@@ -41,4 +41,6 @@ inline void q4_embedding_impl(device const uint *tokens,
 
 Q4_EMBEDDING_ENTRY(embedding_q4_h5120, 5120)
 Q4_EMBEDDING_ENTRY(embedding_q4_h2048, 2048)
+// qwen4exp (Qwen3.8-Flash-Next)
+Q4_EMBEDDING_ENTRY(embedding_q4_h2560, 2560)
 #undef Q4_EMBEDDING_ENTRY

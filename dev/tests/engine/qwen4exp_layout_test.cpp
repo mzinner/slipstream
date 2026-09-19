@@ -1,6 +1,7 @@
 #include "model/Qwen4Exp.hpp"
 #include "model/Qwen3_8.hpp"
 #include "model/WeightStore.hpp"
+#include "ops/GDN.hpp"
 
 #include <iostream>
 #include <stdexcept>
@@ -74,6 +75,20 @@ void linearAttentionMatchesQwen38() {
   static_assert(!next.isFullAttentionLayer(0));
   static_assert(next.isFullAttentionLayer(3));
   static_assert(next.isFullAttentionLayer(47));
+}
+
+// The linear-attention block needs no new kernel. ops::GDN already compiles
+// for this exact shape - see kernelShape() in ops/GDN.cpp - because Qwen3.8
+// has the same head geometry, and the GDN kernels are templated on head
+// counts rather than hidden size.
+void gdnShapeIsAlreadyCompiled() {
+  constexpr Qwen4ExpLayout l;
+  constexpr ops::GdnShape shape{l.gdnKeyHeads, l.gdnValueHeads,
+                                l.gdnHeadDimension, l.convolutionDimension,
+                                l.packedGdnWidth};
+  static_assert(shape.valid(), "the qwen4exp GDN shape must be well formed");
+  static_assert(shape == ops::GdnShape{16, 48, 128, 10240, 16640},
+                "qwen4exp must match a GDN shape the engine already compiles");
 }
 
 // Every projection the engine can already express must satisfy the Q4 rules.
@@ -162,6 +177,7 @@ int main() {
     packedWidthsFollowFromTheConcatenation();
     linearAttentionMatchesQwen38();
     supportedProjectionsAreQ4Aligned();
+    gdnShapeIsAlreadyCompiled();
     expertProjectionsTileAt128();
     expertCountIsStillUnsupported();
     stateLayoutsAreConsistent();

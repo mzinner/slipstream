@@ -14,6 +14,8 @@ const char *embeddingPipeline(uint32_t hiddenSize) {
     return "embedding_q4_h5120";
   case 2048:
     return "embedding_q4_h2048";
+  case 2560:
+    return "embedding_q4_h2560";
   default:
     throw std::invalid_argument("unsupported compiled Q4 embedding shape");
   }
