@@ -267,41 +267,44 @@ kernel void moe_route_scores_q8_m32(
 // reduces the shared expert's scalar gate with a fixed partial-sum order, and
 // simdgroup 0 orders the experts, descending score then ascending id, which
 // is the order the shape's routing and tie-break contract requires.
-kernel void moe_route_select_q8(
-    device const bfloat *scores [[buffer(0)]],
-    device bfloat *input [[buffer(1)]],
-    device uint8_t *shared_weights [[buffer(2)]],
-    device bfloat *shared_scales [[buffer(3)]],
-    device bfloat *shared_biases [[buffer(4)]],
-    device uint *selected [[buffer(5)]],
-    device bfloat *routing_weights [[buffer(6)]],
-    constant MoeRouteParams &params [[buffer(7)]],
-    uint group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint StorageN = 256;
-  constexpr uint Simdgroups = StorageN / 32;
-  constexpr uint ExpertsPerLane = StorageN / 32;
-  threadgroup float row_scores[StorageN];
-  threadgroup float ordered[StorageN];
-  threadgroup float scalar_partials[Simdgroups];
+// RouterWidth is the router projection's padded output width, which is the
+// number of score slots per row - not the live expert count, which can be
+// smaller and is carried in params.experts.
+template <uint RouterWidth>
+__attribute__((always_inline)) inline void moe_route_select_impl(
+    device const bfloat *scores,
+    device bfloat *input,
+    device uint8_t *shared_weights,
+    device bfloat *shared_scales,
+    device bfloat *shared_biases,
+    device uint *selected,
+    device bfloat *routing_weights,
+    constant MoeRouteParams &params, threadgroup float *row_scores,
+    threadgroup float *ordered, threadgroup float *scalar_partials,
+    uint group, uint thread_index, uint simd_lane, uint simd_group) {
+  // The shared expert's scalar gate is a separate Q8 projection that is always
+  // padded to kQ4StorageN, whatever the router's width is. The two used to
+  // share one constant.
+  constexpr uint GateStorageN = 256;
+  constexpr uint Simdgroups = RouterWidth / 32;
+  constexpr uint ExpertsPerLane = RouterWidth / 32;
   const uint row = group;
   if (row >= params.rows)
     return;
   row_scores[thread_index] =
       thread_index < params.experts
-          ? float(scores[ulong(row) * StorageN + thread_index])
+          ? float(scores[ulong(row) * RouterWidth + thread_index])
           : -numeric_limits<float>::infinity();
 
   device bfloat *row_input = input + ulong(row) * params.input_size;
   float scalar = 0.0f;
   for (uint dimension = thread_index; dimension < params.input_size;
-       dimension += StorageN) {
+       dimension += RouterWidth) {
     uint quant_group = dimension / 64;
     uint within_group = dimension % 64;
-    ulong weight_index = ulong(quant_group) * StorageN * 64 + within_group;
-    ulong parameter = ulong(quant_group) * StorageN;
+    ulong weight_index =
+        ulong(quant_group) * GateStorageN * 64 + within_group;
+    ulong parameter = ulong(quant_group) * GateStorageN;
     float dequantized = float(shared_weights[weight_index]) *
                             float(shared_scales[parameter]) +
                         float(shared_biases[parameter]);
@@ -359,6 +362,35 @@ kernel void moe_route_select_q8(
         denominator);
   }
 }
+
+#define MOE_ROUTE_SELECT_ENTRY(Name, RouterWidth)                             \
+  kernel void Name(device const bfloat *scores [[buffer(0)]],                 \
+                   device bfloat *input [[buffer(1)]],                        \
+                   device uint8_t *shared_weights [[buffer(2)]],              \
+                   device bfloat *shared_scales [[buffer(3)]],                \
+                   device bfloat *shared_biases [[buffer(4)]],                \
+                   device uint *selected [[buffer(5)]],                       \
+                   device bfloat *routing_weights [[buffer(6)]],              \
+                   constant MoeRouteParams &params [[buffer(7)]],             \
+                   uint group [[threadgroup_position_in_grid]],               \
+                   uint thread_index [[thread_index_in_threadgroup]],         \
+                   uint simd_lane [[thread_index_in_simdgroup]],              \
+                   uint simd_group [[simdgroup_index_in_threadgroup]]) {      \
+    threadgroup float row_scores[RouterWidth];                                \
+    threadgroup float ordered[64];                                            \
+    threadgroup float scalar_partials[RouterWidth / 32];                      \
+    moe_route_select_impl<RouterWidth>(                                       \
+        scores, input, shared_weights, shared_scales, shared_biases,          \
+        selected, routing_weights, params, row_scores, ordered,               \
+        scalar_partials, group, thread_index, simd_lane, simd_group);         \
+  }
+
+// The existing name keeps the existing width, so nothing else has to move.
+MOE_ROUTE_SELECT_ENTRY(moe_route_select_q8, 256)
+// qwen4exp (Qwen3.8-Flash-Next) routes ten experts out of five hundred twelve.
+MOE_ROUTE_SELECT_ENTRY(moe_route_select_q8_n512, 512)
+#undef MOE_ROUTE_SELECT_ENTRY
+
 
 // Sorts one command's routes by expert. Tile t covers grouped rows
 // [t * tile_rows, (t + 1) * tile_rows) of a single expert; rows past that
