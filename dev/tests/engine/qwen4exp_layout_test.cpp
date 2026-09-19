@@ -137,13 +137,21 @@ void expertProjectionsTileAt128() {
           "padding to 768 would have cost more than 12 GiB");
 }
 
-// The one gap that remains, asserted rather than described, so that lifting
-// the limit fails this test and forces the constant here to be revisited.
-void expertCountIsStillUnsupported() {
+// The MoE shape this layout produces must be one ops::MoE accepts. This used
+// to assert the opposite - that the expert count was over the ceiling - and
+// tightening the limit is what brought it here.
+void moeShapeIsAccepted() {
   constexpr Qwen4ExpLayout layout;
-  require(layout.experts == kUnsupportedExpertCount, "expert count changed");
-  require(layout.experts > 256,
-          "ops::MoE accepts at most 256 experts; update this test if lifted");
+  constexpr ops::MoeShape shape{layout.hiddenSize, layout.experts,
+                                layout.expertsPerToken,
+                                layout.expertIntermediateSize,
+                                layout.expertStorageN};
+  static_assert(layout.experts == kQwen4ExpExpertCount);
+  static_assert(shape.valid(), "ops::MoE must accept the qwen4exp MoE shape");
+  // Ten of five hundred and twelve, in 128-wide tiles, and the router pads to
+  // whole 256-wide tiles.
+  static_assert(shape.routerWidth() == 512);
+  static_assert(shape.expertIntermediateSize % shape.storageN == 0);
 }
 
 void stateLayoutsAreConsistent() {
@@ -179,7 +187,7 @@ int main() {
     supportedProjectionsAreQ4Aligned();
     gdnShapeIsAlreadyCompiled();
     expertProjectionsTileAt128();
-    expertCountIsStillUnsupported();
+    moeShapeIsAccepted();
     stateLayoutsAreConsistent();
   } catch (const std::exception &error) {
     std::cerr << "qwen4exp layout test failed: " << error.what() << '\n';

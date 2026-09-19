@@ -23,7 +23,8 @@ void requireLayout(const Qwen4ExpLayout &layout) {
       !layout.hyperConnectionCount || !layout.hyperConnectionLowRank ||
       !layout.indexerHeads || !layout.indexerKvHeads ||
       !layout.indexerHeadDimension || !layout.ngramVocabularySize ||
-      !layout.ngramEmbeddingSize) {
+      !layout.ngramEmbeddingSize || !layout.ngramHeads ||
+      !layout.ngramShards || !layout.pleConvolutionTaps) {
     throw WeightStoreError("qwen4exp layout contains a zero dimension");
   }
   if (layout.gdnValueHeads % layout.gdnKeyHeads ||
@@ -52,6 +53,8 @@ void requireLayout(const Qwen4ExpLayout &layout) {
                    layout.expertStorageN);
   validateQ4Layout(layout.indexerProjectionWidth(), layout.hiddenSize,
                    layout.expertStorageN);
+  validateQ4Layout(layout.hyperConnectionWidth(), layout.ngramEmbeddingSize);
+  validateQ4Layout(layout.hiddenSize, layout.ngramEmbeddingSize);
 }
 
 Qwen4ExpHyperConnection readHyperConnection(WeightFile &file,
@@ -172,13 +175,40 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     result.files.push_back(file.record());
   }
   {
-    // Gathered per token like the embedding, so stored the same way and
-    // kept out of the layer files it belongs to.
+    // The per-layer embedding, in its own file: the table is gathered per
+    // token like the token embedding, so it is stored the same way, and at
+    // 26.8 GiB it does not belong inside the layer it serves.
     WeightFile file(backend, directory / "ngram.bin", "target/ngram.bin",
                     kNextNgramMagic, layout.ngramVocabularySize,
                     layout.ngramEmbeddingSize);
-    result.ngramEmbedding = readQ4ProjectionComponents(
+    auto &ple = result.perLayerEmbedding;
+    ple.table = readQ4ProjectionComponents(
         file, layout.ngramVocabularySize, layout.ngramEmbeddingSize, "ngram");
+    const uint64_t headBytes = checkedWeightMultiply(
+        layout.ngramHeads, 4, "n-gram head table bytes");
+    ple.headOffsets = file.section(headBytes, "ngram-head-offsets");
+    ple.headVocabularySizes =
+        file.section(headBytes, "ngram-head-vocabulary-sizes");
+    ple.layerMultipliers = file.section(
+        checkedWeightMultiply(layout.ngramHeads, kBFloat16Bytes,
+                              "n-gram layer multiplier bytes"),
+        "ngram-layer-multipliers");
+    ple.keyProjection = readQ4Projection(
+        file, backend, layout.hyperConnectionWidth(),
+        layout.ngramEmbeddingSize, "ple-key");
+    ple.valueProjection = readQ4Projection(
+        file, backend, layout.hiddenSize, layout.ngramEmbeddingSize,
+        "ple-value");
+    const uint64_t width = checkedWeightMultiply(
+        layout.hyperConnectionWidth(), kBFloat16Bytes, "PLE norm bytes");
+    ple.keyNorm = file.section(width, "ple-key-norm");
+    ple.queryNorm = file.section(width, "ple-query-norm");
+    ple.convolutionNorm = file.section(width, "ple-conv-norm");
+    // Depthwise, so one row of taps per channel.
+    ple.convolutionWeights = file.section(
+        checkedWeightMultiply(width, layout.pleConvolutionTaps,
+                              "PLE convolution bytes"),
+        "ple-convolution");
     file.finish();
     result.files.push_back(file.record());
   }

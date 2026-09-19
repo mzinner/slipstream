@@ -13,7 +13,7 @@
 // Apple10; Apple9 performance remains unmeasured.
 constant constexpr uint PrefillMoeTileRows = 32;
 
-template <ushort Rows, bool MultiplySiluGate>
+template <ushort Rows, ushort N, bool MultiplySiluGate>
 inline void prefill_moe_expert_tile(device bfloat *grouped_input,
                                     device const MoeTileDescriptor *tiles,
                                     device uchar *packed, device uchar *shared,
@@ -25,15 +25,15 @@ inline void prefill_moe_expert_tile(device bfloat *grouped_input,
       packed, shared, tiles[group.y].expert, params.experts,
       params.expert_stride_bytes_0, params.output_size, params.input_size);
   const ulong row = ulong(group.y) * PrefillMoeTileRows;
-  q4_mpp_tile_batched<Rows, 256, false, false, 256, MultiplySiluGate>(
+  q4_mpp_tile_batched<Rows, N, false, false, N, MultiplySiluGate>(
       grouped_input + row * params.input_size, slab.weights, slab.scales,
       slab.biases, output + row * params.output_size, slab.weights,
       slab.scales, slab.biases, gate + row * params.output_size,
-      params.output_size, params.input_size, input_sums, group.x * 256,
+      params.output_size, params.input_size, input_sums, group.x * N,
       simd_lane, simd_group);
 }
 
-template <bool MultiplySiluGate>
+template <ushort N, bool MultiplySiluGate>
 inline void prefill_moe_expert(device bfloat *grouped_input,
                                device const MoeTileDescriptor *tiles,
                                device const uint *tile_count,
@@ -46,53 +46,59 @@ inline void prefill_moe_expert(device bfloat *grouped_input,
     return;
   const uint rows = tiles[group.y].rows;
   if (rows <= 8) {
-    prefill_moe_expert_tile<8, MultiplySiluGate>(
+    prefill_moe_expert_tile<8, N, MultiplySiluGate>(
         grouped_input, tiles, packed, shared, gate, output, params, group,
         input_sums, simd_lane, simd_group);
   } else if (rows <= 16) {
-    prefill_moe_expert_tile<16, MultiplySiluGate>(
+    prefill_moe_expert_tile<16, N, MultiplySiluGate>(
         grouped_input, tiles, packed, shared, gate, output, params, group,
         input_sums, simd_lane, simd_group);
   } else {
-    prefill_moe_expert_tile<32, MultiplySiluGate>(
+    prefill_moe_expert_tile<32, N, MultiplySiluGate>(
         grouped_input, tiles, packed, shared, gate, output, params, group,
         input_sums, simd_lane, simd_group);
   }
 }
 
-// Gate and down passes: one affine projection of each tile.
-kernel void prefill_moe_expert_q4_n256_m32(
-    device bfloat *grouped_input [[buffer(0)]],
-    device const MoeTileDescriptor *tiles [[buffer(1)]],
-    device const uint *tile_count [[buffer(2)]],
-    device uchar *packed [[buffer(3)]],
-    device uchar *shared [[buffer(4)]],
-    device bfloat *output [[buffer(5)]],
-    constant MoeExpertParams &params [[buffer(6)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float input_sums[8 * PrefillMoeTileRows];
-  prefill_moe_expert<false>(grouped_input, tiles, tile_count, packed, shared,
-                            output, output, params, group, input_sums,
-                            simd_lane, simd_group);
-}
+// Gate and down passes: one affine projection of each tile. The tile width
+// follows the model: 256 for qwen3_5_moe, 128 for qwen4exp, whose experts are
+// 640 wide and so are not expressible at 256.
+#define PREFILL_MOE_EXPERT_ENTRIES(Suffix, N)                                 \
+  kernel void prefill_moe_expert_q4_##Suffix##_m32(                           \
+      device bfloat *grouped_input [[buffer(0)]],                             \
+      device const MoeTileDescriptor *tiles [[buffer(1)]],                    \
+      device const uint *tile_count [[buffer(2)]],                            \
+      device uchar *packed [[buffer(3)]],                                     \
+      device uchar *shared [[buffer(4)]],                                     \
+      device bfloat *output [[buffer(5)]],                                    \
+      constant MoeExpertParams &params [[buffer(6)]],                         \
+      uint2 group [[threadgroup_position_in_grid]],                           \
+      uint simd_lane [[thread_index_in_simdgroup]],                           \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                   \
+    threadgroup float input_sums[8 * PrefillMoeTileRows];                     \
+    prefill_moe_expert<N, false>(grouped_input, tiles, tile_count, packed,    \
+                                 shared, output, output, params, group,       \
+                                 input_sums, simd_lane, simd_group);          \
+  }                                                                           \
+  /* Up pass: multiplies each output by silu of the gate pass's result. */    \
+  kernel void prefill_moe_expert_q4_##Suffix##_up_silu_m32(                   \
+      device bfloat *grouped_input [[buffer(0)]],                             \
+      device const MoeTileDescriptor *tiles [[buffer(1)]],                    \
+      device const uint *tile_count [[buffer(2)]],                            \
+      device uchar *up_packed [[buffer(3)]],                                  \
+      device uchar *shared_up [[buffer(4)]],                                  \
+      device bfloat *gate [[buffer(5)]],                                      \
+      device bfloat *output [[buffer(6)]],                                    \
+      constant MoeExpertParams &params [[buffer(7)]],                         \
+      uint2 group [[threadgroup_position_in_grid]],                           \
+      uint simd_lane [[thread_index_in_simdgroup]],                           \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                   \
+    threadgroup float input_sums[8 * PrefillMoeTileRows];                     \
+    prefill_moe_expert<N, true>(grouped_input, tiles, tile_count, up_packed,  \
+                                shared_up, gate, output, params, group,       \
+                                input_sums, simd_lane, simd_group);           \
+  }
 
-// Up pass: multiplies each output by silu of the gate pass's bf16 result.
-kernel void prefill_moe_expert_q4_n256_up_silu_m32(
-    device bfloat *grouped_input [[buffer(0)]],
-    device const MoeTileDescriptor *tiles [[buffer(1)]],
-    device const uint *tile_count [[buffer(2)]],
-    device uchar *up_packed [[buffer(3)]],
-    device uchar *shared_up [[buffer(4)]],
-    device bfloat *gate [[buffer(5)]],
-    device bfloat *output [[buffer(6)]],
-    constant MoeExpertParams &params [[buffer(7)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float input_sums[8 * PrefillMoeTileRows];
-  prefill_moe_expert<true>(grouped_input, tiles, tile_count, up_packed,
-                           shared_up, gate, output, params, group, input_sums,
-                           simd_lane, simd_group);
-}
+PREFILL_MOE_EXPERT_ENTRIES(n256, 256)
+PREFILL_MOE_EXPERT_ENTRIES(n128, 128)
+#undef PREFILL_MOE_EXPERT_ENTRIES

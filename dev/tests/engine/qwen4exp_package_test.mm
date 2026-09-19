@@ -249,13 +249,25 @@ int main(int argc, const char *argv[]) {
         layout.hiddenSize,
         std::array<uint64_t, 3>{embeddingElements / 2, embeddingElements / 32,
                                 embeddingElements / 32});
+    // The per-layer embedding file: the gathered table, its per-head tables,
+    // and the projections, norms and dilated convolution around it.
     const uint64_t ngramElements =
         uint64_t(layout.ngramVocabularySize) * layout.ngramEmbeddingSize;
-    const uint64_t ngramBytes = writeWeightFile(
-        root / "target/ngram.bin", "MDFN0004", layout.ngramVocabularySize,
-        layout.ngramEmbeddingSize,
-        std::array<uint64_t, 3>{ngramElements / 2, ngramElements / 32,
-                                ngramElements / 32});
+    const uint64_t headBytes = uint64_t(layout.ngramHeads) * 4;
+    const uint64_t hcWidth =
+        uint64_t(layout.hyperConnectionWidth()) * kBFloat16Bytes;
+    std::vector<uint64_t> ple{
+        ngramElements / 2, ngramElements / 32, ngramElements / 32,
+        headBytes, headBytes,
+        uint64_t(layout.ngramHeads) * kBFloat16Bytes,
+        q4Bytes(layout.hyperConnectionWidth(), layout.ngramEmbeddingSize),
+        q4Bytes(layout.hiddenSize, layout.ngramEmbeddingSize),
+        hcWidth, hcWidth, hcWidth,
+        hcWidth * layout.pleConvolutionTaps};
+    const uint64_t ngramBytes =
+        writeWeightFile(root / "target/ngram.bin", "MDFN0004",
+                        layout.ngramVocabularySize, layout.ngramEmbeddingSize,
+                        ple);
     targetBytes += ngramBytes;
 
     for (uint32_t layer = 0; layer < draft.layers; ++layer)
@@ -282,7 +294,7 @@ int main(int argc, const char *argv[]) {
 
     std::cout << "synthetic qwen4exp package at " << root << "\n"
               << "  target weights   " << gib(targetBytes) << "\n"
-              << "    of which n-gram" << "  " << gib(ngramBytes) << "\n"
+              << "    of which PLE  " << "  " << gib(ngramBytes) << "\n"
               << "  draft weights    " << gib(draftBytes) << "\n"
               << "  apparent total   " << gib(onDisk) << "\n";
 

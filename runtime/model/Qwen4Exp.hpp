@@ -77,6 +77,9 @@ struct Qwen4ExpLayout final {
   uint32_t ngramLayer = 1;
   uint32_t ngramVocabularySize = 20'000'000;
   uint32_t ngramEmbeddingSize = 2560;
+  uint32_t ngramHeads = 8;
+  uint32_t ngramShards = 128;
+  uint32_t pleConvolutionTaps = 4;
 
   [[nodiscard]] constexpr bool
   isFullAttentionLayer(uint32_t layer) const noexcept {
@@ -118,6 +121,11 @@ struct Qwen4ExpLayout final {
   [[nodiscard]] constexpr uint32_t indexerProjectionWidth() const noexcept {
     return (indexerHeads + indexerKvHeads) * indexerHeadDimension;
   }
+  // The PLE convolution is dilated by the n-gram order, so its state spans
+  // more positions than it has taps.
+  [[nodiscard]] constexpr uint32_t pleConvolutionState() const noexcept {
+    return (pleConvolutionTaps - 1) * ngramSize;
+  }
 
   bool operator==(const Qwen4ExpLayout &) const = default;
 };
@@ -152,6 +160,27 @@ struct Qwen4ExpHyperConnection final {
   std::optional<metal::MetalBuffer> blockInject;  // count x width
 };
 
+// The per-layer embedding on layer ngramLayer. It gathers a hashed n-gram
+// embedding, projects it to one value and one key per residual stream, gates
+// the value by the key against the normalized stream, and adds a dilated
+// depthwise convolution of the result. It writes the full hc*hidden width, so
+// it feeds every stream.
+//
+// The embedding table itself is sharded, with a vocabulary size and offset per
+// head, which is why the head tables travel with it.
+struct Qwen4ExpPerLayerEmbedding final {
+  ops::Q4Projection table;            // ngram vocabulary x embedding size
+  metal::MetalBuffer headOffsets;     // ngramHeads
+  metal::MetalBuffer headVocabularySizes;
+  metal::MetalBuffer layerMultipliers;
+  ops::Q4Projection keyProjection;    // hc width x embedding size
+  ops::Q4Projection valueProjection;  // hidden x embedding size
+  metal::MetalBuffer keyNorm;         // hc width
+  metal::MetalBuffer queryNorm;
+  metal::MetalBuffer convolutionNorm;
+  metal::MetalBuffer convolutionWeights;  // hc width x taps
+};
+
 // Sparse attention keeps an indexer that scores which keys to read.
 struct Qwen4ExpIndexer final {
   ops::Q4Projection queryKeyProjection;  // indexerProjectionWidth x hidden
@@ -181,8 +210,9 @@ struct Qwen4ExpWeights final {
   metal::MetalBuffer finalNorm;
   ops::Q4Projection logitsProjection;
   ops::Q4Projection tokenEmbedding;
-  // Its own file: 26.8 GiB does not belong inside a layer.
-  ops::Q4Projection ngramEmbedding;
+  // Its own file: the embedding table alone is 26.8 GiB, which does not
+  // belong inside a layer file.
+  Qwen4ExpPerLayerEmbedding perLayerEmbedding;
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
   std::string manifestFingerprintSha256;
@@ -198,14 +228,10 @@ loadQwen4ExpWeights(metal::MetalBackend &backend,
                     const std::filesystem::path &directory,
                     Qwen4ExpLayout layout = {});
 
-// One constraint this architecture still breaks. It is an engine limit, not a
-// property of the weights, and it must be lifted before a package loads:
-// ops::MoE accepts at most 256 experts, and the router kernel stages 256
-// scores per row before sorting them.
-//
-// The expert width no longer belongs on this list. 640 is expressible exactly
-// at kQ4ExpertStorageN = 128; what remains is a MoE kernel instantiated at
-// that width, which is Stage 3 work.
-inline constexpr uint32_t kUnsupportedExpertCount = 512;
+// Both of this architecture's MoE limits are now lifted. The expert width is
+// expressible at kQ4ExpertStorageN = 128, the packed tiles are instantiated at
+// that width, and ops::MoE routes at a padded router width rather than a fixed
+// 256. What remains for this block is not a width problem.
+inline constexpr uint32_t kQwen4ExpExpertCount = 512;
 
 } // namespace splash::model

@@ -58,7 +58,7 @@ QwenTargetGeometry geometryFor(const Qwen3_8Layout &layout) {
 QwenTargetGeometry geometryFor(const Qwen4ExpLayout &layout) {
   QwenTargetGeometry result = commonGeometry(layout);
   result.moe = {layout.hiddenSize, layout.experts, layout.expertsPerToken,
-                layout.expertIntermediateSize};
+                layout.expertIntermediateSize, layout.expertStorageN};
   result.ffnKind = QwenFfnKind::SparseMoe;
   return result;
 }

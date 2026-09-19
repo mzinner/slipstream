@@ -17,11 +17,22 @@ struct MoeShape final {
   uint32_t experts = 0;
   uint32_t expertsPerToken = 0;
   uint32_t expertIntermediateSize = 0;
+  // Packed tile width for the expert projections: 256 for qwen3_5_moe, 128
+  // for qwen4exp, whose experts are 640 wide and so cannot be expressed at
+  // 256 at all.
+  uint32_t storageN = 256;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return hiddenSize && hiddenSize % 256 == 0 && experts && experts <= 256 &&
+    return hiddenSize && hiddenSize % 256 == 0 && experts && experts <= 512 &&
            expertsPerToken && expertsPerToken <= experts &&
-           expertIntermediateSize && expertIntermediateSize % 256 == 0;
+           (storageN == 256 || storageN == 128) && expertIntermediateSize &&
+           expertIntermediateSize % storageN == 0 &&
+           hiddenSize % storageN == 0;
+  }
+  // The router projection is padded to whole 256-wide tiles, so it is wider
+  // than the live expert count when that is not itself a multiple.
+  [[nodiscard]] constexpr uint32_t routerWidth() const noexcept {
+    return ((experts + 255) / 256) * 256;
   }
   // Routed experts followed by the shared expert.
   [[nodiscard]] constexpr uint32_t routesPerToken() const noexcept {

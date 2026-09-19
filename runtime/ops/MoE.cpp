@@ -43,7 +43,7 @@ bool matches(const ExpertQ4Projection &projection, uint32_t experts,
 void validate(const MoeWeights &weights, MoeShape shape) {
   const uint32_t hidden = shape.hiddenSize;
   const uint32_t intermediate = shape.expertIntermediateSize;
-  if (!shape.valid() || !matches(weights.router, 256, hidden) ||
+  if (!shape.valid() || !matches(weights.router, shape.routerWidth(), hidden) ||
       !matches(weights.sharedExpertGate, 256, hidden) ||
       !matches(weights.expertGate, shape.experts, intermediate, hidden) ||
       !matches(weights.expertUp, shape.experts, intermediate, hidden) ||
@@ -65,9 +65,10 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows,
   const uint32_t outputWidth =
       splitExperts ? std::max(shape.hiddenSize, shape.expertIntermediateSize)
                    : shape.hiddenSize;
-  // The router's rows x 256 bf16 scores live in the grouped input until the
+  // The router's rows x routerWidth bf16 scores live in the grouped input until the
   // gather overwrites them.
-  const uint64_t scoreBytes = uint64_t{rows} * 256 * sizeof(uint16_t);
+  const uint64_t scoreBytes =
+      uint64_t{rows} * shape.routerWidth() * sizeof(uint16_t);
   return {routes * sizeof(uint32_t), routes * sizeof(uint16_t),
           uint64_t{tiles} * sizeof(MoeTileDescriptor), sizeof(uint32_t),
           groupedRows * sizeof(uint32_t), routes * sizeof(uint32_t),
@@ -122,15 +123,18 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
             {buffers.input, weights.router.weights, weights.router.scales,
              weights.router.biases, buffers.groupedInput},
             routeParams,
-            {(rows + route.rows - 1) / route.rows, 256 / route.experts, 1});
-  graph.add("moe_route_select_q8",
+            {(rows + route.rows - 1) / route.rows,
+             shape.routerWidth() / route.experts, 1});
+  graph.add(shape.routerWidth() == 512 ? "moe_route_select_q8_n512"
+                                       : "moe_route_select_q8",
             {buffers.groupedInput, buffers.input,
              weights.sharedExpertGate.weights,
              weights.sharedExpertGate.scales,
              weights.sharedExpertGate.biases, buffers.selectedExperts,
              buffers.routingWeights},
-            routeParams, {rows, 1, 1});
+            routeParams, {rows, 1, 1}, {shape.routerWidth(), 1, 1});
   const bool m8 = plan.config().expertTile == MoeExpertTile::M8;
+  const bool wide = shape.storageN == 256;
   graph.add("moe_group_routes",
             {buffers.selectedExperts, buffers.tileDescriptors,
              buffers.tileCount, buffers.groupedRoutes, buffers.routeRows},
@@ -163,30 +167,39 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   if (plan.splitExperts()) {
     // The gate lands in expertOutput, which the down pass overwrites only
     // after the up pass has consumed it.
-    graph.add("prefill_moe_expert_q4_n256_m32",
+    graph.add(wide ? "prefill_moe_expert_q4_n256_m32"
+                   : "prefill_moe_expert_q4_n128_m32",
               {buffers.groupedInput, buffers.tileDescriptors,
                buffers.tileCount, weights.expertGate.packed,
                weights.sharedGate.packed, buffers.expertOutput},
-              gate, {shape.expertIntermediateSize / 256, tiles, 1});
-    graph.add("prefill_moe_expert_q4_n256_up_silu_m32",
+              gate, {shape.expertIntermediateSize / shape.storageN, tiles, 1});
+    graph.add(wide ? "prefill_moe_expert_q4_n256_up_silu_m32"
+                   : "prefill_moe_expert_q4_n128_up_silu_m32",
               {buffers.groupedInput, buffers.tileDescriptors,
                buffers.tileCount, weights.expertUp.packed,
                weights.sharedUp.packed, buffers.expertOutput,
                buffers.expertIntermediate},
-              up, {shape.expertIntermediateSize / 256, tiles, 1});
-    graph.add("prefill_moe_expert_q4_n256_m32",
+              up, {shape.expertIntermediateSize / shape.storageN, tiles, 1});
+    graph.add(wide ? "prefill_moe_expert_q4_n256_m32"
+                   : "prefill_moe_expert_q4_n128_m32",
               {buffers.expertIntermediate, buffers.tileDescriptors,
                buffers.tileCount, weights.expertDown.packed,
                weights.sharedDown.packed, buffers.expertOutput},
-              down, {shape.hiddenSize / 256, tiles, 1});
+              down, {shape.hiddenSize / shape.storageN, tiles, 1});
   } else {
-    graph.add(m8 ? "moe_expert_gate_up_q4_m8" : "moe_expert_gate_up_q4_m32",
+    graph.add(wide ? (m8 ? "moe_expert_gate_up_q4_m8"
+                         : "moe_expert_gate_up_q4_m32")
+                   : (m8 ? "moe_expert_gate_up_q4_n128_m8"
+                         : "moe_expert_gate_up_q4_n128_m32"),
               {buffers.groupedInput, buffers.tileDescriptors,
                buffers.tileCount, weights.expertGate.packed,
                weights.expertUp.packed, weights.sharedGate.packed,
                weights.sharedUp.packed, buffers.expertIntermediate},
               gateUp, {shape.expertIntermediateSize / 128, tiles, 1});
-    graph.add(m8 ? "moe_expert_down_q4_m8" : "moe_expert_down_q4_m32",
+    graph.add(wide ? (m8 ? "moe_expert_down_q4_m8"
+                         : "moe_expert_down_q4_m32")
+                   : (m8 ? "moe_expert_down_q4_n128_m8"
+                         : "moe_expert_down_q4_n128_m32"),
               {buffers.expertIntermediate, buffers.tileDescriptors,
                buffers.tileCount, weights.expertDown.packed,
                weights.sharedDown.packed, buffers.expertOutput},
