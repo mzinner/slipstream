@@ -56,23 +56,26 @@ void requireLayout(const Qwen4ExpLayout &layout) {
 
 Qwen4ExpHyperConnection readHyperConnection(WeightFile &file,
                                             const Qwen4ExpLayout &layout,
-                                            std::string_view label) {
+                                            std::string_view label,
+                                            bool withInject) {
   const uint64_t width =
       checkedWeightMultiply(layout.hyperConnectionWidth(), kBFloat16Bytes,
                             "hyper-connection width bytes");
+  const uint64_t mix =
+      checkedWeightMultiply(layout.hyperConnectionLowRank, width,
+                            "hyper-connection mix bytes");
   const std::string prefix(label);
-  return {
-      file.section(width, prefix + "-norm"),
-      file.section(checkedWeightMultiply(layout.hyperConnectionCount, width,
-                                         "hyper-connection inject bytes"),
-                   prefix + "-inject"),
-      file.section(checkedWeightMultiply(layout.hyperConnectionLowRank, width,
-                                         "hyper-connection mix bytes"),
-                   prefix + "-mix-down"),
-      file.section(checkedWeightMultiply(layout.hyperConnectionLowRank, width,
-                                         "hyper-connection mix bytes"),
-                   prefix + "-mix-up"),
-  };
+  Qwen4ExpHyperConnection result;
+  result.norm = file.section(width, prefix + "-norm");
+  result.mixDown = file.section(mix, prefix + "-mix-down");
+  result.mixUp = file.section(mix, prefix + "-mix-up");
+  if (withInject) {
+    result.blockInject =
+        file.section(checkedWeightMultiply(layout.hyperConnectionCount, width,
+                                           "hyper-connection inject bytes"),
+                     prefix + "-inject");
+  }
+  return result;
 }
 
 Qwen4ExpIndexer readIndexer(WeightFile &file, metal::MetalBackend &backend,
@@ -135,11 +138,11 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
                     fullAttention ? 1U : 0U);
     auto &layer = result.layers.emplace_back();
     layer.attentionHyperConnection =
-        readHyperConnection(file, layout, "attention-hyper");
+        readHyperConnection(file, layout, "attention-hyper", true);
     layer.mixer =
         readQwenMixer(file, backend, layout.mixerGeometry(), fullAttention);
     if (fullAttention) layer.indexer = readIndexer(file, backend, layout);
-    layer.mlpHyperConnection = readHyperConnection(file, layout, "mlp-hyper");
+    layer.mlpHyperConnection = readHyperConnection(file, layout, "mlp-hyper", true);
     readExperts(file, backend, layout, layer.ffn);
     file.finish();
     result.files.push_back(file.record());
@@ -149,7 +152,7 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     WeightFile file(backend, directory / "head.bin", "target/head.bin",
                     kNextHeadMagic, layout.layers, 2);
     result.hyperConnectionMixer =
-        readHyperConnection(file, layout, "hyper-mixer");
+        readHyperConnection(file, layout, "hyper-mixer", false);
     result.finalNorm = file.section(
         checkedWeightMultiply(layout.hiddenSize, kBFloat16Bytes,
                               "qwen4exp norm bytes"),

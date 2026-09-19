@@ -122,15 +122,34 @@ struct Qwen4ExpLayout final {
   bool operator==(const Qwen4ExpLayout &) const = default;
 };
 
-// Hyper-connections replace the usual input and post-attention norms: each
-// block carries its own norm plus a low-rank mix of the four residual
-// streams. The mix projections are stored bf16, not Q4: the down projection
-// is 320 wide, which is not a multiple of either tile width.
+// Hyper-connections replace the usual input and post-attention norms. The
+// residual is four parallel streams carried as one row of hc*hidden, and each
+// block reads a mix of them and writes back a gated injection.
+//
+// Over a row x of width H = hc*hidden, with d = hidden (from the reference
+// implementation, Qwen4ExpTextGatedResidual):
+//
+//   xn    = hc_norm(x)                  RMS per stream, gain over all of H
+//   w     = silu(down(xn) / hc)         H -> lowRank
+//   w     = sigmoid(up(w))              lowRank -> H
+//   input = mean over hc of             the d-wide block input
+//             reshape(w,[hc,d]) * reshape(xn,[hc,d])
+//   inj   = 2 * sigmoid(block_inject(xn) / hc)      H -> hc
+//
+// and after the block produces y of width d, the residual update is an outer
+// product against the *unnormalized* input:
+//
+//   x = x + outer(inj, y)               [hc,d], flattened back to H
+//
+// The mix projections are stored bf16, not Q4: the down projection is 320
+// wide, which is not a multiple of either tile width.
 struct Qwen4ExpHyperConnection final {
   metal::MetalBuffer norm;         // hyperConnectionWidth
-  metal::MetalBuffer blockInject;  // count x hyperConnectionWidth
   metal::MetalBuffer mixDown;      // lowRank x hyperConnectionWidth
   metal::MetalBuffer mixUp;        // hyperConnectionWidth x lowRank
+  // Absent on the final mixer, which collapses the streams before the head
+  // and never injects a block result back (use_combine=False upstream).
+  std::optional<metal::MetalBuffer> blockInject;  // count x width
 };
 
 // Sparse attention keeps an indexer that scores which keys to read.

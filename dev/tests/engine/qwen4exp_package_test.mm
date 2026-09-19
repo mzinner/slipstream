@@ -69,14 +69,19 @@ uint64_t writeWeightFile(const std::filesystem::path &path,
 }
 
 // Mirrors loadQwen4ExpWeights section for section.
-std::vector<uint64_t> hyperConnectionSections(const Qwen4ExpLayout &l) {
+// Order must match readHyperConnection. The final mixer has no injection
+// weight: it collapses the streams before the head and never writes back.
+std::vector<uint64_t> hyperConnectionSections(const Qwen4ExpLayout &l,
+                                              bool withInject) {
   const uint64_t width = uint64_t(l.hyperConnectionWidth()) * kBFloat16Bytes;
-  return {width, l.hyperConnectionCount * width,
-          l.hyperConnectionLowRank * width, l.hyperConnectionLowRank * width};
+  const uint64_t mix = l.hyperConnectionLowRank * width;
+  std::vector<uint64_t> s{width, mix, mix};
+  if (withInject) s.push_back(l.hyperConnectionCount * width);
+  return s;
 }
 
 std::vector<uint64_t> layerSections(const Qwen4ExpLayout &l, bool full) {
-  std::vector<uint64_t> s = hyperConnectionSections(l);
+  std::vector<uint64_t> s = hyperConnectionSections(l, true);
   if (full) {
     s.push_back(q4Bytes(l.packedFullWidth, l.hiddenSize));
     s.push_back(uint64_t(l.attentionHeadDimension) * kBFloat16Bytes);
@@ -94,7 +99,7 @@ std::vector<uint64_t> layerSections(const Qwen4ExpLayout &l, bool full) {
     s.push_back(uint64_t(l.gdnHeadDimension) * kBFloat16Bytes);
     s.push_back(q4Bytes(l.hiddenSize, l.attentionWidth));
   }
-  for (uint64_t bytes : hyperConnectionSections(l)) s.push_back(bytes);
+  for (uint64_t bytes : hyperConnectionSections(l, true)) s.push_back(bytes);
   const uint64_t q8Router =
       uint64_t(l.experts) * l.hiddenSize +
       2 * (uint64_t(l.experts) * l.hiddenSize / 32);
@@ -232,7 +237,7 @@ int main(int argc, const char *argv[]) {
           Qwen4ExpLayout::layerMagic, layer, full ? 1U : 0U,
           layerSections(layout, full));
     }
-    std::vector<uint64_t> head = hyperConnectionSections(layout);
+    std::vector<uint64_t> head = hyperConnectionSections(layout, false);
     head.push_back(uint64_t(layout.hiddenSize) * kBFloat16Bytes);
     head.push_back(q4Bytes(layout.vocabularySize, layout.hiddenSize));
     targetBytes += writeWeightFile(root / "target/head.bin", "MDFN0002",
