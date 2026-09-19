@@ -154,6 +154,33 @@ void moeShapeIsAccepted() {
   static_assert(shape.expertIntermediateSize % shape.storageN == 0);
 }
 
+// The per-layer embedding's shape was wrong once in a way the totals hid:
+// sixteen heads of 160 and eight of 2560 have the same element count, so the
+// footprint agreed while the structure did not. Pin the structure.
+void ngramGeometryIsPinned() {
+  constexpr Qwen4ExpLayout layout;
+  static_assert(layout.ngramHeads() == 16,
+                "one head per context position per hash");
+  static_assert(layout.ngramHeadDimension() == 160,
+                "the heads partition the embedding width");
+  static_assert(layout.ngramHeads() * layout.ngramHeadDimension() ==
+                    layout.ngramEmbeddingSize,
+                "the heads must tile the embedding exactly");
+
+  // 160 is not a whole number of ordinary groups, which is the whole reason
+  // this table is quantized in finer ones.
+  static_assert(layout.ngramHeadDimension() % kQ4GroupElements != 0);
+  static_assert(layout.ngramHeadDimension() % kQ4FineGroupElements == 0);
+  static_assert(layout.ngramVocabularySize % layout.ngramShards == 0,
+                "the table must divide evenly into its shards");
+
+  // Rows are prime-sized per head, above the base, then padded; the padded
+  // total must still cover every head.
+  static_assert(layout.ngramVocabularySize >
+                    uint64_t(layout.ngramHeads()) * layout.ngramVocabularyBase,
+                "the padded vocabulary must hold every head's table");
+}
+
 void stateLayoutsAreConsistent() {
   constexpr Qwen4ExpLayout layout;
   const auto kv = layout.q8Layout();
@@ -188,6 +215,7 @@ int main() {
     gdnShapeIsAlreadyCompiled();
     expertProjectionsTileAt128();
     moeShapeIsAccepted();
+    ngramGeometryIsPinned();
     stateLayoutsAreConsistent();
   } catch (const std::exception &error) {
     std::cerr << "qwen4exp layout test failed: " << error.what() << '\n';

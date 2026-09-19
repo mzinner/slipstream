@@ -14,6 +14,12 @@
 namespace splash::model {
 
 inline constexpr uint32_t kQ4GroupElements = 64;
+
+// The per-layer embedding's rows are 160 wide, which is not a whole number of
+// 64-element groups. Finer groups divide it exactly, keep each row's scales to
+// itself, and leave row starts group-aligned; the alternatives were sharing a
+// scale between unrelated vocabulary rows or padding every row to 192.
+inline constexpr uint32_t kQ4FineGroupElements = 32;
 inline constexpr uint64_t kBFloat16Bytes = 2;
 
 inline constexpr uint64_t kWeightFileAlignment = 16 * 1024;
@@ -64,8 +70,9 @@ private:
 
 [[nodiscard]] uint64_t checkedWeightMultiply(uint64_t left, uint64_t right,
                                              std::string_view description);
-[[nodiscard]] uint64_t q4PackedBytes(uint32_t outputSize,
-                                     uint32_t inputSize);
+[[nodiscard]] uint64_t
+q4PackedBytes(uint32_t outputSize, uint32_t inputSize,
+              uint32_t groupElements = kQ4GroupElements);
 void validateQ4Layout(uint32_t outputSize, uint32_t inputSize,
                       uint32_t storageN = kQ4StorageN);
 
@@ -78,7 +85,8 @@ readQ4Projection(WeightFile &file, metal::MetalBackend &backend,
 // so token gather can bind each table directly.
 [[nodiscard]] ops::Q4Projection
 readQ4ProjectionComponents(WeightFile &file, uint32_t outputSize,
-                           uint32_t inputSize, std::string_view label);
+                           uint32_t inputSize, std::string_view label,
+                           uint32_t groupElements = kQ4GroupElements);
 
 [[nodiscard]] ops::Q8Projection
 readQ8Projection(WeightFile &file, metal::MetalBackend &backend,

@@ -23,8 +23,10 @@ void requireLayout(const Qwen4ExpLayout &layout) {
       !layout.hyperConnectionCount || !layout.hyperConnectionLowRank ||
       !layout.indexerHeads || !layout.indexerKvHeads ||
       !layout.indexerHeadDimension || !layout.ngramVocabularySize ||
-      !layout.ngramEmbeddingSize || !layout.ngramHeads ||
-      !layout.ngramShards || !layout.pleConvolutionTaps) {
+      !layout.ngramEmbeddingSize || !layout.ngramHeadsPerOrder ||
+      !layout.ngramShards || !layout.pleConvolutionTaps ||
+      !layout.ngramVocabularyBase || !layout.ngramHeads() ||
+      !layout.ngramHeadDimension()) {
     throw WeightStoreError("qwen4exp layout contains a zero dimension");
   }
   if (layout.gdnValueHeads % layout.gdnKeyHeads ||
@@ -55,6 +57,11 @@ void requireLayout(const Qwen4ExpLayout &layout) {
                    layout.expertStorageN);
   validateQ4Layout(layout.hyperConnectionWidth(), layout.ngramEmbeddingSize);
   validateQ4Layout(layout.hiddenSize, layout.ngramEmbeddingSize);
+  if (layout.ngramEmbeddingSize % layout.ngramHeads() ||
+      layout.ngramHeadDimension() % kQ4FineGroupElements ||
+      layout.ngramVocabularySize % layout.ngramShards) {
+    throw WeightStoreError("qwen4exp n-gram geometry is inconsistent");
+  }
 }
 
 Qwen4ExpHyperConnection readHyperConnection(WeightFile &file,
@@ -179,18 +186,20 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     // token like the token embedding, so it is stored the same way, and at
     // 26.8 GiB it does not belong inside the layer it serves.
     WeightFile file(backend, directory / "ngram.bin", "target/ngram.bin",
-                    kNextNgramMagic, layout.ngramVocabularySize,
-                    layout.ngramEmbeddingSize);
+                    kNextNgramMagic, layout.ngramShards,
+                    layout.ngramHeadDimension());
     auto &ple = result.perLayerEmbedding;
+    // One row per hashed n-gram per head, a head wide, in finer groups.
     ple.table = readQ4ProjectionComponents(
-        file, layout.ngramVocabularySize, layout.ngramEmbeddingSize, "ngram");
+        file, layout.ngramVocabularySize, layout.ngramHeadDimension(), "ngram",
+        kQ4FineGroupElements);
     const uint64_t headBytes = checkedWeightMultiply(
-        layout.ngramHeads, 4, "n-gram head table bytes");
+        layout.ngramHeads(), 8, "n-gram head table bytes");
     ple.headOffsets = file.section(headBytes, "ngram-head-offsets");
     ple.headVocabularySizes =
         file.section(headBytes, "ngram-head-vocabulary-sizes");
     ple.layerMultipliers = file.section(
-        checkedWeightMultiply(layout.ngramHeads, kBFloat16Bytes,
+        checkedWeightMultiply(layout.ngramSize, 8,
                               "n-gram layer multiplier bytes"),
         "ngram-layer-multipliers");
     ple.keyProjection = readQ4Projection(

@@ -75,9 +75,15 @@ struct Qwen4ExpLayout final {
   // which is what this model measures on disk.
   uint32_t ngramSize = 3;
   uint32_t ngramLayer = 1;
-  uint32_t ngramVocabularySize = 20'000'000;
+  // The table is one row per hashed n-gram per head, not one per token. Each
+  // head gets its own prime-sized vocabulary just above ngramVocabularyBase,
+  // and the padded total is what the packed file holds. Sixteen heads of 160
+  // multiply out to the same element count as eight of 2560, which is why a
+  // wrong shape can still produce the right total.
+  uint32_t ngramVocabularyBase = 20'000'000;
+  uint32_t ngramVocabularySize = 320'001'536;
   uint32_t ngramEmbeddingSize = 2560;
-  uint32_t ngramHeads = 8;
+  uint32_t ngramHeadsPerOrder = 8;
   uint32_t ngramShards = 128;
   uint32_t pleConvolutionTaps = 4;
 
@@ -126,6 +132,15 @@ struct Qwen4ExpLayout final {
   [[nodiscard]] constexpr uint32_t pleConvolutionState() const noexcept {
     return (pleConvolutionTaps - 1) * ngramSize;
   }
+  // One head per context position per hash, so the orders below the full
+  // n-gram each contribute a set.
+  [[nodiscard]] constexpr uint32_t ngramHeads() const noexcept {
+    return (ngramSize - 1) * ngramHeadsPerOrder;
+  }
+  // The heads partition the embedding width between them.
+  [[nodiscard]] constexpr uint32_t ngramHeadDimension() const noexcept {
+    return ngramHeads() ? ngramEmbeddingSize / ngramHeads() : 0;
+  }
 
   bool operator==(const Qwen4ExpLayout &) const = default;
 };
@@ -169,7 +184,9 @@ struct Qwen4ExpHyperConnection final {
 // The embedding table itself is sharded, with a vocabulary size and offset per
 // head, which is why the head tables travel with it.
 struct Qwen4ExpPerLayerEmbedding final {
-  ops::Q4Projection table;            // ngram vocabulary x embedding size
+  // Rows are one head wide, and quantized in finer groups than everything
+  // else because 160 is not a whole number of 64-element groups.
+  ops::Q4Projection table;            // ngram vocabulary x head dimension
   metal::MetalBuffer headOffsets;     // ngramHeads
   metal::MetalBuffer headVocabularySizes;
   metal::MetalBuffer layerMultipliers;

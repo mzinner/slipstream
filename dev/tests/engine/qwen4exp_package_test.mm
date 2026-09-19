@@ -251,23 +251,25 @@ int main(int argc, const char *argv[]) {
                                 embeddingElements / 32});
     // The per-layer embedding file: the gathered table, its per-head tables,
     // and the projections, norms and dilated convolution around it.
+    // Rows are one head wide and quantized in finer groups, so the parameter
+    // runs are twice what a 64-element group would give.
     const uint64_t ngramElements =
-        uint64_t(layout.ngramVocabularySize) * layout.ngramEmbeddingSize;
-    const uint64_t headBytes = uint64_t(layout.ngramHeads) * 4;
+        uint64_t(layout.ngramVocabularySize) * layout.ngramHeadDimension();
+    const uint64_t ngramParameters = ngramElements / 32 * kBFloat16Bytes;
+    const uint64_t headBytes = uint64_t(layout.ngramHeads()) * 8;
     const uint64_t hcWidth =
         uint64_t(layout.hyperConnectionWidth()) * kBFloat16Bytes;
     std::vector<uint64_t> ple{
-        ngramElements / 2, ngramElements / 32, ngramElements / 32,
+        ngramElements / 2, ngramParameters, ngramParameters,
         headBytes, headBytes,
-        uint64_t(layout.ngramHeads) * kBFloat16Bytes,
+        uint64_t(layout.ngramSize) * 8,
         q4Bytes(layout.hyperConnectionWidth(), layout.ngramEmbeddingSize),
         q4Bytes(layout.hiddenSize, layout.ngramEmbeddingSize),
         hcWidth, hcWidth, hcWidth,
         hcWidth * layout.pleConvolutionTaps};
     const uint64_t ngramBytes =
         writeWeightFile(root / "target/ngram.bin", "MDFN0004",
-                        layout.ngramVocabularySize, layout.ngramEmbeddingSize,
-                        ple);
+                        layout.ngramShards, layout.ngramHeadDimension(), ple);
     targetBytes += ngramBytes;
 
     for (uint32_t layer = 0; layer < draft.layers; ++layer)

@@ -36,8 +36,9 @@ namespace {
     return left + right;
 }
 
-[[nodiscard]] uint64_t q4Elements(uint32_t outputSize, uint32_t inputSize) {
-    if (!outputSize || !inputSize || inputSize % kQ4GroupElements) {
+[[nodiscard]] uint64_t q4Elements(uint32_t outputSize, uint32_t inputSize,
+                                  uint32_t groupElements = kQ4GroupElements) {
+    if (!outputSize || !inputSize || inputSize % groupElements) {
         throw WeightStoreError(
             "Q4 projection dimensions must be positive and input-aligned");
     }
@@ -54,9 +55,15 @@ namespace {
 
 } // namespace
 
-uint64_t q4PackedBytes(uint32_t outputSize, uint32_t inputSize) {
-    uint64_t elements = q4Elements(outputSize, inputSize);
-    return checkedWeightMultiply(elements / 16, 9, "Q4 packed byte count");
+uint64_t q4PackedBytes(uint32_t outputSize, uint32_t inputSize,
+                       uint32_t groupElements) {
+    uint64_t elements = q4Elements(outputSize, inputSize, groupElements);
+    // Half a byte per weight, plus a bf16 scale and bias per group.
+    return checkedWeightAdd(
+        elements / 2,
+        checkedWeightMultiply(elements / groupElements, 2 * kBFloat16Bytes,
+                              "Q4 parameter byte count"),
+        "Q4 packed byte count");
 }
 
 void validateQ4Layout(uint32_t outputSize, uint32_t inputSize,
@@ -254,13 +261,17 @@ ops::Q4Projection readQ4Projection(WeightFile &file,
 ops::Q4Projection readQ4ProjectionComponents(WeightFile &file,
                                              uint32_t outputSize,
                                              uint32_t inputSize,
-                                             std::string_view label) {
-    const uint64_t elements = q4Elements(outputSize, inputSize);
+                                             std::string_view label,
+                                             uint32_t groupElements) {
+    const uint64_t elements = q4Elements(outputSize, inputSize, groupElements);
+    const uint64_t parameters =
+        checkedWeightMultiply(elements / groupElements, kBFloat16Bytes,
+                              "Q4 component parameter bytes");
     const std::string prefix(label);
     return {
         file.section(elements / 2, prefix + "-weights"),
-        file.section(elements / 32, prefix + "-scales"),
-        file.section(elements / 32, prefix + "-biases"),
+        file.section(parameters, prefix + "-scales"),
+        file.section(parameters, prefix + "-biases"),
         outputSize,
         inputSize,
     };
