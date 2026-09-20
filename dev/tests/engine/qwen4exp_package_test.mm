@@ -212,10 +212,15 @@ void writeManifest(const std::filesystem::path &root, const Qwen4ExpLayout &l,
 
 int main(int argc, const char *argv[]) {
   try {
-    require(argc >= 2, "usage: qwen4exp-package <metallib path>");
+    require(argc >= 2, "usage: qwen4exp-package <metallib> [package]");
+    // With a package given, validate that one instead of building a fresh
+    // synthetic tree. That is how the converter's section arithmetic is
+    // checked against this reader rather than against itself.
+    const bool supplied = argc >= 3;
     const std::filesystem::path root =
-        std::filesystem::temp_directory_path() / "qwen4exp-synthetic";
-    std::filesystem::remove_all(root);
+        supplied ? std::filesystem::path(argv[2])
+                 : std::filesystem::temp_directory_path() / "qwen4exp-synthetic";
+    if (!supplied) std::filesystem::remove_all(root);
 
     constexpr Qwen4ExpLayout layout;
     DFlashDraftLayout draft;
@@ -230,21 +235,34 @@ int main(int argc, const char *argv[]) {
     vision.outputHiddenSize = layout.hiddenSize;
 
     uint64_t targetBytes = 0, draftBytes = 0;
-    for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    for (uint32_t layer = 0; layer < layout.layers && !supplied; ++layer) {
       const bool full = layout.isFullAttentionLayer(layer);
       targetBytes += writeWeightFile(
           root / "target" / ("layer-" + std::to_string(layer) + ".bin"),
           Qwen4ExpLayout::layerMagic, layer, full ? 1U : 0U,
           layerSections(layout, full));
     }
+    if (supplied) {
+      for (const auto &entry :
+           std::filesystem::recursive_directory_iterator(root)) {
+        if (!entry.is_regular_file()) continue;
+        const std::string name = entry.path().string();
+        if (name.find("/target/") != std::string::npos)
+          targetBytes += entry.file_size();
+        else if (name.find("/draft/") != std::string::npos)
+          draftBytes += entry.file_size();
+      }
+    }
     std::vector<uint64_t> head = hyperConnectionSections(layout, false);
     head.push_back(uint64_t(layout.hiddenSize) * kBFloat16Bytes);
     head.push_back(q4Bytes(layout.vocabularySize, layout.hiddenSize));
-    targetBytes += writeWeightFile(root / "target/head.bin", "MDFN0002",
-                                   layout.layers, 2, head);
+    if (!supplied)
+      targetBytes += writeWeightFile(root / "target/head.bin", "MDFN0002",
+                                     layout.layers, 2, head);
     const uint64_t embeddingElements =
         uint64_t(layout.vocabularySize) * layout.hiddenSize;
-    targetBytes += writeWeightFile(
+    if (!supplied)
+      targetBytes += writeWeightFile(
         root / "target/embedding.bin", "MDFN0003", layout.vocabularySize,
         layout.hiddenSize,
         std::array<uint64_t, 3>{embeddingElements / 2, embeddingElements / 32,
@@ -268,17 +286,20 @@ int main(int argc, const char *argv[]) {
         hcWidth, hcWidth, hcWidth,
         hcWidth * layout.pleConvolutionTaps};
     const uint64_t ngramBytes =
-        writeWeightFile(root / "target/ngram.bin", "MDFN0004",
-                        layout.ngramShards, layout.ngramHeadDimension(), ple);
-    targetBytes += ngramBytes;
+        supplied ? std::filesystem::file_size(root / "target/ngram.bin")
+                 : writeWeightFile(root / "target/ngram.bin", "MDFN0004",
+                                   layout.ngramShards,
+                                   layout.ngramHeadDimension(), ple);
+    if (!supplied) targetBytes += ngramBytes;
 
-    for (uint32_t layer = 0; layer < draft.layers; ++layer)
+    for (uint32_t layer = 0; layer < draft.layers && !supplied; ++layer)
       draftBytes += writeWeightFile(
           root / "draft" / ("layer-" + std::to_string(layer) + ".bin"),
           "MDFD0004", layer, 0, draftLayerSections(draft));
     const uint64_t codebook =
         uint64_t(draft.vocabularySize) * draft.selectorRank * kBFloat16Bytes;
-    draftBytes += writeWeightFile(
+    if (!supplied)
+      draftBytes += writeWeightFile(
         root / "draft/model.bin", "MDFD0004", draft.layers, 1,
         std::array<uint64_t, 6>{
             q4Bytes(draft.hiddenSize, draft.targetHiddenSize),
@@ -287,7 +308,7 @@ int main(int argc, const char *argv[]) {
             q4Bytes(draft.selectorRank, draft.hiddenSize), codebook,
             codebook});
 
-    writeManifest(root, layout, draft);
+    if (!supplied) writeManifest(root, layout, draft);
 
     uint64_t onDisk = 0;
     for (const auto &entry :
@@ -333,7 +354,7 @@ int main(int argc, const char *argv[]) {
                  "what is\n                   streamed is bounded by the "
                  "cache the budget allows\n";
 
-    std::filesystem::remove_all(root);
+    if (!supplied) std::filesystem::remove_all(root);
     std::cout << "qwen4exp package test passed\n";
     return 0;
   } catch (const std::exception &error) {
