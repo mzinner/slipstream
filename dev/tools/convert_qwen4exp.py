@@ -486,6 +486,27 @@ def write_per_layer_embedding(source: Checkpoint, destination: Path) -> int:
     return packed.finish()
 
 
+def write_placeholder_draft(destination: Path) -> int:
+    """A draft of the right shape and no content.
+
+    The package format requires a DFlash 2 draft and the loader reads one
+    unconditionally, but this model has none: it ships an MTP head, which is
+    a different architecture that these files cannot describe. Until a draft
+    is trained for this target, the package carries zeros - enough for the
+    engine to load, validate and plan, and useless for proposing tokens.
+    Nothing can reach it in the meantime, because execution is refused a step
+    earlier.
+    """
+    layer, model, _ = draft_sections()
+    total = 0
+    for index in range(5):
+        total += sized_file(
+            destination / f"layer-{index}.bin", DRAFT_MAGIC, index, 0, layer
+        )
+    total += sized_file(destination / "model.bin", DRAFT_MAGIC, 5, 1, model)
+    return total
+
+
 def sized_file(path: Path, magic: bytes, layer: int, kind: int, entries) -> int:
     """Header and a hole: the file is the size the layout implies, no body."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -738,8 +759,11 @@ def main() -> int:
                 note = f"  (released {freed / 2**30:.1f} GiB of source)"
         print(f"  layer-{index}.bin {written / 2**30:.2f} GiB{note}")
     total += write_per_layer_embedding(source, target)
+    draft = write_placeholder_draft(arguments.destination / "draft")
     print(f"\ntarget weights  {total / 2**30:.2f} GiB")
-    print("head, embedding and draft are not wired up yet")
+    print(f"draft           {draft / 2**30:.2f} GiB of zeros - this model has")
+    print("                no DFlash 2 draft, only an MTP head")
+    print("head and embedding are not wired up yet")
     return 0
 
 
