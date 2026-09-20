@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from tools.package_format import (  # noqa: E402
     ALIGNMENT,
     EXPERT_STORAGE_N,
+    StreamingWeightFile,
     WeightFile,
     align,
     pad_rows,
@@ -91,6 +92,33 @@ class PackageFormatTests(unittest.TestCase):
         self.assertTrue(np.all(grown[0][100:] == 0))
         with self.assertRaises(ValueError):
             pad_rows(codes, scales, biases, 64)
+
+    def test_streaming_matches_writing_it_all_at_once(self):
+        payloads = [b"a" * 100, b"b" * (ALIGNMENT + 7), b"c" * 3]
+        with tempfile.TemporaryDirectory() as scratch:
+            whole = Path(scratch) / "whole.bin"
+            written = WeightFile(whole, b"MDFN0004", 2, 3)
+            for payload in payloads:
+                written.section(payload)
+            written.finish()
+
+            # The large section arrives in pieces, as the table does.
+            streamed = Path(scratch) / "streamed.bin"
+            out = StreamingWeightFile(streamed, b"MDFN0004", 2, 3)
+            out.section(payloads[0])
+            out.begin()
+            for start in range(0, len(payloads[1]), 512):
+                out.write(payloads[1][start : start + 512])
+            out.section(payloads[2])
+            out.finish()
+
+            self.assertEqual(whole.read_bytes(), streamed.read_bytes())
+
+    def test_streaming_refuses_a_write_outside_a_section(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            out = StreamingWeightFile(Path(scratch) / "x.bin", b"MDFN0004", 0, 0)
+            with self.assertRaises(ValueError):
+                out.write(b"loose")
 
     def test_align_is_idempotent(self):
         self.assertEqual(align(0), 0)

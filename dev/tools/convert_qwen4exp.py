@@ -38,6 +38,7 @@ from tools.package_format import (  # noqa: E402
     FINE_GROUP,
     GROUP,
     STORAGE_N,
+    StreamingWeightFile,
     WeightFile,
     align,
     pad_rows,
@@ -141,6 +142,7 @@ LAYOUT = {
     "ngram_size": 3,
     "ple_taps": 4,
     "ple_layer": 1,
+    "ngram_shards": 128,
 }
 
 
@@ -397,6 +399,66 @@ def write_layer(source: Checkpoint, index: int, destination: Path) -> int:
     return packed.finish()
 
 
+def write_per_layer_embedding(source: Checkpoint, destination: Path) -> int:
+    """The per-layer embedding, streamed because its table is 29.8 GiB.
+
+    The table is 128 shards of identical shape whose rows total exactly the
+    padded vocabulary, so it is a concatenation in shard order - the shards
+    are uniform slices of one table, not one chunk per head. The per-head
+    vocabulary sizes and offsets travel with it as hashing metadata; they do
+    not decide the order.
+
+    Its rows are 160 wide, which is not a whole number of 64-element groups,
+    so it quantizes in groups of 32 and stays row-major: it is gathered a row
+    at a time, never multiplied as a tile.
+    """
+    prefix = f"model.language_model.layers.{LAYOUT['ple_layer']}.ple"
+    embedding = prefix + ".ple_embedding"
+    shards = LAYOUT["ngram_shards"] if "ngram_shards" in LAYOUT else 128
+    names = [f"{embedding}.ngram_embedding.shard_{i}.weight" for i in range(shards)]
+    missing = [name for name in names if not source.has(name)]
+    if missing:
+        raise FileNotFoundError(
+            f"{len(missing)} of {shards} table shards are not downloaded yet"
+        )
+
+    packed = StreamingWeightFile(
+        destination / "ngram.bin",
+        NGRAM_MAGIC,
+        shards,
+        LAYOUT["ngram_head_dimension"],
+    )
+    # Weights, then scales, then biases: three runs over the whole table, so
+    # each shard is quantized once and its three parts held until the run they
+    # belong to is being written.
+    parts = []
+    for name in names:
+        codes, scales, biases = quantize_affine(source.tensor(name), group=FINE_GROUP)
+        flat = codes.reshape(-1)
+        parts.append(
+            (
+                (flat[0::2] | (flat[1::2] << 4)).astype(np.uint8).tobytes(),
+                scales.tobytes(),
+                biases.tobytes(),
+            )
+        )
+    for run in range(3):
+        packed.begin()
+        for part in parts:
+            packed.write(part[run])
+    del parts
+
+    for name in ("ngram_heads_offsets", "ngram_heads_vocab_sizes"):
+        packed.section(source.raw(f"{embedding}.{name}"))
+    packed.section(source.raw(f"{embedding}.layer_multipliers"))
+    packed.section(quantized_tile(source.tensor(prefix + ".key_proj.weight")))
+    packed.section(quantized_tile(source.tensor(prefix + ".value_proj.weight")))
+    for name in ("norm_key", "norm_query", "norm_conv"):
+        packed.section(source.raw(f"{prefix}.{name}.weight"))
+    packed.section(source.raw(prefix + ".conv1d.weight"))
+    return packed.finish()
+
+
 def sized_file(path: Path, magic: bytes, layer: int, kind: int, entries) -> int:
     """Header and a hole: the file is the size the layout implies, no body."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -583,26 +645,33 @@ def main() -> int:
 
     if not arguments.dry_run and not arguments.source:
         parser.error("--source is required unless --dry-run is given")
-    if not arguments.dry_run:
-        # Layers convert; the per-layer embedding does not yet. Its table is
-        # 128 shards with a prime vocabulary per head and its own offsets, and
-        # assembling it in the wrong order would produce a package that loads
-        # and gathers the wrong rows. That wants the real shards to check
-        # against, and they are not all here yet.
-        parser.error(
-            "the per-layer embedding is not wired up; run with --dry-run, or "
-            "convert layers directly with write_layer"
+    if arguments.dry_run:
+        total = dry_run(arguments.destination)
+        on_disk = sum(
+            path.stat().st_blocks * 512
+            for path in arguments.destination.rglob("*")
+            if path.is_file()
         )
+        print(f"target weights  {total / 2**30:.2f} GiB apparent")
+        print(f"on disk         {on_disk / 1024:.0f} KiB (headers only)")
+        print(f"package at      {arguments.destination}")
+        return 0
 
-    total = dry_run(arguments.destination)
-    on_disk = sum(
-        path.stat().st_blocks * 512
-        for path in arguments.destination.rglob("*")
-        if path.is_file()
-    )
-    print(f"target weights  {total / 2**30:.2f} GiB apparent")
-    print(f"on disk         {on_disk / 1024:.0f} KiB (headers only)")
-    print(f"package at      {arguments.destination}")
+    source = Checkpoint(arguments.source)
+    target = arguments.destination / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    total = 0
+    for index in range(LAYOUT["layers"]):
+        try:
+            written = write_layer(source, index, target)
+        except KeyError as missing:
+            print(f"  layer-{index}.bin needs {missing}, not downloaded yet")
+            return 1
+        total += written
+        print(f"  layer-{index}.bin {written / 2**30:.2f} GiB")
+    total += write_per_layer_embedding(source, target)
+    print(f"\ntarget weights  {total / 2**30:.2f} GiB")
+    print("head, embedding and draft are not wired up yet")
     return 0
 
 

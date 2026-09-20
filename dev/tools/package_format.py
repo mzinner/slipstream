@@ -75,6 +75,56 @@ class WeightFile:
         return len(out)
 
 
+class StreamingWeightFile:
+    """The same format, written as it goes.
+
+    A layer is a gibibyte or two and fits in memory comfortably. The
+    per-layer embedding does not: its table alone is 29.8 GiB, and the source
+    it is quantized from is larger still. This writes each section straight
+    out, padding to alignment as it crosses a boundary, so a section can be
+    appended in pieces.
+    """
+
+    def __init__(self, path: Path, magic: bytes, layer: int, kind: int):
+        if len(magic) != 8:
+            raise ValueError("a packed file's magic is eight bytes")
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = open(self.path, "wb")
+        self._handle.write(struct.pack("<8sII", magic, layer, kind))
+        self._offset = 16
+        self._open_section = False
+
+    def begin(self) -> "StreamingWeightFile":
+        """Start a section, padding out to its alignment first."""
+        padding = align(self._offset) - self._offset
+        if padding:
+            self._handle.write(b"\0" * padding)
+            self._offset += padding
+        self._open_section = True
+        return self
+
+    def write(self, payload: bytes) -> "StreamingWeightFile":
+        if not self._open_section:
+            raise ValueError("write outside a section; call begin() first")
+        self._handle.write(payload)
+        self._offset += len(payload)
+        return self
+
+    def section(self, payload: bytes) -> "StreamingWeightFile":
+        if not payload:
+            raise ValueError("a packed section is never empty")
+        return self.begin().write(payload)
+
+    def finish(self) -> int:
+        padding = align(self._offset) - self._offset
+        if padding:
+            self._handle.write(b"\0" * padding)
+            self._offset += padding
+        self._handle.close()
+        return self._offset
+
+
 def read_sections(path: Path, sizes: list[int]):
     """The inverse: pull each section back out at the offset the layout implies."""
     raw = Path(path).read_bytes()
