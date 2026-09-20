@@ -73,6 +73,33 @@ class Checkpoint:
     def has(self, name: str) -> bool:
         return name in self._where
 
+    def shards_for(self, names) -> set[str]:
+        return {self._where[name] for name in names if name in self._where}
+
+    def release(self, keep: set[str]) -> int:
+        """Delete shards no remaining tensor needs, returning bytes freed.
+
+        The converted package is about a third the size of the checkpoint it
+        came from, so releasing a shard once nothing else reads it frees
+        space faster than the output fills it. Without this the two cannot
+        both be on disk: 335 GiB of bf16 and a 96.61 GiB package need more
+        room than converting them one after the other ever does.
+        """
+        freed = 0
+        for shard in sorted(set(self._where.values()) - keep):
+            handle = self._open.pop(shard, None)
+            if handle:
+                handle[0].close()
+            try:
+                freed += os.path.getsize(shard)
+                os.remove(shard)
+            except OSError:
+                continue
+        self._where = {
+            name: shard for name, shard in self._where.items() if shard in keep
+        }
+        return freed
+
     def tensor(self, name: str) -> np.ndarray:
         shard = self._where[name]
         if shard not in self._open:
@@ -641,6 +668,12 @@ def main() -> int:
     parser.add_argument("--destination", required=True, type=Path)
     parser.add_argument("--source", type=Path)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--release-source",
+        action="store_true",
+        help="delete each shard once no remaining layer reads it; needed when "
+        "the checkpoint and the package will not both fit",
+    )
     arguments = parser.parse_args()
 
     if not arguments.dry_run and not arguments.source:
@@ -658,6 +691,25 @@ def main() -> int:
         return 0
 
     source = Checkpoint(arguments.source)
+    if arguments.release_source:
+        # Deleting shards out from under a running download would lose data
+        # and confuse the fetcher, so refuse unless the checkpoint is whole.
+        index = arguments.source / "model.safetensors.index.json"
+        if not index.exists():
+            parser.error(
+                "--release-source needs a complete checkpoint; its index is "
+                "not downloaded yet"
+            )
+        wanted = set(json.loads(index.read_text())["weight_map"].values())
+        present = {path.name for path in arguments.source.glob("*.safetensors")}
+        if wanted - present:
+            parser.error(
+                f"--release-source needs a complete checkpoint; "
+                f"{len(wanted - present)} of {len(wanted)} shards are missing"
+            )
+        if any(arguments.source.glob("*.incomplete")):
+            parser.error("a download is still in progress in that directory")
+
     target = arguments.destination / "target"
     target.mkdir(parents=True, exist_ok=True)
     total = 0
@@ -668,7 +720,23 @@ def main() -> int:
             print(f"  layer-{index}.bin needs {missing}, not downloaded yet")
             return 1
         total += written
-        print(f"  layer-{index}.bin {written / 2**30:.2f} GiB")
+        note = ""
+        if arguments.release_source:
+            still_needed = set()
+            for later in range(index + 1, LAYOUT["layers"]):
+                still_needed |= source.shards_for(
+                    [
+                        name
+                        for name in source._where
+                        if f".layers.{later}." in name
+                        or ".ple." in name
+                        or ".layers." not in name
+                    ]
+                )
+            freed = source.release(still_needed)
+            if freed:
+                note = f"  (released {freed / 2**30:.1f} GiB of source)"
+        print(f"  layer-{index}.bin {written / 2**30:.2f} GiB{note}")
     total += write_per_layer_embedding(source, target)
     print(f"\ntarget weights  {total / 2**30:.2f} GiB")
     print("head, embedding and draft are not wired up yet")
