@@ -42,6 +42,7 @@ from tools.package_format import (  # noqa: E402
     WeightFile,
     align,
     pad_rows,
+    plain_q4,
     q4_bytes,
     tile_q4,
 )
@@ -486,6 +487,28 @@ def write_per_layer_embedding(source: Checkpoint, destination: Path) -> int:
     return packed.finish()
 
 
+def write_head(source: Checkpoint, destination: Path) -> int:
+    path = destination / "head.bin"
+    packed = WeightFile(path, HEAD_MAGIC, LAYOUT["layers"], 2)
+    write_hyper(packed, source, "model.language_model.hyper_connection_mixer", False)
+    if source.has("model.language_model.norm.weight"):
+        packed.section(source.raw("model.language_model.norm.weight"))
+    else:
+        packed.section(b"\0" * (LAYOUT["hidden"] * BF16))
+    packed.section(quantized_tile(source.tensor("lm_head.weight")))
+    return packed.finish()
+
+
+def write_embedding(source: Checkpoint, destination: Path) -> int:
+    path = destination / "embedding.bin"
+    packed = WeightFile(path, EMBEDDING_MAGIC, LAYOUT["vocabulary"], LAYOUT["hidden"])
+    raw_embed = source.tensor("model.language_model.embed_tokens.weight")
+    codes, scales, biases = quantize_affine(raw_embed, group=GROUP)
+    for run in plain_q4(codes, scales, biases):
+        packed.section(run)
+    return packed.finish()
+
+
 def write_placeholder_draft(destination: Path) -> int:
     """A draft of the right shape and no content.
 
@@ -758,12 +781,17 @@ def main() -> int:
             if freed:
                 note = f"  (released {freed / 2**30:.1f} GiB of source)"
         print(f"  layer-{index}.bin {written / 2**30:.2f} GiB{note}")
+    total += write_head(source, target)
+    print("  head.bin")
+    total += write_embedding(source, target)
+    print("  embedding.bin")
     total += write_per_layer_embedding(source, target)
+    print("  ngram.bin")
     draft = write_placeholder_draft(arguments.destination / "draft")
+    write_manifest(arguments.destination)
     print(f"\ntarget weights  {total / 2**30:.2f} GiB")
     print(f"draft           {draft / 2**30:.2f} GiB of zeros - this model has")
     print("                no DFlash 2 draft, only an MTP head")
-    print("head and embedding are not wired up yet")
     return 0
 
 
