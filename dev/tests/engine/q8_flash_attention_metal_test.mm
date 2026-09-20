@@ -576,6 +576,77 @@ void requireIdentical(const Pipelines &placement, const Case &data,
   }
 }
 
+// The sparse walk visits a list of logical pages and masks the tokens the
+// indexer dropped. Handing it every page with every token kept must reproduce
+// the dense result exactly: same positions, same causal limit, same softmax,
+// only a different way of arriving at the pages. Anything less than bit
+// equality here means the walk moved something it should not have.
+Dispatch dispatchSparse(id<MTLDevice> device, id<MTLCommandQueue> queue,
+                        id<MTLComputePipelineState> split,
+                        id<MTLComputePipelineState> reduce, const Case &data,
+                        uint32_t width, const std::vector<uint32_t> &pages,
+                        const std::vector<uint32_t> &masks) {
+  const Shape shape = data.shape;
+  const uint32_t splits = data.params.split_count;
+  const uint64_t laneBytes = data.queries.length;
+  id<MTLBuffer> queries = makeBuffer(device, width * laneBytes);
+  id<MTLBuffer> output = makeBuffer(device, width * laneBytes);
+  const uint64_t slots = uint64_t{width} * shape.kvHeads * splits;
+  id<MTLBuffer> partials = makeBuffer(
+      device, slots * shape.fusedRows() * kHeadDimension * sizeof(float));
+  id<MTLBuffer> statistics =
+      makeBuffer(device, slots * shape.fusedRows() * 2 * sizeof(float));
+  for (uint32_t lane = 0; lane < width; ++lane) {
+    std::memcpy(static_cast<uint8_t *>(queries.contents) + lane * laneBytes,
+                data.queries.contents, laneBytes);
+  }
+  // One lane's selection: the count, then the pages, then their masks.
+  const uint32_t stride = uint32_t(1 + pages.size() + masks.size());
+  id<MTLBuffer> selection =
+      makeBuffer(device, uint64_t{stride} * width * sizeof(uint32_t));
+  uint32_t *cursor = static_cast<uint32_t *>(selection.contents);
+  for (uint32_t lane = 0; lane < width; ++lane) {
+    uint32_t *base = cursor + uint64_t{lane} * stride;
+    base[0] = uint32_t(pages.size());
+    std::memcpy(base + 1, pages.data(), pages.size() * sizeof(uint32_t));
+    std::memcpy(base + 1 + pages.size(), masks.data(),
+                masks.size() * sizeof(uint32_t));
+  }
+  std::array<Q8VerifyAttentionParams, 4> params{};
+  params.fill(data.params);
+  id<MTLCommandBuffer> command = [queue commandBuffer];
+  id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+  [encoder setComputePipelineState:split];
+  [encoder setBuffer:queries offset:0 atIndex:0];
+  [encoder setBuffer:data.q8Keys offset:0 atIndex:1];
+  [encoder setBuffer:data.keyScales offset:0 atIndex:2];
+  [encoder setBuffer:data.q8Values offset:0 atIndex:3];
+  [encoder setBuffer:data.valueScales offset:0 atIndex:4];
+  [encoder setBuffer:partials offset:0 atIndex:5];
+  [encoder setBuffer:statistics offset:0 atIndex:6];
+  for (uint32_t index = 7; index < 11; ++index)
+    [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:index];
+  [encoder setBytes:params.data()
+              length:sizeof(Q8VerifyAttentionParams) * params.size()
+             atIndex:11];
+  [encoder setBuffer:selection offset:0 atIndex:12];
+  [encoder setBytes:&stride length:sizeof(uint32_t) atIndex:13];
+  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, splits, width)
+          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  [encoder setComputePipelineState:reduce];
+  [encoder setBuffer:partials offset:0 atIndex:0];
+  [encoder setBuffer:statistics offset:0 atIndex:1];
+  [encoder setBuffer:output offset:0 atIndex:2];
+  [encoder setBytes:params.data()
+              length:sizeof(Q8VerifyAttentionParams) * params.size()
+             atIndex:3];
+  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, shape.fusedRows(), width)
+          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  [encoder endEncoding];
+  finish(command);
+  return {copyOf(output), copyOf(partials), copyOf(statistics)};
+}
+
 // Keep the CPU reference gates for both scale placements and verify that a
 // second independent submission produces identical output and scratch.
 void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
@@ -638,6 +709,59 @@ void run(const char *libraryPath) {
     runCase(device, queue, pipelines, shape, 8'192, 5, 4, false);
     runCase(device, queue, pipelines, shape, 32'768, 7, 4, false);
     runCase(device, queue, pipelines, shape, 32'768, 8, 2, false, 65);
+  }
+  // The sparse walk, on the shape it is built for. Selecting every page with
+  // every token kept must land on the dense answer bit for bit.
+  {
+    const Shape shape = kShapes[1];
+    const Pipelines dense = makePipelines(device, library, shape, true);
+    id<MTLComputePipelineState> sparse =
+        makePipeline(device, library, "verify_attention_q8_sparse_kv2_g8");
+    for (const uint32_t committed : {127u, 1'100u, 4'093u}) {
+      Case data = makeCase(device, shape, committed, 8, kQ8VerifySplits);
+      fill(data);
+      const uint32_t pageCount =
+          (committed + 8 + kPageTokens - 1) / kPageTokens;
+      std::vector<uint32_t> pages(pageCount), masks(pageCount, ~0u);
+      for (uint32_t page = 0; page < pageCount; ++page) pages[page] = page;
+      const Dispatch want =
+          dispatch(device, queue, dense.split, dense.reduce, data, 2);
+      const Dispatch got = dispatchSparse(device, queue, sparse, dense.reduce,
+                                          data, 2, pages, masks);
+      require(want.output.size() == got.output.size(),
+              "sparse output size differs from dense");
+      {
+        size_t differing = 0, firstAt = 0;
+        for (size_t i = 0; i < want.output.size(); ++i) {
+          if (want.output[i] != got.output[i]) {
+            if (!differing) firstAt = i;
+            ++differing;
+          }
+        }
+        if (differing) {
+          std::cout << "  sparse differs at " << differing << " of "
+                    << want.output.size() << " elements, first at " << firstAt
+                    << " dense=" << std::hex << unsigned(want.output[firstAt])
+                    << " sparse=" << unsigned(got.output[firstAt]) << std::dec
+                    << '\n';
+        }
+        require(differing == 0,
+                "a full selection did not reproduce the dense result exactly");
+      }
+      // Dropping pages must change the answer, or the mask is doing nothing
+      // and the comparison above proves nothing either.
+      if (pageCount > 2) {
+        std::vector<uint32_t> fewer(pages.begin(), pages.end() - 1);
+        std::vector<uint32_t> fewerMasks(fewer.size(), ~0u);
+        const Dispatch partial = dispatchSparse(
+            device, queue, sparse, dense.reduce, data, 2, fewer, fewerMasks);
+        require(std::memcmp(want.output.data(), partial.output.data(),
+                            want.output.size()) != 0,
+                "dropping a page left the result unchanged");
+      }
+      std::cout << "sparse_walk committed=" << committed
+                << " pages=" << pageCount << " matches dense exactly\n";
+    }
   }
   std::cout << "q8_flash_attention_metal_test: ok\n";
 }

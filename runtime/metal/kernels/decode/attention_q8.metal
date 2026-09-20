@@ -102,12 +102,51 @@ inline SplashQ8VerifyTile splash_q8_verify_attention_tile_at(
         thread_index);                                                          \
   }
 
+// Sparse verify: the same tile, walking the pages the indexer selected. The
+// selection is per batch lane, laid out as a count, then that many logical
+// page indices, then that many token bitmaps, at a fixed stride per lane.
+#define Q8_VERIFY_SPARSE(Name, Heads, Group, ScaleInSoftmax)                    \
+  kernel void Name(                                                             \
+      device bfloat *queries [[buffer(0)]],                                     \
+      device int8_t *q8_keys [[buffer(1)]],                                     \
+      device const float *q8_key_scales [[buffer(2)]],                          \
+      device int8_t *q8_values [[buffer(3)]],                                   \
+      device const float *q8_value_scales [[buffer(4)]],                        \
+      device float *partials [[buffer(5)]],                                     \
+      device float *statistics [[buffer(6)]],                                   \
+      device const uint *page_table0 [[buffer(7)]],                             \
+      device const uint *page_table1 [[buffer(8)]],                             \
+      device const uint *page_table2 [[buffer(9)]],                             \
+      device const uint *page_table3 [[buffer(10)]],                            \
+      constant SplashQ8VerifyAttentionParams *params [[buffer(11)]],            \
+      device const uint *selection [[buffer(12)]],                              \
+      constant uint &selection_stride [[buffer(13)]],                           \
+      uint3 group [[threadgroup_position_in_grid]],                             \
+      uint thread_index [[thread_index_in_threadgroup]]) {                      \
+    Q8_VERIFY_SCRATCH(Group)                                                    \
+    Q8_VERIFY_TILE_AT(Heads, Group)                                             \
+    device const uint *lane = selection + ulong(group.z) * selection_stride;    \
+    const uint selected_count = lane[0];                                        \
+    device const uint *selected_pages = lane + 1;                               \
+    device const uint *selected_masks = selected_pages + selected_count;        \
+    splash_q8_attention_direct_tile<Heads, Group,                               \
+                                      SPLASH_TARGET_VERIFY_ROWS,                \
+                                      ScaleInSoftmax, true>(                    \
+        tile.queries, q8_keys, q8_key_scales, q8_values, q8_value_scales,       \
+        tile.page_table, tile.kv_head, tile.committed_tokens, tile.active_rows, \
+        tile.splits, tile.split, partials, statistics, tile.slot, scores,       \
+        probabilities, row_max, row_sum, previous_scale, &rescale,              \
+        thread_index, selected_pages, selected_masks, selected_count);          \
+  }
+
 Q8_VERIFY_SPLIT(verify_attention_q8_split, 4, 6, true)
 Q8_VERIFY_SPLIT(verify_attention_q8_split_cooperative_scale,
                        4, 6, false)
 Q8_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8, 2, 8, true)
 Q8_VERIFY_SPLIT(
     verify_attention_q8_split_cooperative_scale_kv2_g8, 2, 8, false)
+Q8_VERIFY_SPARSE(verify_attention_q8_sparse_kv2_g8, 2, 8, false)
+#undef Q8_VERIFY_SPARSE
 #undef Q8_VERIFY_SPLIT
 #undef Q8_VERIFY_TILE_AT
 #undef Q8_VERIFY_SCRATCH

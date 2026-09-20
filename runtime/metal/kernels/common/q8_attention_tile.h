@@ -93,7 +93,11 @@ inline void splash_q8_page_softmax(
     device const float4 *key_scales, device const float4 *value_scales,
     uint token_start,
     uint visible_tokens, uint committed_tokens, uint active_rows,
-    uint thread_index) {
+    uint thread_index,
+    // Which of this page's tokens the indexer kept, one bit per token, low
+    // bit first. The dense path passes all ones and the comparison folds
+    // away; only qwen4exp's sparse attention passes anything else.
+    uint page_mask = ~0u) {
   constexpr uint N = SplashQ8PageTokens;
   constexpr uint FusedRows = RowsPerTile * QueryHeadsPerKVHead;
   constexpr uint TokensPerLane = 8;
@@ -129,7 +133,8 @@ inline void splash_q8_page_softmax(
   float local_max = -INFINITY;
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
-    score[j] = token + j < limit ? score[j] : -INFINITY;
+    const bool kept = ((page_mask >> (column + j)) & 1u) != 0u;
+    score[j] = (token + j < limit && kept) ? score[j] : -INFINITY;
     local_max = max(local_max, score[j]);
   }
   local_max = max(local_max, simd_shuffle_xor(local_max, 1));
@@ -178,8 +183,14 @@ inline void splash_q8_page_softmax(
 // KV-head-major [kv head][row][query head in group][dimension], so the tile's
 // fused rows form one contiguous M x D tensor. Three barriers per page order
 // the score store, the softmax and the probability reads of PV.
+// With Sparse, the walk follows a list of logical pages instead of a range,
+// and each listed page carries a bitmap of the tokens the indexer kept. The
+// logical page index still supplies the position, so causality and the
+// softmax are untouched; only which pages are visited, and which tokens
+// within them survive the mask, change. Without Sparse the two extra
+// arguments are unread and the mask folds to a constant.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile,
-          bool ScaleInSoftmax>
+          bool ScaleInSoftmax, bool Sparse = false>
 inline void splash_q8_attention_direct_tile(
     device bfloat *tile_queries, device int8_t *q8_keys,
     device const float *q8_key_scales, device int8_t *q8_values,
@@ -189,17 +200,24 @@ inline void splash_q8_attention_direct_tile(
     threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
-    uint thread_index) {
+    uint thread_index,
+    device const uint *selected_pages = nullptr,
+    device const uint *selected_masks = nullptr,
+    uint selected_count = 0u) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr ushort N = SplashQ8PageTokens;
   constexpr ushort D = SplashQ8HeadDimension;
   uint visible_tokens = committed_tokens + active_rows;
   uint pages = splash_attention_pages(visible_tokens);
-  uint per_split = splash_attention_pages_per_split(pages, splits);
+  // Splits partition the work the same way whether it is a page range or a
+  // selection: the sparse walk divides its list, not the whole history, or
+  // every split would redo the entire selection.
+  const uint walk_total = Sparse ? selected_count : pages;
+  uint per_split = splash_attention_pages_per_split(walk_total, splits);
   uint page_begin = split * per_split;
-  if (page_begin >= pages)
+  if (page_begin >= walk_total)
     return;
-  uint page_end = min(pages, page_begin + per_split);
+  uint page_end = min(walk_total, page_begin + per_split);
   if (thread_index < M) {
     row_max[thread_index] = -INFINITY;
     row_sum[thread_index] = 0.0f;
@@ -238,7 +256,12 @@ inline void splash_q8_attention_direct_tile(
       running[index] = 0.0f;
   }
 
-  for (uint page = page_begin; page < page_end; ++page) {
+  // Dense walks a contiguous range of logical pages; sparse walks the slots
+  // the indexer selected. Either way `page` is the logical index, which is
+  // what the position and the causal limit are built from.
+  for (uint step = page_begin; step < page_end; ++step) {
+    const uint page = Sparse ? selected_pages[step] : step;
+    const uint page_mask = Sparse ? selected_masks[step] : ~0u;
     uint physical = page_table[page];
     uint token_start = page * N;
     auto kt = tensor(
@@ -276,7 +299,8 @@ inline void splash_q8_attention_direct_tile(
         scores, probabilities, row_max, row_sum, previous_scale, rescale,
         reinterpret_cast<device const float4 *>(key_scales),
         reinterpret_cast<device const float4 *>(value_scales), token_start,
-        visible_tokens, committed_tokens, active_rows, thread_index);
+        visible_tokens, committed_tokens, active_rows, thread_index,
+        page_mask);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (atomic_load_explicit(rescale, memory_order_relaxed)) {
 #pragma unroll
