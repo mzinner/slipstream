@@ -21,11 +21,14 @@ section arithmetic here agrees with the reader.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import struct
 import sys
 from pathlib import Path
+
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tools.package_format import (  # noqa: E402
@@ -35,9 +38,75 @@ from tools.package_format import (  # noqa: E402
     FINE_GROUP,
     GROUP,
     STORAGE_N,
+    WeightFile,
     align,
+    pad_rows,
     q4_bytes,
+    tile_q4,
 )
+from tools.quantize import from_bf16, quantize_affine  # noqa: E402
+
+
+class Checkpoint:
+    """Reads tensors by name from a directory of safetensors shards.
+
+    The index is not required: every shard's header names what it holds, so a
+    partially downloaded checkpoint can still be converted as far as it goes.
+    """
+
+    def __init__(self, root: Path):
+        self.root = Path(root)
+        self._where: dict[str, str] = {}
+        self._open: dict[str, tuple] = {}
+        for shard in sorted(glob.glob(str(self.root / "*.safetensors"))):
+            try:
+                with open(shard, "rb") as handle:
+                    (length,) = struct.unpack("<Q", handle.read(8))
+                    header = json.loads(handle.read(length))
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue  # still being written
+            header.pop("__metadata__", None)
+            for name in header:
+                self._where[name] = shard
+
+    def has(self, name: str) -> bool:
+        return name in self._where
+
+    def tensor(self, name: str) -> np.ndarray:
+        shard = self._where[name]
+        if shard not in self._open:
+            handle = open(shard, "rb")
+            (length,) = struct.unpack("<Q", handle.read(8))
+            self._open[shard] = (handle, json.loads(handle.read(length)), 8 + length)
+        handle, header, base = self._open[shard]
+        entry = header[name]
+        start, end = entry["data_offsets"]
+        handle.seek(base + start)
+        payload = handle.read(end - start)
+        if entry["dtype"] != "BF16":
+            raise ValueError(f"{name} is {entry['dtype']}, expected BF16")
+        values = from_bf16(np.frombuffer(payload, dtype=np.uint16))
+        return values.reshape(entry["shape"])
+
+    def raw(self, name: str) -> bytes:
+        """The stored bytes, for tensors the package carries as bf16."""
+        shard = self._where[name]
+        if shard not in self._open:
+            handle = open(shard, "rb")
+            (length,) = struct.unpack("<Q", handle.read(8))
+            self._open[shard] = (handle, json.loads(handle.read(length)), 8 + length)
+        handle, header, base = self._open[shard]
+        start, end = header[name]["data_offsets"]
+        handle.seek(base + start)
+        return handle.read(end - start)
+
+
+def quantized_tile(values, storage_n=STORAGE_N, group=GROUP, pad_to=None):
+    codes, scales, biases = quantize_affine(values, group=group)
+    if pad_to is not None:
+        codes, scales, biases = pad_rows(codes, scales, biases, pad_to)
+    return tile_q4(codes, scales, biases, storage_n=storage_n, group=group)
+
 
 LAYER_MAGIC = b"MDFN0001"
 HEAD_MAGIC = b"MDFN0002"
@@ -182,6 +251,118 @@ def ngram_sections() -> list[tuple[int, str]]:
         (width, "ple-conv-norm"),
         (width * LAYOUT["ple_taps"], "ple-convolution"),
     ]
+
+
+def write_hyper(packed, source: Checkpoint, prefix: str, with_inject: bool):
+    """Order matches readHyperConnection: norm, mix down, mix up, inject."""
+    packed.section(source.raw(prefix + ".hc_norm.weight"))
+    packed.section(source.raw(prefix + ".input_mix_weight_down.weight"))
+    packed.section(source.raw(prefix + ".input_mix_weight_up.weight"))
+    if with_inject:
+        packed.section(source.raw(prefix + ".block_inject_weight.weight"))
+
+
+def write_experts(packed, source: Checkpoint, prefix: str) -> None:
+    """Expert slabs, 128 wide, with gate and up split out of one tensor.
+
+    The checkpoint fuses them as [experts, 2 * intermediate, hidden] and the
+    reference chunks the product in two, so the first half is the gate and
+    the second the up. They are separate slabs here because the operator
+    reads them as separate projections.
+    """
+    experts = LAYOUT["experts"]
+    inter = LAYOUT["expert_intermediate"]
+    narrow = EXPERT_STORAGE_N
+
+    router = source.tensor(prefix + ".gate.weight")
+    packed.section(quantized_q8(router))
+
+    fused = source.tensor(prefix + ".experts.gate_up_proj")
+    for half in (slice(0, inter), slice(inter, 2 * inter)):
+        packed.section(
+            b"".join(
+                quantized_tile(fused[index][half], storage_n=narrow)
+                for index in range(experts)
+            )
+        )
+    del fused
+    down = source.tensor(prefix + ".experts.down_proj")
+    packed.section(
+        b"".join(
+            quantized_tile(down[index], storage_n=narrow) for index in range(experts)
+        )
+    )
+    del down
+
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        packed.section(
+            quantized_tile(
+                source.tensor(f"{prefix}.shared_expert.{name}.weight"),
+                storage_n=narrow,
+            )
+        )
+    gate = source.tensor(prefix + ".shared_expert_gate.weight")
+    padded = np.zeros((STORAGE_N, gate.shape[1]), dtype=np.float32)
+    padded[0] = gate[0]
+    packed.section(quantized_q8(padded))
+
+
+def quantized_q8(values) -> bytes:
+    """Eight-bit affine, in the runs readQ8Projection expects."""
+    out, inp = values.shape
+    groups = inp // GROUP
+    blocks = np.ascontiguousarray(values, dtype=np.float32).reshape(out, groups, GROUP)
+    low = blocks.min(axis=2)
+    high = blocks.max(axis=2)
+    anchor_low = np.abs(low) > np.abs(high)
+    bias = np.where(anchor_low, low, high)
+    other = np.where(anchor_low, high, low)
+    scale = (other - bias) / 255.0
+    from tools.quantize import to_bf16
+
+    scale_bits, bias_bits = to_bf16(scale), to_bf16(bias)
+    stored_scale = from_bf16(scale_bits)[..., None]
+    stored_bias = from_bf16(bias_bits)[..., None]
+    safe = np.where(stored_scale == 0, 1.0, stored_scale)
+    codes = np.clip(np.rint((blocks - stored_bias) / safe), 0, 255).astype(np.uint8)
+
+    # [quant group][row] for the parameters, as the router kernel indexes them.
+    def parameters(values_):
+        return values_.T.reshape(-1).tobytes()
+
+    return (
+        codes.reshape(out, inp).tobytes()
+        + parameters(scale_bits)
+        + parameters(bias_bits)
+    )
+
+
+def write_layer(source: Checkpoint, index: int, destination: Path) -> int:
+    prefix = f"model.language_model.layers.{index}"
+    kind, _ = layer_sections(index)
+    packed = WeightFile(destination / f"layer-{index}.bin", LAYER_MAGIC, index, kind)
+    write_hyper(packed, source, prefix + ".attn_hyper_connection", True)
+
+    if kind == 1:
+        raise NotImplementedError("attention layers are not wired up yet")
+    linear = prefix + ".linear_attn"
+    parts = [
+        source.tensor(linear + ".in_proj_qkv.weight"),
+        source.tensor(linear + ".in_proj_z.weight"),
+        source.tensor(linear + ".in_proj_b.weight"),
+        source.tensor(linear + ".in_proj_a.weight"),
+    ]
+    packed.section(quantized_tile(np.vstack(parts), pad_to=LAYOUT["packed_gdn"]))
+    packed.section(source.raw(linear + ".conv1d.weight"))
+    logarithm = source.tensor(linear + ".A_log")
+    packed.section((-np.exp(logarithm)).astype("<f4").tobytes())
+    packed.section(source.raw(linear + ".dt_bias"))
+    packed.section(source.raw(linear + ".norm.weight"))
+    packed.section(quantized_tile(source.tensor(linear + ".out_proj.weight")))
+
+    write_hyper(packed, source, prefix + ".mlp_hyper_connection", True)
+    write_experts(packed, source, prefix + ".mlp")
+    return packed.finish()
 
 
 def sized_file(path: Path, magic: bytes, layer: int, kind: int, entries) -> int:
