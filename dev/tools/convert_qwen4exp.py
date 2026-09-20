@@ -262,6 +262,34 @@ def write_hyper(packed, source: Checkpoint, prefix: str, with_inject: bool):
         packed.section(source.raw(prefix + ".block_inject_weight.weight"))
 
 
+def write_attention(packed, source: Checkpoint, prefix: str) -> None:
+    """Order matches readQwenMixer then readIndexer.
+
+    The packed projection is query, key, value, and the query is twice the
+    head width because this model gates its attention output - the same
+    doubling the 27B has, which is why packed_full is 13312 and not 7168.
+    """
+    parts = [
+        source.tensor(prefix + ".q_proj.weight"),
+        source.tensor(prefix + ".k_proj.weight"),
+        source.tensor(prefix + ".v_proj.weight"),
+    ]
+    packed.section(quantized_tile(np.vstack(parts), pad_to=LAYOUT["packed_full"]))
+    packed.section(source.raw(prefix + ".q_norm.weight"))
+    packed.section(source.raw(prefix + ".k_norm.weight"))
+    packed.section(quantized_tile(source.tensor(prefix + ".o_proj.weight")))
+    # The indexer tiles 128 wide: its projection is 640 out, not a multiple
+    # of 256.
+    packed.section(
+        quantized_tile(
+            source.tensor(prefix + ".indexer.index_qk_proj.weight"),
+            storage_n=EXPERT_STORAGE_N,
+        )
+    )
+    packed.section(source.raw(prefix + ".indexer.q_layernorm.weight"))
+    packed.section(source.raw(prefix + ".indexer.k_layernorm.weight"))
+
+
 def write_experts(packed, source: Checkpoint, prefix: str) -> None:
     """Expert slabs, 128 wide, with gate and up split out of one tensor.
 
@@ -344,7 +372,11 @@ def write_layer(source: Checkpoint, index: int, destination: Path) -> int:
     write_hyper(packed, source, prefix + ".attn_hyper_connection", True)
 
     if kind == 1:
-        raise NotImplementedError("attention layers are not wired up yet")
+        write_attention(packed, source, prefix + ".self_attn")
+        write_hyper(packed, source, prefix + ".mlp_hyper_connection", True)
+        write_experts(packed, source, prefix + ".mlp")
+        return packed.finish()
+
     linear = prefix + ".linear_attn"
     parts = [
         source.tensor(linear + ".in_proj_qkv.weight"),
@@ -552,9 +584,14 @@ def main() -> int:
     if not arguments.dry_run and not arguments.source:
         parser.error("--source is required unless --dry-run is given")
     if not arguments.dry_run:
+        # Layers convert; the per-layer embedding does not yet. Its table is
+        # 128 shards with a prime vocabulary per head and its own offsets, and
+        # assembling it in the wrong order would produce a package that loads
+        # and gathers the wrong rows. That wants the real shards to check
+        # against, and they are not all here yet.
         parser.error(
-            "converting real weights needs the checkpoint; only --dry-run is "
-            "wired up so far"
+            "the per-layer embedding is not wired up; run with --dry-run, or "
+            "convert layers directly with write_layer"
         )
 
     total = dry_run(arguments.destination)
