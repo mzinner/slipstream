@@ -230,6 +230,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/Qwen3_8.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/QwenTarget.cpp \
+	runtime/model/Qwen4ExpTarget.cpp \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/QwenState.cpp

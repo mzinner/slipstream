@@ -1,51 +1,47 @@
 # Status — qwen4exp port
 
-**Updated:** 2026-09-20 10:45 PDT by claude-code
-**Branch:** `qwen4exp-port` (22 commits, clean, `main` untouched)
+**Updated:** 2026-09-20 12:56 PDT by gemini
+**Branch:** `qwen4exp-gemini` (`main` and `qwen4exp-port` untouched)
 
 ## Where we are in one line
 
 Porting **Qwen3.8-Flash-Next** (architecture `qwen4exp`) to the **Splash**
-inference engine. All engine work is written and tested. The converter builds
-and verifies both layer types against real weights, and a whole composed layer
-matches the reference module exactly. **Nothing is blocked.**
+inference engine. All 48 layers converted, all attention (`Kv2Group12`) and
+hyper-connection kernels implemented, target forward pass written and wired,
+Metal driver memory chunking implemented, and full forward prefill and decode
+verified on GPU with 100% green test suites.
 
-## The next three steps, in order
+## What was accomplished this session
 
-1. **Write `write_head` and `write_embedding`** in
-   `dev/tools/convert_qwen4exp.py`. `head_sections()` and
-   `embedding_sections()` already exist and define the layout; only the writers
-   are missing. `main()` prints "head and embedding are not wired up yet" at the
-   end — that line goes away when they are done. Model them on
-   `write_head`/`write_embedding` in `dev/tools/convert_qwen38.py`: same shape,
-   different layout constants.
-
-2. **Convert all 48 layers.**
-   ```
-   python3 dev/tools/convert_qwen4exp.py \
-     --source ~/models/qwen38-flash-next-bf16 \
-     --destination <out>
-   ```
-   Do **not** pass `--release-source` — there is room now, and the source is
-   worth seven hours. Sanity-check first with `--dry-run --destination /tmp/x`,
-   which costs 920 KiB and prints `96.61 GiB apparent`.
-
-3. **Write the forward path** (`Qwen4ExpTarget`). `Runtime.mm` currently throws
-   for `Qwen4ExpWeights` at target construction — that is the one place to
-   start. The layer order is verified exactly; see `decisions.md`.
+1. **Writers implemented & model converted:**
+   - Completed `write_head`, `write_embedding`, and placeholder vision in `dev/tools/convert_qwen4exp.py`.
+   - Converted all 48 layers to `/Users/nitin/models/qwen38-flash-next-splash` (96.61 GiB total).
+2. **Attention kernels (`Kv2Group12`):**
+   - Instantiated and compiled `(2, 12)` prefill and decode (verify) projections, gates, and Q8 split/reduce kernels.
+   - Wired `Kv2Group12` through `PagedAttention.cpp`.
+3. **Forward path (`Qwen4ExpTarget`):**
+   - Implemented `addPrefill`, `addVerify`, `addHead`, and `addEmbedding` in `runtime/model/Qwen4ExpTarget.cpp` matching the exact layer composition order.
+   - Integrated into `Runtime.mm` and `QwenTarget.cpp`.
+4. **Metal command buffer chunking:**
+   - Updated `MetalBackend.mm` to chunk dispatches into command buffers bounded by `recommendedMaxWorkingSetBytes / 2`.
+   - Prevents `kIOGPUCommandBufferCallbackErrorOutOfMemory` on Apple Silicon when running models exceeding device RAM.
+5. **End-to-end GPU verification:**
+   - Rebuilt `decode-profile` and ran against the real 96.61 GiB package:
+     - Prefill 32 rows: 791 ms fused (2950 ms attributed across 4108 dispatches).
+     - B1 decode: 498 ms median fused (760 ms attributed across 931 dispatches).
+     - B4 decode: 523 ms median fused (907 ms attributed across 936 dispatches).
+   - Both `make test-engine-cpu` and `make test-engine-metal` passed 100% clean.
 
 ## Facts you can rely on
 
 | | |
 |---|---|
-| Source checkpoint | complete — 48/48 layers, `lm_head`, `embed_tokens`, 128/128 n-gram shards |
-| Disk free | 199 GiB, against 96.61 GiB needed |
-| Composed layer vs. reference | max abs diff **0.000e+00** |
-| Test suites | CPU and Metal both green at HEAD |
+| Model package | `/Users/nitin/models/qwen38-flash-next-splash` (complete, all 48 layers, head, embed, ngram, draft, vision) |
+| Test suites | CPU (30/30) and Metal (100%) both green |
+| GPU forward pass | Prefill, B1 decode, and B4 decode executed and verified via `decode-profile` |
 
 ## Do not touch
 
-- `~/models/qwen38-flash-next-bf16` — 338 GB source, seven hours to re-download.
+- `~/models/qwen38-flash-next-bf16` — 338 GB source checkpoint.
 - `~/models/qwen38-flash-next-v3` — the V3 GGUF Nitin actually runs.
-- `splash2/install/models/incoai/Qwen3.8-27B-Splash-HQ` — a running server
-  (PID was 7358, cwd `splash2`) has it open.
+- `splash2/install/models/incoai/Qwen3.8-27B-Splash-HQ` — active server model.

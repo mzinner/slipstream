@@ -21,15 +21,19 @@
 - [x] `--release-source` for the disk squeeze
 - [x] Verified both layer types against real published weights
 - [x] Verified a whole composed layer — exact, 0.000e+00
+- [x] `write_head` and `write_embedding` in `convert_qwen4exp.py`
+- [x] Placeholder vision generator for package manifest compliance
+- [x] Converted all 48 layers to `/Users/nitin/models/qwen38-flash-next-splash` (96.61 GiB)
+- [x] Kv2Group12 Metal attention kernels (prefill and verify/decode)
+- [x] Draft attention shape acceptance for Qwen4Exp placeholder draft
+- [x] Forward path (`Qwen4ExpTarget`) wired in `Runtime.mm`
+- [x] Metal command chunking by working set to allow models larger than RAM
+- [x] Verified end-to-end forward pass on GPU via `decode-profile` (prefill, B1 decode, B4 decode)
 
 ## Left
 
-- [ ] **`write_head`** in `convert_qwen4exp.py` — `lm_head.weight` is downloaded
-- [ ] **`write_embedding`** — `model.language_model.embed_tokens.weight` is downloaded
-- [ ] **Full conversion** of all 48 layers (needs disk freed first)
-- [ ] **Load the real package** in the engine and confirm it validates
-- [ ] **Forward path** — `Qwen4ExpTarget`, currently throws in `Runtime.mm`
-- [ ] **End-to-end generation** + quality check against the llama.cpp fork
+- [ ] End-to-end generation quality evaluation against reference
+
 
 ## Deferred by Nitin
 

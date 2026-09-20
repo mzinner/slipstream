@@ -61,6 +61,8 @@ enum class KernelLayout : uint8_t { Hidden5120, Hidden2048 };
     return KernelLayout::Hidden5120;
   if (shape == DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128})
     return KernelLayout::Hidden2048;
+  if (shape == DraftAttentionShape{2560, 768, 3072, 2048, 16, 8, 128})
+    return KernelLayout::Hidden2048;
   throw std::invalid_argument("unsupported compiled draft attention shape");
 }
 

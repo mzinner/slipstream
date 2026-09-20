@@ -288,21 +288,10 @@ struct Runtime::Impl {
         runtimeOverheadReserveBytes(value.runtimeOverheadReserveBytes),
         sampling(value.backend, geometry.target.vocabularySize, kDecodeRows),
         targetModel(std::visit(
-                        [&](const auto &weights) -> QwenTarget {
-                          using W = std::remove_cvref_t<decltype(weights)>;
-                          // qwen4exp packages load and plan, but its
-                          // hyper-connections, sparse-attention indexer and
-                          // n-gram module have no operators yet, so there is
-                          // nothing to execute.
-                          if constexpr (std::is_same_v<W, Qwen4ExpWeights>) {
-                            throw std::invalid_argument(
-                                "qwen4exp has no execution path yet");
-                          } else {
-                            return QwenTarget(weights, value.backend,
-                                              operators);
-                          }
-                        },
-                        value.package.target)),
+            [&](const auto &weights) -> QwenTarget {
+              return QwenTarget(weights, value.backend, operators);
+            },
+            value.package.target)),
         draftModel(value.package.draft, value.backend, operators) {
     if (!admitAllocation)
       throw std::invalid_argument(
@@ -1032,6 +1021,9 @@ struct Runtime::Impl {
     buffers.groupedInput = p(PrefillTensor::MoeGroupedInput);
     buffers.expertIntermediate = p(PrefillTensor::MoeExpertIntermediate);
     buffers.expertOutput = p(PrefillTensor::MoeExpertOutput);
+    buffers.hyperReduced = p(PrefillTensor::HyperReduced);
+    buffers.hyperInjection = p(PrefillTensor::HyperInjection);
+    buffers.hyperMixed = p(PrefillTensor::HyperMixed);
     std::vector<kv::Q8LayerStorage> kvLayers(
         geometry.target.kvLayout.attentionLayers);
     for (uint32_t layer = 0; layer < kvLayers.size(); ++layer)
@@ -1055,9 +1047,9 @@ struct Runtime::Impl {
       ops::DraftAttention::gatherLastRows(
           graph,
           prefillU16(PrefillTensor::Hidden0, sequence.rowBegin,
-                     item.tokenCount, geometry.target.hiddenSize),
+                     item.tokenCount, geometry.target.residualWidth()),
           d(DecodeTensor::Hidden0), item.tokenCount,
-          geometry.target.hiddenSize);
+          geometry.target.residualWidth());
       if (entry.constraint == ConstraintMode::None) {
         if (samplingEnabled(entry)) {
           entry.cycleUniforms.fill(0.0F);
@@ -1259,6 +1251,9 @@ struct Runtime::Impl {
     buffers.groupedInput = d(DecodeTensor::MoeGroupedInput);
     buffers.expertIntermediate = d(DecodeTensor::MoeExpertIntermediate);
     buffers.expertOutput = d(DecodeTensor::MoeExpertOutput);
+    buffers.hyperReduced = d(DecodeTensor::HyperReduced);
+    buffers.hyperInjection = d(DecodeTensor::HyperInjection);
+    buffers.hyperMixed = d(DecodeTensor::HyperMixed);
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
       const ModelBatchItem &item = paddedItem(lane);
       q8[lane] = q8Params(item.logicalPosition, kDecodeRows, kTileRows,
@@ -1398,6 +1393,15 @@ struct Runtime::Impl {
     const uint32_t rows = lanes * kDecodeRows;
     targetModel.addEmbedding(graph, decodeArena->packed(tokens, lanes),
                              decodeArena->packed(output, lanes), rows);
+  }
+
+  void encodeBatchDraftEmbedding(CommandGraph &graph, DecodeTensor tokens,
+                                 DecodeTensor output, uint32_t lanes) {
+    if (!lanes || lanes > kLaneCount)
+      throw std::invalid_argument("invalid draft embedding batch width");
+    const uint32_t rows = lanes * kDecodeRows;
+    targetModel.addDraftEmbedding(graph, decodeArena->packed(tokens, lanes),
+                                  decodeArena->packed(output, lanes), rows);
   }
 
   void encodeBatchVerifyInput(CommandGraph &graph, uint32_t lanes) {
@@ -2187,8 +2191,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
       requests[lane] = lanes[lane].request;
       logicalPositions[lane] = items[lane].logicalPosition;
     }
-    impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
-                                DecodeTensor::DraftHidden0, width);
+    impl_->encodeBatchDraftEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
+                                    DecodeTensor::DraftHidden0, width);
     impl_->encodeDraftBatchGraph(commandGraph, {requests.data(), lanes.size()},
                                  {logicalPositions.data(), lanes.size()},
                                  batchStats);

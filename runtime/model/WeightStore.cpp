@@ -242,8 +242,9 @@ ops::Q4Projection readQ4Projection(WeightFile &file,
                                    metal::MetalBackend &backend,
                                    uint32_t outputSize,
                                    uint32_t inputSize,
-                                   std::string_view label) {
-    validateQ4Layout(outputSize, inputSize);
+                                   std::string_view label,
+                                   uint32_t storageN) {
+    validateQ4Layout(outputSize, inputSize, storageN);
     const uint64_t elements = q4Elements(outputSize, inputSize);
     const uint64_t weightBytes = elements / 2;
     const uint64_t parameterBytes = elements / 32;

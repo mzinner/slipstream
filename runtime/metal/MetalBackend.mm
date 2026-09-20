@@ -1326,83 +1326,159 @@ CommandTicket MetalBackend::submitCommandAsync(
         throw MetalBackendError(std::move(message));
     };
 
-    auto wallStart = std::chrono::steady_clock::now();
-    id<MTLCommandBuffer> command = [impl_->queue commandBuffer];
-    if (!command) {
-        failBeforeCommit("unable to create Metal command buffer");
-    }
-    const uint64_t sparseEventValue = impl_->pendingSparseEventValue;
-    if (sparseEventValue) {
-        // Keep the queue dependency explicit; the CPU resolves it before commit.
-        [command encodeWaitForEvent:impl_->sparseEvent value:sparseEventValue];
-    }
-    // Encoders can remain autoreleased after their command has completed.
-    // The serving loop is long-lived, so bound their temporary ownership to
-    // encoding; the command retains everything needed for GPU execution.
-    @autoreleasepool {
-        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-        if (!encoder) {
-            failBeforeCommit("unable to create Metal compute encoder");
-        }
-        try {
-            for (const PreparedDispatch &item : prepared) {
-                const ComputeDispatch &dispatch = *item.source;
-                [encoder setComputePipelineState:item.pipeline];
-                for (const BufferBinding &binding : dispatch.buffers) {
-                    const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
-                    [encoder setBuffer:buffer.allocation->buffer
-                                offset:checkedNSUInteger(buffer.offsetBytes,
-                                                         "buffer offset")
-                               atIndex:binding.index];
-                }
-                for (const BytesBinding &binding : dispatch.bytes) {
-                    [encoder setBytes:binding.data
-                               length:checkedNSUInteger(binding.sizeBytes,
-                                                        "byte binding size")
-                              atIndex:binding.index];
-                }
-                [encoder dispatchThreadgroups:item.groups
-                         threadsPerThreadgroup:item.threads];
+    const uint64_t maxCommandWorkingSetBytes = std::max<uint64_t>(
+        4ULL * 1024 * 1024 * 1024,
+        impl_->capabilities.recommendedMaxWorkingSetBytes / 2);
+
+    std::vector<std::vector<PreparedDispatch>> chunks;
+    std::unordered_set<const MetalAllocation *> currentAllocations;
+    uint64_t currentWorkingSetBytes = 0;
+    std::vector<PreparedDispatch> currentChunk;
+
+    for (const PreparedDispatch &item : prepared) {
+        uint64_t additionalBytes = 0;
+        for (const BufferBinding &binding : item.source->buffers) {
+            const MetalAllocation *alloc = binding.buffer.impl_->allocation.get();
+            if (currentAllocations.find(alloc) == currentAllocations.end()) {
+                additionalBytes += alloc->bytes;
             }
-            [encoder endEncoding];
-        } catch (...) {
-            impl_->asyncState->releaseSubmission(ticketState->sequence);
-            throw;
         }
+        if (!currentChunk.empty() &&
+            currentWorkingSetBytes + additionalBytes > maxCommandWorkingSetBytes) {
+            chunks.push_back(std::move(currentChunk));
+            currentChunk.clear();
+            currentAllocations.clear();
+            currentWorkingSetBytes = 0;
+            additionalBytes = 0;
+            for (const BufferBinding &binding : item.source->buffers) {
+                const MetalAllocation *alloc = binding.buffer.impl_->allocation.get();
+                if (currentAllocations.find(alloc) == currentAllocations.end()) {
+                    additionalBytes += alloc->bytes;
+                }
+            }
+        }
+        for (const BufferBinding &binding : item.source->buffers) {
+            currentAllocations.insert(binding.buffer.impl_->allocation.get());
+        }
+        currentWorkingSetBytes += additionalBytes;
+        currentChunk.push_back(item);
+    }
+    if (!currentChunk.empty()) {
+        chunks.push_back(std::move(currentChunk));
     }
 
-    // currentAllocatedSize is instantaneous rather than a historical peak.
-    // The shared observer survives backend destruction while Metal owns the
-    // command, and the ticket retains every referenced allocation.
+    auto wallStart = std::chrono::steady_clock::now();
+    const uint64_t sparseEventValue = impl_->pendingSparseEventValue;
+
+    std::vector<id<MTLCommandBuffer>> commands;
+    commands.reserve(chunks.size());
+
+    for (size_t c = 0; c < chunks.size(); ++c) {
+        id<MTLCommandBuffer> command = [impl_->queue commandBuffer];
+        if (!command) {
+            failBeforeCommit("unable to create Metal command buffer");
+        }
+        if (c == 0 && sparseEventValue) {
+            // Keep the queue dependency explicit; the CPU resolves it before commit.
+            [command encodeWaitForEvent:impl_->sparseEvent value:sparseEventValue];
+        }
+        @autoreleasepool {
+            id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+            if (!encoder) {
+                failBeforeCommit("unable to create Metal compute encoder");
+            }
+            try {
+                for (const PreparedDispatch &item : chunks[c]) {
+                    const ComputeDispatch &dispatch = *item.source;
+                    [encoder setComputePipelineState:item.pipeline];
+                    for (const BufferBinding &binding : dispatch.buffers) {
+                        const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
+                        [encoder setBuffer:buffer.allocation->buffer
+                                    offset:checkedNSUInteger(buffer.offsetBytes,
+                                                             "buffer offset")
+                                   atIndex:binding.index];
+                    }
+                    for (const BytesBinding &binding : dispatch.bytes) {
+                        [encoder setBytes:binding.data
+                                   length:checkedNSUInteger(binding.sizeBytes,
+                                                            "byte binding size")
+                                  atIndex:binding.index];
+                    }
+                    [encoder dispatchThreadgroups:item.groups
+                             threadsPerThreadgroup:item.threads];
+                }
+                [encoder endEncoding];
+            } catch (...) {
+                impl_->asyncState->releaseSubmission(ticketState->sequence);
+                throw;
+            }
+        }
+        commands.push_back(command);
+    }
+
+    struct MultiCommandTracker {
+        std::atomic<size_t> remaining{0};
+        std::mutex mutex;
+        CommandTiming timing;
+        std::string error;
+        std::shared_ptr<CommandTicket::State> ticketState;
+    };
+    auto tracker = std::make_shared<MultiCommandTracker>();
+    tracker->remaining.store(commands.size(), std::memory_order_relaxed);
+    tracker->ticketState = ticketState;
+
     std::shared_ptr<BackendAsyncState> observer = impl_->asyncState;
-    [command addScheduledHandler:^(id<MTLCommandBuffer>) {
-      observer->sampleDeviceMemory();
-    }];
-    [command addCompletedHandler:^(id<MTLCommandBuffer> completedCommand) {
-      observer->sampleDeviceMemory();
-      auto wallEnd = std::chrono::steady_clock::now();
-      CommandTiming timing;
-      timing.gpuSeconds =
-          completedCommand.GPUEndTime - completedCommand.GPUStartTime;
-      if (!std::isfinite(timing.gpuSeconds) || timing.gpuSeconds < 0.0) {
-          timing.gpuSeconds = 0.0;
-      }
-      timing.wallSeconds =
-          std::chrono::duration<double>(wallEnd - wallStart).count();
-
-      std::string error;
-      if (completedCommand.status != MTLCommandBufferStatusCompleted) {
-          std::ostringstream message;
-          message << "Metal command " << ticketState->sequence
-                  << " failed (sparse event " << sparseEventValue << ')';
-          if (completedCommand.error) {
-              message << ": " << errorDescription(completedCommand.error);
+    for (size_t c = 0; c < commands.size(); ++c) {
+        id<MTLCommandBuffer> command = commands[c];
+        [command addScheduledHandler:^(id<MTLCommandBuffer>) {
+          observer->sampleDeviceMemory();
+        }];
+        [command addCompletedHandler:^(id<MTLCommandBuffer> completedCommand) {
+          observer->sampleDeviceMemory();
+          auto wallEnd = std::chrono::steady_clock::now();
+          CommandTiming timing;
+          timing.gpuSeconds =
+              completedCommand.GPUEndTime - completedCommand.GPUStartTime;
+          if (!std::isfinite(timing.gpuSeconds) || timing.gpuSeconds < 0.0) {
+              timing.gpuSeconds = 0.0;
           }
-          error = message.str();
-      }
 
-      ticketState->finish(timing, std::move(error));
-    }];
+          std::string error;
+          if (completedCommand.status != MTLCommandBufferStatusCompleted) {
+              std::ostringstream message;
+              message << "Metal command " << tracker->ticketState->sequence;
+              if (commands.size() > 1) {
+                  message << " (chunk " << (c + 1) << '/' << commands.size() << ')';
+              }
+              message << " failed (sparse event " << sparseEventValue << ')';
+              if (completedCommand.error) {
+                  message << ": " << errorDescription(completedCommand.error);
+              }
+              error = message.str();
+          }
+
+          bool isLast = false;
+          CommandTiming finalTiming;
+          std::string finalError;
+          {
+              std::lock_guard lock(tracker->mutex);
+              tracker->timing.gpuSeconds += timing.gpuSeconds;
+              if (!error.empty() && tracker->error.empty()) {
+                  tracker->error = std::move(error);
+              }
+              if (tracker->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                  isLast = true;
+                  tracker->timing.wallSeconds =
+                      std::chrono::duration<double>(wallEnd - wallStart).count();
+                  finalTiming = tracker->timing;
+                  finalError = std::move(tracker->error);
+              }
+          }
+          if (isLast) {
+              tracker->ticketState->finish(finalTiming, std::move(finalError));
+          }
+        }];
+    }
     impl_->sampleDeviceMemory();
     id<MTLSharedEvent> event = impl_->sparseEvent;
     const bool pendingMap =
@@ -1413,7 +1489,7 @@ CommandTicket MetalBackend::submitCommandAsync(
         observer->mapWaitEvent.store(sparseEventValue, std::memory_order_release);
     }
     afterMetalEvent(event, sparseEventValue, kSparseMapTimeoutMilliseconds,
-        [command, event, observer, ticketState, sparseEventValue,
+        [commands, event, observer, ticketState, sparseEventValue,
          pendingMap, mapWaitStart, wallStart](bool signaled) {
             if (pendingMap) {
                 const double waited = steadySeconds() - mapWaitStart;
@@ -1439,9 +1515,11 @@ CommandTicket MetalBackend::submitCommandAsync(
                 ticketState->finish(timing, message.str());
                 return;
             }
-            if (!observer->commitSubmission(ticketState->sequence, command)) {
-                ticketState->finish({}, "Metal backend stopped before command submission");
-                return;
+            for (id<MTLCommandBuffer> command : commands) {
+                if (!observer->commitSubmission(ticketState->sequence, command)) {
+                    ticketState->finish({}, "Metal backend stopped before command submission");
+                    return;
+                }
             }
             observer->sampleDeviceMemory();
         }, observer->stopping.get_token());

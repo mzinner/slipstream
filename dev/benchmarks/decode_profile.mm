@@ -224,8 +224,10 @@ int main(int argc, char **argv) {
            1) /
           model.targetKvLayout().sparseMappingBatchPages() *
           model.targetKvLayout().sparseMappingBatchPages();
-      MemoryGovernor governor(
-          backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1);
+      const uint64_t governorLimit = std::max(
+          backend.capabilities().recommendedMaxWorkingSetBytes,
+          backend.memoryStats().allocatedBytes + 4ULL * 1024 * 1024 * 1024);
+      MemoryGovernor governor(backend, governorLimit, 1);
       kv::Q8PageStorage pages(backend, governor.allocationAdmission(),
                               model.targetKvLayout(), pageCount);
       for (uint32_t page = 0; page < pageCount; ++page) {

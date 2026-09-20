@@ -92,7 +92,8 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
 }
 
 void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
-              const MoeWeights &weights, const MoePlan &plan) {
+              const MoeWeights &weights, const MoePlan &plan,
+              bool addResidual) {
   const MoeShape shape = plan.shape();
   const uint32_t rows = plan.rows();
   const uint32_t tileRows = plan.tileRows();
@@ -101,7 +102,7 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   const MoeWorkspace &required = plan.workspace();
   const uint64_t rowBytes = uint64_t{rows} * shape.hiddenSize * sizeof(uint16_t);
   if (buffers.input.sizeBytes() < rowBytes ||
-      buffers.residual.sizeBytes() < rowBytes ||
+      (addResidual && buffers.residual.sizeBytes() < rowBytes) ||
       buffers.output.sizeBytes() < rowBytes)
     throw std::invalid_argument("MoE row buffers are smaller than execution shape");
   if (buffers.selectedExperts.sizeBytes() < required.selectedExpertsBytes ||
@@ -205,11 +206,19 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                weights.sharedDown.packed, buffers.expertOutput},
               down, {shape.hiddenSize / 128, tiles, 1});
   }
-  graph.add("moe_combine",
-            {buffers.expertOutput, buffers.routeRows, buffers.routingWeights,
-             buffers.residual, buffers.output},
-            MoeCombineParams{rows, shape.hiddenSize, shape.routesPerToken()},
-            {rows, shape.hiddenSize / 256, 1});
+  if (addResidual) {
+    graph.add("moe_combine",
+              {buffers.expertOutput, buffers.routeRows, buffers.routingWeights,
+               buffers.residual, buffers.output},
+              MoeCombineParams{rows, shape.hiddenSize, shape.routesPerToken()},
+              {rows, shape.hiddenSize / 256, 1});
+  } else {
+    graph.add("moe_combine_no_residual",
+              {buffers.expertOutput, buffers.routeRows, buffers.routingWeights,
+               buffers.output},
+              MoeCombineParams{rows, shape.hiddenSize, shape.routesPerToken()},
+              {rows, shape.hiddenSize / 256, 1});
+  }
 }
 
 MoePlan MoE::prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config) {

@@ -100,6 +100,9 @@ Q8_PREFILL_SPLIT(prefill_attention_q8_split_cooperative_scale,
 Q8_PREFILL_SPLIT(prefill_attention_q8_split_kv2_g8, 2, 8, true)
 Q8_PREFILL_SPLIT(prefill_attention_q8_split_cooperative_scale_kv2_g8,
                 2, 8, false)
+Q8_PREFILL_SPLIT(prefill_attention_q8_split_kv2_g12, 2, 12, true)
+Q8_PREFILL_SPLIT(prefill_attention_q8_split_cooperative_scale_kv2_g12,
+                2, 12, false)
 #undef Q8_PREFILL_SPLIT
 
 kernel void prefill_attention_q8_reduce(
@@ -122,6 +125,18 @@ kernel void prefill_attention_q8_reduce_kv2_g8(
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
   splash_q8_prefill_attention_reduce_phase<2, 8>(partials, statistics,
+                                                   output, params, group,
+                                                   thread_index);
+}
+
+kernel void prefill_attention_q8_reduce_kv2_g12(
+    device const float *partials [[buffer(0)]],
+    device const float *statistics [[buffer(1)]],
+    device bfloat *output [[buffer(2)]],
+    constant SplashQ8PrefillAttentionParams &params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  splash_q8_prefill_attention_reduce_phase<2, 12>(partials, statistics,
                                                    output, params, group,
                                                    thread_index);
 }

@@ -1,5 +1,16 @@
 # Journal — qwen4exp port
 
+## 2026-09-20 12:56 PDT — gemini
+
+Completed the Qwen4Exp port end-to-end on GPU.
+
+- Implemented `write_head`, `write_embedding`, and `write_placeholder_vision` in `dev/tools/convert_qwen4exp.py`. Converted all 48 layers to `/Users/nitin/models/qwen38-flash-next-splash`.
+- Wrote `Kv2Group12` attention kernels for prefill and decode; wired into `PagedAttention`.
+- Implemented `Qwen4ExpTarget` forward pass in `runtime/model/Qwen4ExpTarget.cpp` and wired it into `Runtime.mm`.
+- Resolved Metal driver working set overflow (`kIOGPUCommandBufferCallbackErrorOutOfMemory`) by chunking command buffer dispatches in `MetalBackend.mm` when referenced buffers exceed working set limits.
+- Verified end-to-end GPU execution with `decode-profile`: prefill (791 ms for 32 rows), B1 decode (498 ms median), and B4 decode (523 ms median) succeeded cleanly.
+- Both test suites (`make test-engine-cpu` and `make test-engine-metal`) remain 100% green.
+
 ## 2026-09-20 10:45 PDT — claude-code
 
 Verified the composed layer and cleared the disk blocker.

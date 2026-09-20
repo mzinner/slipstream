@@ -68,6 +68,26 @@ kernel void verify_attention_qkv_kv2_g8(
       reductions, normalized, group, thread_index, lane, simd_group);
 }
 
+kernel void verify_attention_qkv_kv2_g12(
+    device const bfloat *qkv [[buffer(0)]],
+    device const bfloat *q_norm [[buffer(1)]],
+    device const bfloat *k_norm [[buffer(2)]],
+    device const float *rope_cos [[buffer(3)]],
+    device const float *rope_sin [[buffer(4)]],
+    device bfloat *queries [[buffer(5)]], device bfloat *keys [[buffer(6)]],
+    device bfloat *values [[buffer(7)]],
+    constant FullDecodeBatchParams &params [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float reductions[8];
+  threadgroup bfloat normalized[256];
+  full_qkv_decode_phase<24, 2>(
+      qkv, q_norm, k_norm, rope_cos, rope_sin, queries, keys, values, params,
+      reductions, normalized, group, thread_index, lane, simd_group);
+}
+
 template <uint QHeads, uint KHeads>
 inline void full_attention_gate_decode_phase(
     device const bfloat *packed_qkv, device const bfloat *attention,
@@ -122,5 +142,16 @@ kernel void verify_attention_gate_kv2_g8(
     uint index [[thread_position_in_grid]],
     uint grid_size [[threads_per_grid]]) {
   full_attention_gate_decode_phase<16, 2>(
+      packed_qkv, attention, hidden, params, index, grid_size);
+}
+
+kernel void verify_attention_gate_kv2_g12(
+    device const bfloat *packed_qkv [[buffer(0)]],
+    device const bfloat *attention [[buffer(1)]],
+    device bfloat *hidden [[buffer(2)]],
+    constant FullDecodeBatchParams &params [[buffer(3)]],
+    uint index [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]]) {
+  full_attention_gate_decode_phase<24, 2>(
       packed_qkv, attention, hidden, params, index, grid_size);
 }

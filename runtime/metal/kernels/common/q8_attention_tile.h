@@ -102,79 +102,77 @@ inline void splash_q8_page_softmax(
   constexpr uint FusedRows = RowsPerTile * QueryHeadsPerKVHead;
   constexpr uint TokensPerLane = 8;
   constexpr uint LanesPerRow = N / TokensPerLane;
-  static_assert(N == 32, "four lanes of eight tokens span one page");
-  static_assert(LanesPerRow * FusedRows <= 256,
-                "one softmax lane per thread of the 256-thread tile");
-  if (thread_index >= LanesPerRow * FusedRows)
-    return;
-  const uint fused_row = thread_index / LanesPerRow;
-  const uint column = thread_index % LanesPerRow * TokensPerLane;
-  const uint query_row = fused_row / QueryHeadsPerKVHead;
-  const uint causal_end =
-      committed_tokens + min(query_row, active_rows - 1) + 1;
-  const uint limit = min(visible_tokens, causal_end);
-  const uint token = token_start + column;
-  threadgroup const float4 *scores4 =
-      reinterpret_cast<threadgroup const float4 *>(scores + fused_row * N +
-                                                   column);
-  const uint vector = column / 4;
-  float score[TokensPerLane];
-  {
-    float4 low = scores4[0], high = scores4[1];
-    if constexpr (ScaleInSoftmax) {
-      low *= key_scales[vector];
-      high *= key_scales[vector + 1];
+  constexpr uint TotalLanes = LanesPerRow * FusedRows;
+  for (uint lane_idx = thread_index; lane_idx < TotalLanes; lane_idx += 256) {
+    const uint fused_row = lane_idx / LanesPerRow;
+    const uint column = lane_idx % LanesPerRow * TokensPerLane;
+    const uint query_row = fused_row / QueryHeadsPerKVHead;
+    const uint causal_end =
+        committed_tokens + min(query_row, active_rows - 1) + 1;
+    const uint limit = min(visible_tokens, causal_end);
+    const uint token = token_start + column;
+    threadgroup const float4 *scores4 =
+        reinterpret_cast<threadgroup const float4 *>(scores + fused_row * N +
+                                                     column);
+    const uint vector = column / 4;
+    float score[TokensPerLane];
+    {
+      float4 low = scores4[0], high = scores4[1];
+      if constexpr (ScaleInSoftmax) {
+        low *= key_scales[vector];
+        high *= key_scales[vector + 1];
+      }
+      low *= 0.0625f;
+      high *= 0.0625f;
+      score[0] = low.x, score[1] = low.y, score[2] = low.z, score[3] = low.w;
+      score[4] = high.x, score[5] = high.y, score[6] = high.z, score[7] = high.w;
     }
-    low *= 0.0625f;
-    high *= 0.0625f;
-    score[0] = low.x, score[1] = low.y, score[2] = low.z, score[3] = low.w;
-    score[4] = high.x, score[5] = high.y, score[6] = high.z, score[7] = high.w;
-  }
-  float local_max = -INFINITY;
+    float local_max = -INFINITY;
 #pragma unroll
-  for (uint j = 0; j < TokensPerLane; ++j) {
-    const bool kept = ((page_mask >> (column + j)) & 1u) != 0u;
-    score[j] = (token + j < limit && kept) ? score[j] : -INFINITY;
-    local_max = max(local_max, score[j]);
-  }
-  local_max = max(local_max, simd_shuffle_xor(local_max, 1));
-  local_max = max(local_max, simd_shuffle_xor(local_max, 2));
-  const float previous_max = row_max[fused_row];
-  const float next_max = max(previous_max, local_max);
-  float probability[TokensPerLane];
-  float local_sum = 0.0f;
+    for (uint j = 0; j < TokensPerLane; ++j) {
+      const bool kept = ((page_mask >> (column + j)) & 1u) != 0u;
+      score[j] = (token + j < limit && kept) ? score[j] : -INFINITY;
+      local_max = max(local_max, score[j]);
+    }
+    local_max = max(local_max, simd_shuffle_xor(local_max, 1));
+    local_max = max(local_max, simd_shuffle_xor(local_max, 2));
+    const float previous_max = row_max[fused_row];
+    const float next_max = max(previous_max, local_max);
+    float probability[TokensPerLane];
+    float local_sum = 0.0f;
 #pragma unroll
-  for (uint j = 0; j < TokensPerLane; ++j) {
-    probability[j] = token + j < limit ? fast::exp(score[j] - next_max) : 0.0f;
-    local_sum += probability[j];
+    for (uint j = 0; j < TokensPerLane; ++j) {
+      probability[j] = token + j < limit ? fast::exp(score[j] - next_max) : 0.0f;
+      local_sum += probability[j];
+    }
+    local_sum += simd_shuffle_xor(local_sum, 1);
+    local_sum += simd_shuffle_xor(local_sum, 2);
+    if (column == 0) {
+      const float scale = next_max == -INFINITY || next_max == previous_max
+                              ? 1.0f
+                              : fast::exp(previous_max - next_max);
+      previous_scale[fused_row] = scale;
+      row_sum[fused_row] = row_sum[fused_row] * scale + local_sum;
+      row_max[fused_row] = next_max;
+      if (scale != 1.0f)
+        atomic_store_explicit(rescale, 1u, memory_order_relaxed);
+    }
+    // Masked tokens stay exactly zero whatever their stored value scale holds.
+    const float4 low_scales = value_scales[vector],
+                 high_scales = value_scales[vector + 1];
+    const float4 low(token + 0 < limit ? probability[0] * low_scales.x : 0.0f,
+                     token + 1 < limit ? probability[1] * low_scales.y : 0.0f,
+                     token + 2 < limit ? probability[2] * low_scales.z : 0.0f,
+                     token + 3 < limit ? probability[3] * low_scales.w : 0.0f);
+    const float4 high(token + 4 < limit ? probability[4] * high_scales.x : 0.0f,
+                      token + 5 < limit ? probability[5] * high_scales.y : 0.0f,
+                      token + 6 < limit ? probability[6] * high_scales.z : 0.0f,
+                      token + 7 < limit ? probability[7] * high_scales.w : 0.0f);
+    threadgroup bfloat4 *probabilities4 = reinterpret_cast<threadgroup bfloat4 *>(
+        probabilities + fused_row * N + column);
+    probabilities4[0] = bfloat4(low);
+    probabilities4[1] = bfloat4(high);
   }
-  local_sum += simd_shuffle_xor(local_sum, 1);
-  local_sum += simd_shuffle_xor(local_sum, 2);
-  if (column == 0) {
-    const float scale = next_max == -INFINITY || next_max == previous_max
-                            ? 1.0f
-                            : fast::exp(previous_max - next_max);
-    previous_scale[fused_row] = scale;
-    row_sum[fused_row] = row_sum[fused_row] * scale + local_sum;
-    row_max[fused_row] = next_max;
-    if (scale != 1.0f)
-      atomic_store_explicit(rescale, 1u, memory_order_relaxed);
-  }
-  // Masked tokens stay exactly zero whatever their stored value scale holds.
-  const float4 low_scales = value_scales[vector],
-               high_scales = value_scales[vector + 1];
-  const float4 low(token + 0 < limit ? probability[0] * low_scales.x : 0.0f,
-                   token + 1 < limit ? probability[1] * low_scales.y : 0.0f,
-                   token + 2 < limit ? probability[2] * low_scales.z : 0.0f,
-                   token + 3 < limit ? probability[3] * low_scales.w : 0.0f);
-  const float4 high(token + 4 < limit ? probability[4] * high_scales.x : 0.0f,
-                    token + 5 < limit ? probability[5] * high_scales.y : 0.0f,
-                    token + 6 < limit ? probability[6] * high_scales.z : 0.0f,
-                    token + 7 < limit ? probability[7] * high_scales.w : 0.0f);
-  threadgroup bfloat4 *probabilities4 = reinterpret_cast<threadgroup bfloat4 *>(
-      probabilities + fused_row * N + column);
-  probabilities4[0] = bfloat4(low);
-  probabilities4[1] = bfloat4(high);
 }
 
 // One tile over its split's pages with the INT8 K/V and the scales consumed

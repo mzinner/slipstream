@@ -12,12 +12,12 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
     result[static_cast<uint32_t>(tensor)] = bytes;
   };
   put(PrefillTensor::Hidden0,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
+      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.residualWidth()));
   put(PrefillTensor::Hidden1,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
+      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.residualWidth()));
   put(PrefillTensor::InputTokens, bytesFor<uint32_t>(kPrefillRows));
   put(PrefillTensor::Normalized,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
+      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.residualWidth()));
   put(PrefillTensor::Captured,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
                          geometry.target.capturedHiddenSize()));
@@ -126,6 +126,17 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
     put(PrefillTensor::MoeExpertIntermediate, workspace.expertIntermediateBytes);
     put(PrefillTensor::MoeExpertOutput, workspace.expertOutputBytes);
   }
+  if (geometry.target.hyperConnectionCount > 1) {
+    put(PrefillTensor::HyperReduced,
+        bytesFor<uint16_t>(uint64_t{kPrefillRows} *
+                           geometry.target.hyperConnectionLowRank));
+    put(PrefillTensor::HyperInjection,
+        bytesFor<uint16_t>(uint64_t{kPrefillRows} *
+                           geometry.target.hyperConnectionCount));
+    put(PrefillTensor::HyperMixed,
+        bytesFor<uint16_t>(uint64_t{kPrefillRows} *
+                           geometry.target.hiddenSize));
+  }
   return result;
 }
 
@@ -173,12 +184,12 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   };
   const uint64_t r = kDecodeRows;
   put(DecodeTensor::Hidden0,
-      bytesFor<uint16_t>(r * geometry.target.hiddenSize));
+      bytesFor<uint16_t>(r * geometry.target.residualWidth()));
   put(DecodeTensor::Hidden1,
-      bytesFor<uint16_t>(r * geometry.target.hiddenSize));
+      bytesFor<uint16_t>(r * geometry.target.residualWidth()));
   put(DecodeTensor::InputTokens, bytesFor<uint32_t>(r));
   put(DecodeTensor::Normalized,
-      bytesFor<uint16_t>(r * geometry.target.hiddenSize));
+      bytesFor<uint16_t>(r * geometry.target.residualWidth()));
   put(DecodeTensor::Recurrent,
       bytesFor<uint16_t>(r * geometry.target.attentionWidth));
   put(DecodeTensor::GdnHidden,
@@ -306,6 +317,14 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
     put(DecodeTensor::MoeGroupedInput, workspace.groupedInputBytes);
     put(DecodeTensor::MoeExpertIntermediate, workspace.expertIntermediateBytes);
     put(DecodeTensor::MoeExpertOutput, workspace.expertOutputBytes);
+  }
+  if (geometry.target.hyperConnectionCount > 1) {
+    put(DecodeTensor::HyperReduced,
+        bytesFor<uint16_t>(r * geometry.target.hyperConnectionLowRank));
+    put(DecodeTensor::HyperInjection,
+        bytesFor<uint16_t>(r * geometry.target.hyperConnectionCount));
+    put(DecodeTensor::HyperMixed,
+        bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   }
   return result;
 }

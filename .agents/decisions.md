@@ -85,3 +85,20 @@ and passes the CPU suite.
 The package format requires a DFlash 2 draft. Flash-Next has no such draft, only
 an MTP head. A zero-filled placeholder is written so packages validate. Expect
 no speculation speedup until a real draft is trained. Nitin deferred that.
+
+## Kv2Group12 Attention Kernels
+
+Qwen4Exp attention uses 24 query heads and 2 KV heads (head dimension 128), which
+is group size 12 (`Kv2Group12`). Dedicated prefill and decode (verify) projections,
+gates, and Q8 split/reduce kernels were instantiated and wired into `PagedAttention`
+to support this layout cleanly without padding.
+
+## Command Buffer Chunking for Models Exceeding Device RAM
+
+A single Metal command buffer cannot reference resources whose sum exceeds the
+device working set ceiling (~58 GiB on 64 GiB Apple Silicon). Attempting to commit
+all 48 layers (96.61 GiB) in a single command buffer triggers
+`kIOGPUCommandBufferCallbackErrorOutOfMemory`. `MetalBackend::submitCommandAsync`
+now chunks dispatches into batches bounded by `recommendedMaxWorkingSetBytes / 2`.
+All chunks commit in order to the serial command queue, enabling models larger
+than physical RAM to stream on demand without exhausting GPU driver residency limits.

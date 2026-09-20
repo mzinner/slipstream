@@ -18,13 +18,6 @@
 // The gate weights are bf16 rather than Q4 because LowRank is 320, which is
 // not a multiple of either packed tile width.
 
-struct HyperConnectionParams {
-  uint rows;
-  uint hidden;
-  uint count;
-  uint low_rank;
-  float epsilon;
-};
 
 constant constexpr uint kThreads = 256;
 constant constexpr uint kSimdWidth = 32;
@@ -170,3 +163,96 @@ kernel void hyper_connection_update(
     residual[element] = bfloat(float(residual[element]) + gate * value);
   }
 }
+
+kernel void hyper_connection_update_out(
+    device const bfloat *residual_in [[buffer(0)]],
+    device bfloat *residual_out [[buffer(1)]],
+    device const bfloat *block [[buffer(2)]],
+    device const bfloat *injection [[buffer(3)]],
+    constant HyperConnectionParams &params [[buffer(4)]],
+    uint index [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]]) {
+  const uint hidden = params.hidden;
+  const uint width = params.count * hidden;
+  const uint total = params.rows * width;
+  for (uint element = index; element < total; element += grid_size) {
+    const uint row = element / width;
+    const uint offset = element % width;
+    const float gate = float(injection[row * params.count + offset / hidden]);
+    const float value = float(block[row * hidden + offset % hidden]);
+    residual_out[element] = bfloat(float(residual_in[element]) + gate * value);
+  }
+}
+
+// Final mixer: collapses the streams before lm_head without block injection.
+kernel void hyper_connection_mix_no_inject(
+    device const bfloat *normalized [[buffer(0)]],
+    device const bfloat *reduced [[buffer(1)]],
+    device const bfloat *up [[buffer(2)]],
+    device bfloat *mixed [[buffer(3)]],
+    constant HyperConnectionParams &params [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  (void)simd_lane;
+  (void)simd_group;
+  const uint hidden = params.hidden;
+  const uint width = params.count * hidden;
+  const uint low_rank = params.low_rank;
+  device const bfloat *xn = normalized + ulong(row) * width;
+  device const bfloat *low = reduced + ulong(row) * low_rank;
+
+  threadgroup float staged[64];
+  for (uint r = thread_index; r < low_rank && r < 64; r += kThreads)
+    staged[r] = float(low[r]);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  device bfloat *out = mixed + ulong(row) * hidden;
+  for (uint dimension = thread_index; dimension < hidden;
+       dimension += kThreads) {
+    float accumulated = 0.0f;
+    for (uint stream = 0; stream < params.count; ++stream) {
+      const uint index = stream * hidden + dimension;
+      device const bfloat *weights = up + ulong(index) * low_rank;
+      float sum = 0.0f;
+      for (uint r = 0; r < low_rank; ++r) {
+        const float value = r < 64 ? staged[r] : float(low[r]);
+        sum += float(weights[r]) * value;
+      }
+      const float gate = 1.0f / (1.0f + exp(-sum));
+      accumulated += gate * float(xn[index]);
+    }
+    out[dimension] = bfloat(accumulated / float(params.count));
+  }
+}
+
+// Broadcasts a [rows, hidden] embedding to [rows, count * hidden] streams.
+kernel void hyper_connection_broadcast(
+    device const bfloat *input [[buffer(0)]],
+    device bfloat *output [[buffer(1)]],
+    constant HyperConnectionParams &params [[buffer(2)]],
+    uint index [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]]) {
+  const uint width = params.count * params.hidden;
+  const uint total = params.rows * width;
+  for (uint element = index; element < total; element += grid_size) {
+    const uint row = element / width;
+    const uint dim = element % params.hidden;
+    output[element] = input[row * params.hidden + dim];
+  }
+}
+
+// In-place vector addition: residual += delta
+kernel void hyper_connection_accumulate(
+    device bfloat *residual [[buffer(0)]],
+    device const bfloat *delta [[buffer(1)]],
+    constant HyperConnectionParams &params [[buffer(2)]],
+    uint index [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]]) {
+  const uint total = params.rows * params.count * params.hidden;
+  for (uint element = index; element < total; element += grid_size) {
+    residual[element] = bfloat(float(residual[element]) + float(delta[element]));
+  }
+}
+

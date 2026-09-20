@@ -178,7 +178,8 @@ struct MoE final {
   [[nodiscard]] static std::array<MoePlan, 2>
   decodeCandidates(MoeShape shape, uint32_t lanes, uint32_t routeWideRows);
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
-                  const MoeWeights &weights, const MoePlan &plan);
+                  const MoeWeights &weights, const MoePlan &plan,
+                  bool addResidual = true);
 };
 
 } // namespace splash::ops

@@ -530,6 +530,51 @@ def write_placeholder_draft(destination: Path) -> int:
     return total
 
 
+def vision_sections() -> list[tuple[int, str]]:
+    depth = 27
+    hidden = 1152
+    patch_dim = 1536
+    intermediate = 4352
+    merged = 4608
+    out_hidden = LAYOUT["hidden"]
+    grid = 48
+    entries = [
+        (hidden * patch_dim * BF16, "patch-embed-weight"),
+        (hidden * BF16, "patch-embed-bias"),
+        (grid * grid * hidden * BF16, "position-table"),
+    ]
+    for _ in range(depth):
+        entries.append((hidden * BF16, "norm1-weight"))
+        entries.append((hidden * BF16, "norm1-bias"))
+        entries.append((3 * hidden * hidden * BF16, "qkv-weight"))
+        entries.append((3 * hidden * BF16, "qkv-bias"))
+        entries.append((hidden * hidden * BF16, "proj-weight"))
+        entries.append((hidden * BF16, "proj-bias"))
+        entries.append((hidden * BF16, "norm2-weight"))
+        entries.append((hidden * BF16, "norm2-bias"))
+        entries.append((intermediate * hidden * BF16, "fc1-weight"))
+        entries.append((intermediate * BF16, "fc1-bias"))
+        entries.append((hidden * intermediate * BF16, "fc2-weight"))
+        entries.append((hidden * BF16, "fc2-bias"))
+    entries.append((hidden * BF16, "merger-norm-weight"))
+    entries.append((hidden * BF16, "merger-norm-bias"))
+    entries.append((merged * merged * BF16, "merger-fc1-weight"))
+    entries.append((merged * BF16, "merger-fc1-bias"))
+    entries.append((out_hidden * merged * BF16, "merger-fc2-weight"))
+    entries.append((out_hidden * BF16, "merger-fc2-bias"))
+    return entries
+
+
+def write_placeholder_vision(destination: Path) -> int:
+    """A vision tower of the right shape and no content.
+
+    The model loader loads vision weights unconditionally, but Flash-Next is
+    text-only. Carrying a sized hole allows the package to load without error.
+    """
+    entries = vision_sections()
+    return sized_file(destination / "model.bin", VISION_MAGIC, 27, 0, entries)
+
+
 def sized_file(path: Path, magic: bytes, layer: int, kind: int, entries) -> int:
     """Header and a hole: the file is the size the layout implies, no body."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -703,6 +748,7 @@ def dry_run(root: Path) -> int:
     for index in range(5):
         sized_file(root / "draft" / f"layer-{index}.bin", DRAFT_MAGIC, index, 0, layer)
     sized_file(root / "draft" / "model.bin", DRAFT_MAGIC, 5, 1, model)
+    sized_file(root / "vision" / "model.bin", VISION_MAGIC, 27, 0, vision_sections())
     write_manifest(root)
     return total
 
@@ -788,6 +834,7 @@ def main() -> int:
     total += write_per_layer_embedding(source, target)
     print("  ngram.bin")
     draft = write_placeholder_draft(arguments.destination / "draft")
+    write_placeholder_vision(arguments.destination / "vision")
     write_manifest(arguments.destination)
     print(f"\ntarget weights  {total / 2**30:.2f} GiB")
     print(f"draft           {draft / 2**30:.2f} GiB of zeros - this model has")

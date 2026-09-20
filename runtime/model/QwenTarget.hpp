@@ -21,6 +21,7 @@ namespace splash::model {
 
 struct Qwen3_8Weights;
 struct Qwen3_6MoeWeights;
+struct Qwen4ExpWeights;
 
 enum class QwenFfnKind : uint8_t { Dense, SparseMoe };
 
@@ -153,6 +154,12 @@ struct QwenTargetGeometry final {
   uint32_t captureLayerCount = 0;
   kv::Q8Layout kvLayout{};
   GdnStateLayout stateLayout{};
+  uint32_t hyperConnectionCount = 1;
+  uint32_t hyperConnectionLowRank = 0;
+
+  [[nodiscard]] constexpr uint32_t residualWidth() const noexcept {
+    return hiddenSize * (hyperConnectionCount ? hyperConnectionCount : 1);
+  }
 
   [[nodiscard]] constexpr uint32_t gdnKeyWidth() const noexcept {
     return gdnKeyHeads * gdnHeadDimension;
@@ -249,6 +256,9 @@ struct QwenTargetPrefillBuffers final {
   metal::MetalBuffer groupedInput;
   metal::MetalBuffer expertIntermediate;
   metal::MetalBuffer expertOutput;
+  metal::MetalBuffer hyperReduced;
+  metal::MetalBuffer hyperInjection;
+  metal::MetalBuffer hyperMixed;
 };
 
 struct QwenTargetVerifyBuffers final {
@@ -294,6 +304,9 @@ struct QwenTargetVerifyBuffers final {
   metal::MetalBuffer groupedInput;
   metal::MetalBuffer expertIntermediate;
   metal::MetalBuffer expertOutput;
+  metal::MetalBuffer hyperReduced;
+  metal::MetalBuffer hyperInjection;
+  metal::MetalBuffer hyperMixed;
 };
 
 struct QwenTargetCommitBuffers final {
@@ -312,6 +325,8 @@ struct QwenTargetCommitBuffers final {
 qwenTargetGeometry(const Qwen3_8Weights &weights);
 [[nodiscard]] QwenTargetGeometry
 qwenTargetGeometry(const Qwen3_6MoeWeights &weights);
+[[nodiscard]] QwenTargetGeometry
+qwenTargetGeometry(const Qwen4ExpWeights &weights);
 
 // Builds the shared Qwen GDN/attention layer graph with the target's dense
 // or sparse-MoE FFN. Architecture-specific loaders supply the package tensors.
@@ -320,6 +335,8 @@ public:
   QwenTarget(const Qwen3_8Weights &weights, metal::MetalBackend &backend,
              const ops::ExecutionPlans &operators);
   QwenTarget(const Qwen3_6MoeWeights &weights, metal::MetalBackend &backend,
+             const ops::ExecutionPlans &operators);
+  QwenTarget(const Qwen4ExpWeights &weights, metal::MetalBackend &backend,
              const ops::ExecutionPlans &operators);
 
   [[nodiscard]] const QwenTargetGeometry &geometry() const noexcept {
@@ -343,12 +360,15 @@ public:
                uint32_t normalizedRows) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
+  void addDraftEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
+                         metal::MetalBuffer hidden, uint32_t rows) const;
   void addStateCommit(metal::CommandGraph &graph,
                       QwenTargetCommitBuffers buffers, uint32_t lanes) const;
 
 private:
   using WeightView =
-      std::variant<const Qwen3_8Weights *, const Qwen3_6MoeWeights *>;
+      std::variant<const Qwen3_8Weights *, const Qwen3_6MoeWeights *,
+                   const Qwen4ExpWeights *>;
 
   template <class Weights>
   void addPrefillImpl(
@@ -369,6 +389,9 @@ private:
   QwenTargetGeometry geometry_;
   metal::MetalBackend &backend_;
   const ops::ExecutionPlans &operators_;
+  metal::MetalBuffer embeddingScratch_;
+  metal::MetalBuffer headNormalized_;
+  metal::MetalBuffer headReduced_;
 };
 
 } // namespace splash::model

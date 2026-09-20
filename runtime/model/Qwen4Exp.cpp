@@ -95,7 +95,7 @@ Qwen4ExpIndexer readIndexer(WeightFile &file, metal::MetalBackend &backend,
                             "indexer norm bytes");
   ops::Q4Projection projection = readQ4Projection(
       file, backend, layout.indexerProjectionWidth(), layout.hiddenSize,
-      "indexer-qk");
+      "indexer-qk", layout.expertStorageN);
   return {projection, file.section(normBytes, "indexer-query-norm"),
           file.section(normBytes, "indexer-key-norm")};
 }
