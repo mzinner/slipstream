@@ -142,6 +142,22 @@ struct Qwen4ExpLayout final {
     return ngramHeads() ? ngramEmbeddingSize / ngramHeads() : 0;
   }
 
+  // Weights this model can be planned without holding all of: the routed
+  // experts, which are touched ten at a time out of five hundred and twelve,
+  // and the per-layer embedding table, which is one gathered row per head.
+  // Everything else - attention, the mixers, the shared expert, the norms -
+  // is read for every token and stays resident.
+  [[nodiscard]] constexpr uint64_t streamableWeightBytes() const noexcept {
+    const uint64_t perExpert =
+        (2ULL * expertIntermediateSize * hiddenSize +
+         uint64_t{hiddenSize} * expertIntermediateSize) *
+        9 / 16;
+    const uint64_t experts_ = perExpert * experts * layers;
+    const uint64_t table = uint64_t{ngramVocabularySize} *
+                           ngramHeadDimension() * 9 / 16;
+    return experts_ + table;
+  }
+
   bool operator==(const Qwen4ExpLayout &) const = default;
 };
 

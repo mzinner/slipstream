@@ -48,6 +48,17 @@ struct ModelPackage final {
       return weights.manifestFingerprintSha256;
     }, target);
   }
+  // Zero for targets that are planned fully resident; the two shipped models
+  // are, so nothing about their planning changes.
+  [[nodiscard]] uint64_t streamableWeightBytes() const noexcept {
+    return std::visit([](const auto &weights) -> uint64_t {
+      using W = std::remove_cvref_t<decltype(weights)>;
+      if constexpr (std::is_same_v<W, Qwen4ExpWeights>)
+        return weights.layout.streamableWeightBytes();
+      else
+        return 0;
+    }, target);
+  }
   [[nodiscard]] std::span<const WeightFileRecord> targetFiles() const noexcept {
     return std::visit([](const auto &weights) ->
                           std::span<const WeightFileRecord> {

@@ -29,6 +29,23 @@ struct ModelMemoryFootprint final {
   uint64_t sharedDecodeBytes = 0;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
+  // These two stay last: the footprint is brace-initialized positionally in
+  // several places, so inserting a field anywhere above silently shifts every
+  // value after it, and every field here is the same type.
+  // Part of targetWeightsBytes that may be demand-paged rather than held.
+  //
+  // Weights are mapped PROT_READ / MAP_SHARED from the package, so their
+  // pages are file-backed and clean: the kernel can evict them under pressure
+  // and fault them back from the package. For every model that fits, counting
+  // them as resident is the right conservative answer and this stays zero.
+  // A model whose experts are larger than the working set cannot be planned
+  // that way at all, and for those the planner reserves a cache for this share
+  // instead of the whole of it. Nothing here changes how a page is mapped;
+  // only how much of it the budget is asked to hold at once.
+  uint64_t streamableWeightsBytes = 0;
+  // What the planner keeps for the streamable share. Zero means the model was
+  // planned without streaming and streamableWeightsBytes must be zero too.
+  uint64_t streamCacheBytes = 0;
 };
 
 struct ModelMemoryProfile final {
@@ -39,6 +56,9 @@ struct ModelMemoryProfile final {
 
   [[nodiscard]] std::optional<std::string> validationError() const;
   [[nodiscard]] uint64_t fixedRuntimeBytes() const;
+  // Weights the budget must hold outright: everything but the streamable
+  // share, plus whatever cache is kept for that share.
+  [[nodiscard]] uint64_t residentWeightBytes() const;
 };
 
 [[nodiscard]] std::string modelStatusJson(const ModelMemoryProfile &model);

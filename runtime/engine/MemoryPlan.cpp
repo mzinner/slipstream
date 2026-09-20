@@ -83,6 +83,19 @@ std::optional<std::string> ModelMemoryProfile::validationError() const {
   if (!footprint.runtimeOverheadReserveBytes) {
     return "runtime_overhead_reserve_required";
   }
+  if (footprint.streamableWeightsBytes > footprint.targetWeightsBytes) {
+    return "streamable_weights_exceed_target_weights";
+  }
+  // A cache without a streamable share reserves memory for nothing, and a
+  // streamable share without a cache would let the planner believe those
+  // weights cost nothing at all.
+  if ((footprint.streamableWeightsBytes == 0) !=
+      (footprint.streamCacheBytes == 0)) {
+    return "streamable_weights_and_stream_cache_must_agree";
+  }
+  if (footprint.streamCacheBytes > footprint.streamableWeightsBytes) {
+    return "stream_cache_exceeds_the_weights_it_caches";
+  }
   try {
     static_cast<void>(fixedRuntimeBytes());
   } catch (const std::overflow_error &) {
@@ -91,10 +104,19 @@ std::optional<std::string> ModelMemoryProfile::validationError() const {
   return std::nullopt;
 }
 
+uint64_t ModelMemoryProfile::residentWeightBytes() const {
+  if (footprint.streamableWeightsBytes > footprint.targetWeightsBytes) {
+    throw std::invalid_argument(
+        "streamable weights exceed the target weights they are part of");
+  }
+  return footprint.targetWeightsBytes - footprint.streamableWeightsBytes +
+         footprint.streamCacheBytes;
+}
+
 uint64_t ModelMemoryProfile::fixedRuntimeBytes() const {
   uint64_t result = 0;
   for (uint64_t value : {
-           footprint.targetWeightsBytes, footprint.draftWeightsBytes,
+           residentWeightBytes(), footprint.draftWeightsBytes,
            footprint.visionWeightsBytes, footprint.sharedPrefillBytes,
            footprint.sharedDecodeBytes, footprint.pipelineReserveBytes,
            footprint.runtimeOverheadReserveBytes}) {

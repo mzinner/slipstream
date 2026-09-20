@@ -311,13 +311,27 @@ int main(int argc, const char *argv[]) {
     const auto &capabilities = backend.capabilities();
     std::cout << "  device working set " << gib(capabilities.recommendedMaxWorkingSetBytes)
               << "\n";
-    if (targetBytes + draftBytes >
-        capabilities.recommendedMaxWorkingSetBytes) {
-      std::cout << "  VERDICT          weights exceed the working set by "
-                << gib(targetBytes + draftBytes -
-                       capabilities.recommendedMaxWorkingSetBytes)
-                << "\n                   before any cache or activation\n";
-    }
+    // What the planner is actually asked to hold. The routed experts and the
+    // per-layer embedding table are mapped read-only from the package, so
+    // their pages are file-backed and refetchable; the budget holds a cache of
+    // them rather than all of them.
+    const uint64_t streamable = layout.streamableWeightBytes();
+    const uint64_t resident = targetBytes - streamable;
+    std::cout << "  streamable       " << gib(streamable)
+              << "  (routed experts and the per-layer embedding)\n"
+              << "  resident weights " << gib(resident + draftBytes) << '\n';
+    require(streamable < targetBytes,
+            "the streamable share cannot be the whole target");
+    require(resident + draftBytes < capabilities.recommendedMaxWorkingSetBytes,
+            "the resident weights alone must fit the working set, or no "
+            "cache size can make this model plannable");
+    const uint64_t spare =
+        capabilities.recommendedMaxWorkingSetBytes - resident - draftBytes;
+    std::cout << "  budget left for  " << gib(spare)
+              << "  cache, KV and activations\n"
+              << "  VERDICT          plannable: the resident weights fit, and "
+                 "what is\n                   streamed is bounded by the "
+                 "cache the budget allows\n";
 
     std::filesystem::remove_all(root);
     std::cout << "qwen4exp package test passed\n";
