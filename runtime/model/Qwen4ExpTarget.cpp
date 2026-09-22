@@ -2378,16 +2378,28 @@ void Qwen4ExpTarget::addVerify(
     std::vector<uint16_t> chain(maxDrafts * uint64_t{width});
     const auto *y = static_cast<const uint16_t *>(Y.contents());
     std::memcpy(chain.data(), y + uint64_t{mtp.rows - 1} * width, width * 2);
+    // Each guess runs one new row: the attention step stores every row's
+    // keys and values at its position, so the rows guessed before are read
+    // from the cache. (Re-running them, SPLASH_MTP_RERUN, costs each earlier
+    // row's experts again.) The next step's first guess overwrites these
+    // positions with the accepted tokens' real rows.
+    static const bool rerun = std::getenv("SPLASH_MTP_RERUN") != nullptr;
     for (uint32_t k = 1; k < maxDrafts; ++k) {
-      for (uint32_t r = 0; r < k; ++r)
-        std::memcpy(hIn + uint64_t{r} * width, chain.data() + uint64_t{r} * width, width * 2);
-      drafts[k] = step(anchorPosition - 1 + 1, k, drafts.data());
+      if (rerun) {
+        for (uint32_t r = 0; r < k; ++r)
+          std::memcpy(hIn + uint64_t{r} * width, chain.data() + uint64_t{r} * width, width * 2);
+        drafts[k] = step(anchorPosition, k, drafts.data());
+      } else {
+        std::memcpy(hIn, chain.data() + uint64_t{k - 1} * width, width * 2);
+        drafts[k] = step(anchorPosition + k - 1, 1, drafts.data() + (k - 1));
+      }
       draftCandidates[k] = lastCandidates;
       draftProbabilities[k] = lastProbabilities;
       if (lastConfidence < confident)
         return drafts;
       drafted = k + 1;
-      std::memcpy(chain.data() + uint64_t{k} * width, y + uint64_t{k - 1} * width, width * 2);
+      std::memcpy(chain.data() + uint64_t{k} * width,
+                  y + uint64_t{rerun ? k - 1 : 0} * width, width * 2);
     }
     return drafts;
   };
