@@ -46,6 +46,14 @@ wanted 128 MiB, long before any real weights existed.
 - **Changing a shared constant breaks tests quietly in many places.** Raising
   the prompt chunk to 4096 needed ~12 test edits where 2048/2049 were
   hardcoded; tests should use the constants.
+- **Two engines at once crash the Mac** (kernel watchdog panic, forced reboot;
+  twice on 2026-09-22). Each engine pins ~40 GiB that macOS cannot page out.
+  Run every experiment through `dev/benchmarks/guarded.py -- <cmd>`: it
+  refuses to start beside another engine and kills a run under 4 GiB free.
+  Never start a new background run until the previous one has provably
+  exited (`pgrep -fl generate-sample`); `pkill -f` patterns can silently miss.
+  Diagnose a crash from `/Library/Logs/DiagnosticReports/panic-full-*.panic`
+  (JSON; `processByPid` shows who held the memory).
 - **PLE gate offset**: normalized rows go at `row + (taps-1)*dilation`, because
   the convolution reads history first.
 
