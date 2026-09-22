@@ -301,6 +301,10 @@ struct QwenMtpLane final {
   uint64_t firstPosition = 0;
   std::array<uint32_t, ExecutionLimits::targetVerifyRows> tokens{};
   std::span<const uint32_t> pageTable;
+  // The request's sampling; temperature 0 is greedy.
+  float temperature = 0.0f;
+  float topP = 1.0f;
+  uint32_t topK = 0;
 };
 
 struct QwenTargetVerifyBuffers final {
@@ -315,6 +319,9 @@ struct QwenTargetVerifyBuffers final {
   uint32_t kvPageCount = 0;
   std::array<QwenMtpLane, ExecutionLimits::maximumBatchWidth> mtp{};
   metal::MetalBuffer proposedTokens;
+  // Out: proposals the MTP head actually made for lane 0 (it stops when
+  // unsure), so the runtime can cap the rows the verifier keeps.
+  uint32_t *mtpProposedOut = nullptr;
   // The draft's distribution per proposal as the acceptance reads it: 16
   // candidate ids and their probabilities.
   metal::MetalBuffer proposalCandidates;

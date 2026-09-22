@@ -783,6 +783,9 @@ struct Runtime::Impl {
     return mtpDrafting() && !std::getenv("SPLASH_MTP_SHADOW");
   }
 
+  // Proposals the MTP head made this step (it stops when unsure).
+  uint32_t mtpProposed = kMtpProposals;
+
   uint32_t retainedRowLimit(uint32_t remaining,
                             const Request *entry = nullptr) const noexcept {
     if (entry && mtpProposing(*entry))
@@ -1290,6 +1293,8 @@ struct Runtime::Impl {
     buffers.hyperInjection = d(DecodeTensor::HyperInjection);
     buffers.hyperMixed = d(DecodeTensor::HyperMixed);
     buffers.liveRowsPerLane = package.descriptor.draftPlaceholder ? 1u : kDecodeRows;
+    mtpProposed = kMtpProposals;
+    buffers.mtpProposedOut = &mtpProposed;
     buffers.mtpEnabled = mtpDrafting();
     buffers.mtpShadow = !(lanes == 1 && mtpProposing(laneEntry(entries, 0)));
     if (!buffers.mtpShadow)
@@ -1301,6 +1306,12 @@ struct Runtime::Impl {
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       buffers.mtp[lane] = laneEntry(entries, lane).mtp;
       buffers.mtp[lane].pageTable = items[lane].pageTable;
+      const Request &requestEntry = laneEntry(entries, lane);
+      if (samplingEnabled(requestEntry)) {
+        buffers.mtp[lane].temperature = requestEntry.sampling.temperature;
+        buffers.mtp[lane].topP = requestEntry.sampling.topP;
+        buffers.mtp[lane].topK = requestEntry.sampling.topK;
+      }
     }
     buffers.ple = {d(DecodeTensor::InputTokens), d(DecodeTensor::PleShifted),
                    d(DecodeTensor::PleEmbedding), d(DecodeTensor::PleKeys),
@@ -2286,13 +2297,19 @@ Runtime::decodeAsync(const BatchPlan &plan,
     }
     impl_->encodeTargetVerifyBatchForward(
         commandGraph, {requests.data(), lanes.size()}, items, batchStats);
+    // The head may have stopped early; keep no row it did not propose.
+    if (mtpProposes)
+      maximumRetained[0] = std::min(maximumRetained[0], 1 + impl_->mtpProposed);
     impl_->encodeTargetVerifyBatchPolicy(commandGraph,
                                          {requests.data(), lanes.size()});
     impl_->encodeBatchAcceptance(commandGraph, {requests.data(), lanes.size()},
                                  {maximumRetained.data(), lanes.size()});
     impl_->encodeBatchGdnCommit(commandGraph, {requests.data(), lanes.size()});
-    impl_->encodeDraftStateCommitBatch(
-        commandGraph, {requests.data(), lanes.size()}, items, batchStats);
+    // The placeholder DFlash draft's context is dead weight when the MTP head
+    // drafts: nothing reads it.
+    if (!mtpProposes)
+      impl_->encodeDraftStateCommitBatch(
+          commandGraph, {requests.data(), lanes.size()}, items, batchStats);
   }
 
   const bool overlapConstraintMask =

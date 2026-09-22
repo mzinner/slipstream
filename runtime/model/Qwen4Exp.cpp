@@ -284,7 +284,8 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
       // Misses go around the file cache, as llama.cpp's --moe-stream-direct
       // does: the expert cache already holds them, so a second copy in the
       // file cache only crowds memory.
-      (void)::fcntl(layer.expertSource.fd, F_NOCACHE, 1);
+      if (!std::getenv("SPLASH_EXPERT_READS_CACHED"))
+        (void)::fcntl(layer.expertSource.fd, F_NOCACHE, 1);
     }
     file.finish();
     if (layerIndex >= residentLayers) {

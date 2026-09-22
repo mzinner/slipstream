@@ -11,6 +11,7 @@
 #include "ops/PagedAttention.hpp"
 
 #include <algorithm>
+#include <random>
 #include <cmath>
 #include <map>
 #include <deque>
@@ -1170,13 +1171,17 @@ void Qwen4ExpTarget::addVerify(
   // lane rows 0, 8, 16, ... The other rows' results are never kept.
   // One lane: its live rows are rows 0..live-1. Several lanes with one live
   // row each: rows 0, 8, 16, ...
-  const uint32_t live = buffers.liveRowsPerLane;
-  const uint32_t hcRows = lanes == 1 ? live : (live == 1 ? lanes : rows);
-  const uint32_t hcStep =
-      lanes != 1 && live == 1 ? ExecutionLimits::targetVerifyRows : 1;
-  const HyperConnectionParams hcParams{
-      hcRows, geometry.hiddenSize, geometry.hyperConnectionCount,
-      geometry.hyperConnectionLowRank, 1e-6f, 1, hcStep, 0};
+  // Recomputed after the MTP head drafts, since it may guess fewer rows.
+  uint32_t hcRows = 0, hcStep = 1;
+  HyperConnectionParams hcParams{};
+  auto setLiveRows = [&] {
+    const uint32_t live = buffers.liveRowsPerLane;
+    hcRows = lanes == 1 ? live : (live == 1 ? lanes : rows);
+    hcStep = lanes != 1 && live == 1 ? ExecutionLimits::targetVerifyRows : 1;
+    hcParams = {hcRows, geometry.hiddenSize, geometry.hyperConnectionCount,
+                geometry.hyperConnectionLowRank, 1e-6f, 1, hcStep, 0};
+  };
+  setLiveRows();
 
   uint32_t gdnIndex = 0;
   uint32_t attentionIndex = 0;
@@ -1741,6 +1746,9 @@ void Qwen4ExpTarget::addVerify(
   // In shadow mode its guesses are only scored against what the target then
   // produces; nothing is proposed.
   // -------------------------------------------------------------------------
+  uint32_t drafted = 0;
+  std::array<std::array<uint32_t, 16>, 3> draftCandidates{};
+  std::array<std::array<float, 16>, 3> draftProbabilities{};
   auto runMtpDraft = [&]() -> std::array<uint32_t, 3> {
     std::array<uint32_t, 3> drafts{};
     const QwenMtpLane &mtp = buffers.mtp[0];
@@ -1778,6 +1786,9 @@ void Qwen4ExpTarget::addVerify(
     // One draft step over `live` rows at positions position..position+live-1,
     // whose inputs are rows 0..live-1 of mtpHin and `tokens`. Returns the
     // head's top token after the last row.
+    float lastConfidence = 1.0f;
+    std::array<uint32_t, 16> lastCandidates{};
+    std::array<float, 16> lastProbabilities{};
     auto step = [&](uint64_t position, uint32_t live,
                     const uint32_t *tokens) -> uint32_t {
       auto *tokenOut = static_cast<uint32_t *>(weights.mtpTokens.contents());
@@ -1879,13 +1890,74 @@ void Qwen4ExpTarget::addVerify(
 
       const auto *logits = static_cast<const uint16_t *>(buffers.logits.contents()) +
                            uint64_t{live - 1} * vocabulary;
-      uint32_t best = 0;
-      float bestValue = -INFINITY;
+      auto logit = [&](uint32_t v) {
+        return std::bit_cast<float>(uint32_t{logits[v]} << 16);
+      };
+      // Greedy: the top token, reported as certain. Sampled: the request's
+      // own sampling applied to the head's logits - top-k (at most 16, the
+      // acceptance's candidate width), temperature, top-p - and the guess
+      // drawn from it; speculative sampling then keeps it with probability
+      // min(1, p/q), so the output is still exactly the target's.
+      const uint32_t width16 = mtp.temperature > 0.0f
+          ? std::min<uint32_t>(mtp.topK ? mtp.topK : 16, 16) : 1;
+      std::array<uint32_t, 16> ids{};
+      std::array<float, 16> values{};
+      uint32_t filled = 0;
       for (uint32_t v = 0; v < vocabulary; ++v) {
-        const float value = std::bit_cast<float>(uint32_t{logits[v]} << 16);
-        if (value > bestValue) { bestValue = value; best = v; }
+        const float value = logit(v);
+        if (filled < width16) {
+          uint32_t at = filled++;
+          while (at > 0 && values[at - 1] < value) {
+            ids[at] = ids[at - 1]; values[at] = values[at - 1]; --at;
+          }
+          ids[at] = v; values[at] = value;
+        } else if (value > values[width16 - 1]) {
+          uint32_t at = width16 - 1;
+          while (at > 0 && values[at - 1] < value) {
+            ids[at] = ids[at - 1]; values[at] = values[at - 1]; --at;
+          }
+          ids[at] = v; values[at] = value;
+        }
       }
-      return best;
+      // Confidence: the head's own probability for its top token.
+      float total = 0.0f;
+      for (uint32_t v = 0; v < vocabulary; ++v) {
+        const float value = logit(v);
+        if (value > values[0] - 16.0f) total += std::exp(value - values[0]);
+      }
+      lastConfidence = 1.0f / total;
+      lastCandidates.fill(UINT32_MAX);
+      lastProbabilities.fill(0.0f);
+      if (mtp.temperature <= 0.0f) {
+        lastCandidates[0] = ids[0];
+        lastProbabilities[0] = 1.0f;
+        return ids[0];
+      }
+      std::array<float, 16> q{};
+      float sum = 0.0f;
+      for (uint32_t i = 0; i < width16; ++i) {
+        q[i] = std::exp((values[i] - values[0]) / mtp.temperature);
+        sum += q[i];
+      }
+      uint32_t kept = width16;
+      float cumulative = 0.0f;
+      for (uint32_t i = 0; i < width16; ++i) {
+        cumulative += q[i] / sum;
+        if (cumulative >= mtp.topP) { kept = i + 1; break; }
+      }
+      float keptSum = 0.0f;
+      for (uint32_t i = 0; i < kept; ++i) keptSum += q[i];
+      static std::mt19937 random(20260922);
+      for (uint32_t i = 0; i < kept; ++i) {
+        lastCandidates[i] = ids[i];
+        lastProbabilities[i] = q[i] / keptSum;
+      }
+      float draw = std::uniform_real_distribution<float>(0.0f, 1.0f)(random);
+      for (uint32_t i = 0; i + 1 < kept; ++i) {
+        if (draw < lastProbabilities[i]) return ids[i];
+        draw -= lastProbabilities[i];
+      }
+      return ids[kept - 1];
     };
 
     // Step 1: refresh the accepted rows with the target's own residuals, and
@@ -1893,7 +1965,20 @@ void Qwen4ExpTarget::addVerify(
     for (uint32_t r = 0; r < mtp.rows; ++r)
       std::memcpy(hIn + uint64_t{r} * width,
                   hidden0 + uint64_t{mtp.firstRow + r} * width, width * 2);
+    // Guessing stops once the head is unsure (as llama.cpp's
+    // --spec-draft-p-min): an unlikely guess is usually rejected, and every
+    // guessed row costs the verifier its own experts.
+    static const float confident = [] {
+      const char *value = std::getenv("SPLASH_MTP_P_MIN");
+      return value ? static_cast<float>(std::atof(value)) : 0.3f;
+    }();
+    drafted = 0;
     drafts[0] = step(mtp.firstPosition, mtp.rows, mtp.tokens.data());
+    draftCandidates[0] = lastCandidates;
+    draftProbabilities[0] = lastProbabilities;
+    if (lastConfidence < confident)
+      return drafts;
+    drafted = 1;
     // Steps 2 and 3 chain on the head's own residual. Each re-runs the rows
     // before it (same inputs, same keys) so its attention sees them.
     const uint64_t anchorPosition = mtp.firstPosition + mtp.rows;
@@ -1904,6 +1989,11 @@ void Qwen4ExpTarget::addVerify(
       for (uint32_t r = 0; r < k; ++r)
         std::memcpy(hIn + uint64_t{r} * width, chain.data() + uint64_t{r} * width, width * 2);
       drafts[k] = step(anchorPosition - 1 + 1, k, drafts.data());
+      draftCandidates[k] = lastCandidates;
+      draftProbabilities[k] = lastProbabilities;
+      if (lastConfidence < confident)
+        return drafts;
+      drafted = k + 1;
       std::memcpy(chain.data() + uint64_t{k} * width, y + uint64_t{k - 1} * width, width * 2);
     }
     return drafts;
@@ -1916,17 +2006,22 @@ void Qwen4ExpTarget::addVerify(
     mtpMs = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - mtpStart).count();
     if (!buffers.mtpShadow) {
+      buffers.liveRowsPerLane = 1 + drafted;
+      setLiveRows();
+      if (buffers.mtpProposedOut)
+        *buffers.mtpProposedOut = drafted;
       // The verify rows are the anchor then these proposals. Past the third
       // the proposals repeat it: the retained-row cap keeps them from counting.
       auto *proposed = static_cast<uint32_t *>(buffers.proposedTokens.contents());
       auto *candidates = static_cast<uint32_t *>(buffers.proposalCandidates.contents());
       auto *probabilities = static_cast<float *>(buffers.proposalProbabilities.contents());
       for (uint32_t k = 0; k < ExecutionLimits::draftProposalTokens; ++k) {
-        proposed[k] = drafts[std::min<uint32_t>(k, 2)];
-        // A one-point draft distribution: the guess, with certainty.
+        const uint32_t source = std::min<uint32_t>(k, 2);
+        proposed[k] = drafts[source];
+        // The distribution each guess was drawn from (one point if greedy).
         for (uint32_t c = 0; c < 16; ++c) {
-          candidates[k * 16 + c] = c == 0 ? proposed[k] : UINT32_MAX;
-          probabilities[k * 16 + c] = c == 0 ? 1.0f : 0.0f;
+          candidates[k * 16 + c] = draftCandidates[source][c];
+          probabilities[k * 16 + c] = draftProbabilities[source][c];
         }
       }
     }
