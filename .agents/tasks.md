@@ -46,12 +46,17 @@
 
 ## Left / Future Improvements
 
-- [ ] Asynchronous pipelined prefetch: overlap next layer's expert prefetch during current layer's GPU execution
-- [ ] Ping-pong double buffering for streaming layers to further decouple CPU staging and GPU dispatch
+- [x] Asynchronous pipelined prefetch (decode pipeline + lookahead routing)
+- [x] Decode at ≥ 30 tok/s consistently (33–45 measured 2026-09-22)
+- [x] Server end to end incl. tool calls with MTP drafting
+- [x] Prompt path: no fallback to mapped expert files (row ranges)
+- [ ] Code-prompt drift: 79% same pick vs llama.cpp 89%
+- [ ] Short-prompt reading speed (87 vs ~110 tok/s)
+- [ ] Sparse indexer for >2K context
+- [ ] 27B regression check (needs a 4-bit 27B package)
 
 ## Deferred by Nitin
 
-- [ ] DFlash 2 draft training (speculative decoding). A zero-filled placeholder
-      draft is written today because the format requires one. Expect no speedup
-      from speculation until this exists.
+- [ ] DFlash 2 draft training. No longer needed for speed: the model's own MTP
+      head drafts. The zero placeholder stays because the package format needs one.
 

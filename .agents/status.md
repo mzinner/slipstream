@@ -1,42 +1,51 @@
 # Status — qwen4exp port
 
-**Updated:** 2026-09-21 23:30 PDT by claude-code
-**Branch:** `qwen4exp-review` (built on Gemini's `qwen4exp-gemini`; Gemini's uncommitted work is the first commit)
+**Updated:** 2026-09-22 02:05 PDT by claude-code
+**Branch:** `qwen4exp-review` (not pushed; never push to upstream `incoai/splash`)
 
 ## Where we are in one line
 
-Flash-Next runs end to end in Splash, including the server and tool calls, at
-~2.5 tok/s. llama.cpp V3 does 18 (27 with its draft head). Nitin asked for a
-redesign from a per-component profile, at llama.cpp's memory budget. The
-profile and plan are done; implementation has not started.
+Flash-Next runs in Splash at **33–45 tok/s** (llama.cpp V3: 18, or 27 with its
+draft head), same memory budget. The server works end to end, tool calls included.
 
-## The plan (full write-up: https://claude.ai/artifact/PB7F2nj2KRtST91NfMGoEQ)
+## Numbers (one warm engine, 384 generated tokens, 36 GiB expert cache)
 
-Floor for one generated token on this Mac: ~5 GB read at 291 GB/s ≈ 17 ms.
-Budget: 36 GiB expert cache, wired limit 58 GiB, same as llama.cpp.
+| Prompt | Greedy | Sampled 0.7 | Reading the prompt |
+|---|---|---|---|
+| Short, 65 tok | 45.1 tok/s | 41.5 | 87 tok/s |
+| Code, 1,495 tok | 35.2 | 36.0 | 222 tok/s |
+| Long, 9,129 tok | 37.9 | 33.3 | 211 tok/s |
 
-1. **Rewrite hyper-connection kernels** — ~224 of ~300 ms per decode step today
-   (one threadgroup per row). Floor 4.4 ms. No quality risk. START HERE.
-2. **Expert fetch** — direct parallel pread (SSD measured 15 GB/s), 36 GiB
-   cache, frequency-aware eviction. Today ~105 ms/token via 16 KB page faults.
-3. **Single-row decode kernels** for dense, experts, GDN (8-row kernels now).
-4. **Remove per-layer stop-and-wait**: GPU-side slot table, lookahead prefetch.
-5. **Prefill streaming**: never bind whole layer files; double-buffered reads.
-6. **MTP draft head** in place of the zero placeholder.
-7. Optional: 8-bit hyper-connection weights, only if quality holds.
+Through the server: tool requests 33–52 tok/s; first token after a new
+339-token tool prompt 3–4 s, 0.2 s when the prompt is cached.
 
-Quality alongside: Splash 80% same-pick vs llama.cpp 89% on the code prompt;
-drift grows with position (cause open). Sparse indexer unwired (>2K context).
+## Quality
+
+- Short text: perplexity 8.93 vs bf16 reference 8.93.
+- Code prompt second half: 79% same top pick, KL 0.51 (llama.cpp 89%, 0.18).
+  Drift grows with position; cause open. Sparse indexer unwired (>2K context).
+
+## Open work, in order
+
+1. **Code-prompt drift** (quality). Compare layer by layer with
+   `reference_logits.py` at late positions.
+2. **Short-prompt reading speed** 87 tok/s vs llama.cpp ~110.
+3. **Sparse indexer** for contexts past 2,048 tokens.
+4. 27B regression check needs a 4-bit 27B package: the installed 27B is
+   `splash-packed-q8`, which only the `splash2` fork reads (main and this
+   branch both reject it), so this branch cannot affect it today.
 
 ## Tools (all in repo)
 
 - `generate-sample`: `SPLASH_PROFILE_STEPS=N`, `SPLASH_PROFILE_PREFILL=1`,
-  `SPLASH_ROUTE_LOG=path`, `SPLASH_DUMP_PREFILL_LOGITS=path`; several prompts
-  separated by `;` run on one warm engine. **Build it explicitly** — `make`
-  does not relink it.
+  `SPLASH_DUMP_PREFILL_LOGITS=path`, `SPLASH_TEMPERATURE`; several prompts
+  separated by `;`. **Build it explicitly** (`make build/engine-tests/generate-sample`).
+- `SPLASH_LOG_ALLOCATIONS=1`: every Metal allocation ≥ 1 MiB.
 - `dev/benchmarks/qwen4exp/`: `bench_splash.py --one-process`, `bench_llama.py`,
-  `reference_logits.py` (bf16 ground truth), `compare_logits.py`,
-  `write_llama_kld_base.py`, `simulate_cache.py`, `probes/`.
+  `reference_logits.py`, `compare_logits.py`, `simulate_cache.py`, `probes/`.
+- Server: `.venv/bin/python -m server.server $M/target $M/draft --tokenizer $M/tokenizer
+  --model local/qwen3.8-flash-next-splash --port 8090 --binary build/splash`
+  with `M=~/models/qwen38-flash-next-splash`.
 
 ## Do not touch
 
@@ -44,7 +53,4 @@ drift grows with position (cause open). Sparse indexer unwired (>2K context).
 - `~/models/qwen38-flash-next-v3` — the model Nitin runs daily (llama.cpp, port 8080).
 - `splash2/` checkout — serves the 27B.
 
-## Before merging this branch
-
-Check 27B speed on it: Gemini's command-splitting in MetalBackend.mm may
-trigger for the 27B.
+Full write-up: https://claude.ai/artifact/PB7F2nj2KRtST91NfMGoEQ

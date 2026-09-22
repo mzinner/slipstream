@@ -1,5 +1,16 @@
 # Journal — qwen4exp port
 
+## 2026-09-22 02:05 PDT — claude-code
+
+Server now starts and serves Flash-Next end to end. Three fixes: the memory
+plan sized the expert cache differently from the model (startup audit
+refused); tool calls failed because the grammar mask was built from stale
+draft tokens (MTP drafts inside the verify step, so the constrained path now
+drafts first); prompts stalled ~10 s when a chunk needed more experts than a
+layer caches (the layer fell back to the mapped file; it now runs in row
+ranges). Decode 33–45 tok/s on all bench prompts; prompt reading 211–222 tok/s
+on long prompts. 27B check blocked: installed 27B is Q8, readable only by splash2.
+
 ## 2026-09-22 — claude-code
 
 Redesign pass, per the profile (artifact: https://claude.ai/artifact/PB7F2nj2KRtST91NfMGoEQ). Decode went from ~2.5 to 31-44 tok/s at llama.cpp's 36 GiB budget; llama.cpp V3 does 23-25 on the same prompts.
