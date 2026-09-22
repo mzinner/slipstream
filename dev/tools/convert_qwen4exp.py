@@ -503,6 +503,44 @@ def write_head(source: Checkpoint, destination: Path) -> int:
     return packed.finish()
 
 
+MTP_COMBINER_MAGIC = b"MDFN0005"
+
+
+def write_mtp(source: Checkpoint, destination: Path) -> int:
+    """The multi-token-prediction head, the model's own draft.
+
+    Its one decoder layer is named exactly like a trunk attention layer
+    (mtp.layers.0.*), so it is written by the same code into the same layer
+    format, as layer 48. The combiner that feeds it and the mixer that closes
+    it go in a second file, in the order readQwen4ExpMtp reads them:
+
+      pre_fc_norm_embedding  bf16 [hidden]        enorm, a (1 + w) gain
+      pre_fc_norm_hidden     bf16 [hc x hidden]   hnorm, per stream
+      fc_embedding           Q4   [hidden, hidden]
+      fc_hidden              Q4   [hidden, hidden], applied to each stream
+      hyper_connection_mixer norm, mix down, mix up (no injection)
+
+    The head shares the trunk's token embedding and output head.
+    """
+    layer = destination / "mtp-layer.bin"
+    packed = WeightFile(layer, LAYER_MAGIC, LAYOUT["layers"], 1)
+    prefix = "mtp.layers.0"
+    write_hyper(packed, source, prefix + ".attn_hyper_connection", True)
+    write_attention(packed, source, prefix + ".self_attn")
+    write_hyper(packed, source, prefix + ".mlp_hyper_connection", True)
+    write_experts(packed, source, prefix + ".mlp")
+    total = packed.finish()
+
+    combiner = WeightFile(destination / "mtp-combiner.bin", MTP_COMBINER_MAGIC,
+                          LAYOUT["layers"], 3)
+    combiner.section(source.raw("mtp.pre_fc_norm_embedding.weight"))
+    combiner.section(source.raw("mtp.pre_fc_norm_hidden.weight"))
+    combiner.section(quantized_tile(source.tensor("mtp.fc_embedding.weight")))
+    combiner.section(quantized_tile(source.tensor("mtp.fc_hidden.weight")))
+    write_hyper(combiner, source, "mtp.hyper_connection_mixer", False)
+    return total + combiner.finish()
+
+
 def write_embedding(source: Checkpoint, destination: Path) -> int:
     path = destination / "embedding.bin"
     packed = WeightFile(path, EMBEDDING_MAGIC, LAYOUT["vocabulary"], LAYOUT["hidden"])
@@ -765,6 +803,8 @@ def main() -> int:
     parser.add_argument("--destination", required=True, type=Path)
     parser.add_argument("--source", type=Path)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--mtp-only", action="store_true",
+                        help="write only the MTP draft head into an existing package")
     parser.add_argument(
         "--layers",
         default="all",
@@ -793,6 +833,10 @@ def main() -> int:
         return 0
 
     source = Checkpoint(arguments.source)
+    if arguments.mtp_only:
+        written = write_mtp(source, arguments.destination / "target")
+        print(f"mtp head        {written / 2**30:.2f} GiB")
+        return 0
     if arguments.release_source:
         # Deleting shards out from under a running download would lose data
         # and confuse the fetcher, so refuse unless the checkpoint is whole.

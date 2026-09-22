@@ -162,6 +162,8 @@ struct QwenTargetGeometry final {
   uint32_t pleEmbeddingSize = 0;
   uint32_t pleHistoryRows = 0;
   uint32_t pleEndToken = 0;
+  // Key/value layers past the trunk's attention layers (the MTP head's).
+  uint32_t extraKvLayers = 0;
 
   [[nodiscard]] constexpr bool hasPerLayerEmbedding() const noexcept {
     return pleEmbeddingSize != 0;
@@ -197,7 +199,8 @@ struct QwenTargetGeometry final {
            attentionHeadDimension && rotaryPairs && rotaryTheta > 0.0F &&
            captureLayerCount && captureLayerCount <= maximumCaptureLayers &&
            kvLayout.valid() && stateLayout.valid() &&
-           stateLayout.layers + kvLayout.attentionLayers == layers &&
+           stateLayout.layers + kvLayout.attentionLayers - extraKvLayers ==
+               layers &&
            gdnKeyWidth() * 2 + attentionWidth <= packedGdnWidth &&
            attentionWidth == attentionQueryHeads * attentionHeadDimension &&
            kvLayout.kvHeads == attentionKvHeads &&
@@ -287,11 +290,31 @@ struct QwenTargetPrefillBuffers final {
   QwenTargetPleBuffers ple;
 };
 
+// What the MTP draft head consumes at the start of a decode cycle for one
+// lane: rows of the previous step's final residual (decode Hidden0, lane
+// local) at consecutive positions, each paired with the token that followed
+// it. After a verify step that is its retained rows; after a prompt, the
+// prompt's last row. The last row's token is the current anchor.
+struct QwenMtpLane final {
+  uint32_t rows = 0;
+  uint32_t firstRow = 0;
+  uint64_t firstPosition = 0;
+  std::array<uint32_t, ExecutionLimits::targetVerifyRows> tokens{};
+  std::span<const uint32_t> pageTable;
+};
+
 struct QwenTargetVerifyBuffers final {
   // Rows per lane whose output can be kept. Below targetVerifyRows when the
   // draft is a placeholder: the other rows are computed only as far as the
   // cheap layers go, and their expert work is skipped.
   uint32_t liveRowsPerLane = ExecutionLimits::targetVerifyRows;
+  // MTP drafting. `mtpShadow` runs the head and measures its guesses without
+  // proposing them.
+  bool mtpEnabled = false;
+  bool mtpShadow = true;
+  uint32_t kvPageCount = 0;
+  std::array<QwenMtpLane, ExecutionLimits::maximumBatchWidth> mtp{};
+  metal::MetalBuffer proposedTokens;
   std::array<metal::MetalBuffer, 2> hidden;
   metal::MetalBuffer normalized;
   metal::MetalBuffer recurrent;

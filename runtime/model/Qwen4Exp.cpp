@@ -243,10 +243,11 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
   result.residentLayers = residentLayers;
   std::cerr << "[Qwen4Exp] resident layers: " << residentLayers << " / " << layout.layers << "\n";
 
-  for (uint32_t layerIndex = 0; layerIndex < layout.layers; ++layerIndex) {
-    const bool fullAttention = layout.isFullAttentionLayer(layerIndex);
-    const std::string filename =
-        "layer-" + std::to_string(layerIndex) + ".bin";
+  // One decoder layer file: the trunk's 48, and the MTP head's, which is an
+  // ordinary attention layer.
+  auto readLayer = [&](const std::string &filename, uint32_t layerIndex,
+                       bool isFull) -> Qwen4ExpLayerWeights {
+    const bool fullAttention = isFull;
     WeightFile file(backend, directory / filename, "target/" + filename,
                     Qwen4ExpLayout::layerMagic, layerIndex,
                     fullAttention ? 1U : 0U);
@@ -261,7 +262,7 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
                          MemoryAdvice::Random);
       }
     }
-    auto &layer = result.layers.emplace_back();
+    Qwen4ExpLayerWeights layer;
     layer.attentionHyperConnection =
         readHyperConnection(file, layout, "attention-hyper", true);
     layer.mixer =
@@ -290,6 +291,40 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
       detachStreamingLayer(backend, layer);
     }
     result.files.push_back(file.record());
+    return layer;
+  };
+  for (uint32_t layerIndex = 0; layerIndex < layout.layers; ++layerIndex)
+    result.layers.push_back(readLayer("layer-" + std::to_string(layerIndex) + ".bin",
+                                      layerIndex,
+                                      layout.isFullAttentionLayer(layerIndex)));
+  if (std::filesystem::exists(directory / "mtp-layer.bin") &&
+      std::filesystem::exists(directory / "mtp-combiner.bin")) {
+    result.mtpLayer = readLayer("mtp-layer.bin", layout.layers, true);
+    WeightFile file(backend, directory / "mtp-combiner.bin",
+                    "target/mtp-combiner.bin", "MDFN0005", layout.layers, 3);
+    Qwen4ExpMtpCombiner combiner;
+    const uint64_t hidden = uint64_t{layout.hiddenSize} * kBFloat16Bytes;
+    combiner.embeddingNorm = detachBuffer(
+        backend, file.section(hidden, "mtp-enorm"), "mtp-enorm");
+    combiner.hiddenNorm = detachBuffer(
+        backend, file.section(hidden * layout.hyperConnectionCount, "mtp-hnorm"),
+        "mtp-hnorm");
+    combiner.fcEmbedding = detachQ4(
+        backend, readQ4Projection(file, backend, layout.hiddenSize,
+                                  layout.hiddenSize, "mtp-fc-embedding"),
+        "mtp-fc-embedding");
+    combiner.fcHidden = detachQ4(
+        backend, readQ4Projection(file, backend, layout.hiddenSize,
+                                  layout.hiddenSize, "mtp-fc-hidden"),
+        "mtp-fc-hidden");
+    combiner.mixer = readHyperConnection(file, layout, "mtp-mixer", false);
+    combiner.mixer.norm = detachBuffer(backend, combiner.mixer.norm, "mtp-mix-norm");
+    combiner.mixer.mixDown = detachBuffer(backend, combiner.mixer.mixDown, "mtp-mix-down");
+    combiner.mixer.mixUp = detachBuffer(backend, combiner.mixer.mixUp, "mtp-mix-up");
+    file.finish();
+    result.files.push_back(file.record());
+    result.mtpCombiner = std::move(combiner);
+    std::cerr << "[Qwen4Exp] MTP draft head loaded\n";
   }
 
   {
@@ -409,8 +444,12 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     std::cerr << "[Qwen4Exp] expert cache: " << cacheCapacity
               << " experts per layer\n";
     const uint64_t cacheBytes = uint64_t{cacheCapacity} * expertStride;
-    for (uint32_t l = residentLayers; l < layout.layers; ++l) {
-      auto &cache = result.layers[l].expertCache;
+    auto streamingLayer = [&](uint32_t l) -> Qwen4ExpLayerWeights & {
+      return l < layout.layers ? result.layers[l] : *result.mtpLayer;
+    };
+    const uint32_t cachedLayers = layout.layers + (result.mtpLayer ? 1 : 0);
+    for (uint32_t l = residentLayers; l < cachedLayers; ++l) {
+      auto &cache = streamingLayer(l).expertCache;
       cache.capacity = cacheCapacity;
       cache.cacheGate = backend.allocateBuffer(cacheBytes, metal::BufferStorage::Shared, "layer-expert-gate");
       cache.cacheUp = backend.allocateBuffer(cacheBytes, metal::BufferStorage::Shared, "layer-expert-up");
@@ -421,7 +460,7 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
       cache.numCached = 0;
       cache.clock = 0;
     }
-    const uint32_t streamingLayersCount = layout.layers - residentLayers;
+    const uint32_t streamingLayersCount = cachedLayers - residentLayers;
     // Loading experts 0..N at startup is an arbitrary guess that costs a read
     // of the whole cache; the first request fills it with the right ones.
     uint32_t prewarmCount = 0;
@@ -431,8 +470,8 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     const uint32_t prewarm = std::min(cacheCapacity, prewarmCount);
     dispatch_apply(streamingLayersCount, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t idx) {
       const uint32_t l = residentLayers + static_cast<uint32_t>(idx);
-      auto &cache = result.layers[l].expertCache;
-      const auto &layer = result.layers[l];
+      auto &cache = streamingLayer(l).expertCache;
+      const auto &layer = streamingLayer(l);
       char *cg = static_cast<char *>(cache.cacheGate.contents());
       char *cu = static_cast<char *>(cache.cacheUp.contents());
       char *cd = static_cast<char *>(cache.cacheDown.contents());

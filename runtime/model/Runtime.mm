@@ -225,6 +225,8 @@ struct Runtime::Impl {
     uint64_t draftContextThrough = 0;
     std::optional<DraftContextPlan> draftContextPlan;
     std::vector<ImageState> images;
+    // The MTP head's input for the next decode cycle; see QwenMtpLane.
+    QwenMtpLane mtp;
   };
 
   struct DecodeLaneResult final {
@@ -767,7 +769,23 @@ struct Runtime::Impl {
 
   // Rows a verify step may keep: the anchor plus accepted proposals. With a
   // placeholder draft no proposal is worth keeping, so only the anchor.
-  uint32_t retainedRowLimit(uint32_t remaining) const noexcept {
+  // The package has an MTP head and drafting was not turned off.
+  bool mtpDrafting() const noexcept {
+    const auto *weights = std::get_if<Qwen4ExpWeights>(&package.target);
+    return weights && weights->mtpLayer && !std::getenv("SPLASH_NO_MTP");
+  }
+  // MTP guesses are verified, not only measured. Greedy requests only: a
+  // sampled request's acceptance needs the head's probabilities.
+  static constexpr uint32_t kMtpProposals = 3;
+  bool mtpProposing(const Request &entry) const noexcept {
+    return mtpDrafting() && !std::getenv("SPLASH_MTP_SHADOW") &&
+           !samplingEnabled(entry);
+  }
+
+  uint32_t retainedRowLimit(uint32_t remaining,
+                            const Request *entry = nullptr) const noexcept {
+    if (entry && mtpProposing(*entry))
+      return std::min(remaining, 1 + kMtpProposals);
     return std::min(remaining,
                     package.descriptor.draftPlaceholder ? 1u : kDecodeRows);
   }
@@ -1271,6 +1289,16 @@ struct Runtime::Impl {
     buffers.hyperInjection = d(DecodeTensor::HyperInjection);
     buffers.hyperMixed = d(DecodeTensor::HyperMixed);
     buffers.liveRowsPerLane = package.descriptor.draftPlaceholder ? 1u : kDecodeRows;
+    buffers.mtpEnabled = mtpDrafting();
+    buffers.mtpShadow = !(lanes == 1 && mtpProposing(laneEntry(entries, 0)));
+    if (!buffers.mtpShadow)
+      buffers.liveRowsPerLane = 1 + kMtpProposals;
+    buffers.kvPageCount = kvPages.pageCount();
+    buffers.proposedTokens = d(DecodeTensor::ProposedTokens);
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      buffers.mtp[lane] = laneEntry(entries, lane).mtp;
+      buffers.mtp[lane].pageTable = items[lane].pageTable;
+    }
     buffers.ple = {d(DecodeTensor::InputTokens), d(DecodeTensor::PleShifted),
                    d(DecodeTensor::PleEmbedding), d(DecodeTensor::PleKeys),
                    d(DecodeTensor::PleValues), d(DecodeTensor::PleGated),
@@ -1536,6 +1564,14 @@ struct Runtime::Impl {
                            static_cast<uint32_t>(nextLength), 0, false}));
       entry.generatedTokens += laneResult.retained;
       entry.pendingToken = laneResult.nextAnchor;
+      // Next cycle the MTP head reads this step's retained rows, each with
+      // the token that followed it; the last with the new anchor.
+      entry.mtp.rows = laneResult.retained;
+      entry.mtp.firstRow = 0;
+      entry.mtp.firstPosition = items[lane].logicalPosition;
+      for (uint32_t row = 0; row + 1 < laneResult.retained; ++row)
+        entry.mtp.tokens[row] = output[row + 1];
+      entry.mtp.tokens[laneResult.retained - 1] = laneResult.nextAnchor;
       entry.maskWords.clear();
       entry.verifyMaskInFlight = false;
       entry.decodeStage = DecodeStage::Regular;
@@ -1605,7 +1641,7 @@ struct Runtime::Impl {
 
           const uint32_t remaining = entry.maxNewTokens - entry.generatedTokens;
           laneResult.currentAnchor = *entry.pendingToken;
-          laneResult.maximumRetained = impl_.retainedRowLimit(remaining);
+          laneResult.maximumRetained = impl_.retainedRowLimit(remaining, &entry);
           laneResult.verify = true;
           entries[lane] = &entry;
 
@@ -2069,6 +2105,12 @@ Runtime::prefillAsync(const BatchPlan &plan,
             throw std::runtime_error(
                 "prefill policy selected an invalid token");
           }
+          // The prompt's last row sits last among the rows gathered into
+          // Hidden0; the MTP head pairs it with the first sampled token.
+          entry.mtp.rows = 1;
+          entry.mtp.firstRow = std::min(item.tokenCount, kDecodeRows) - 1;
+          entry.mtp.firstPosition = nextLength - 1;
+          entry.mtp.tokens[0] = *entry.pendingToken;
           impl->emitTerminalAnchor(entry, result);
         } else {
           const uint32_t lastRows = std::min(item.tokenCount, kDecodeRows);
@@ -2179,7 +2221,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
     // output budget only lowers the token-exact commit count; it never
     // changes the Metal graph shape.
     laneResult.currentAnchor = *entry.pendingToken;
-    laneResult.maximumRetained = impl_->retainedRowLimit(remaining);
+    laneResult.maximumRetained = impl_->retainedRowLimit(remaining, &entry);
 
     impl_->prepareDecodeLane(entry, item, lane);
     impl_->loadPolicyBuffers(entry, lane, {});
@@ -2212,7 +2254,11 @@ Runtime::decodeAsync(const BatchPlan &plan,
         impl_->decodeArena->packed(DecodeTensor::DraftRopeCos, width),
         impl_->decodeArena->packed(DecodeTensor::DraftRopeSin, width));
   }
-  if (draftComputed) {
+  // With the MTP head proposing, the placeholder DFlash draft must not run:
+  // its selection would overwrite the head's proposals.
+  const bool mtpProposes = lanes.size() == 1 && lanes[0].request &&
+                           impl_->mtpProposing(*lanes[0].request);
+  if (draftComputed && !mtpProposes) {
     std::array<Impl::Request *, kLaneCount> requests{};
     std::array<uint64_t, kLaneCount> logicalPositions{};
     for (uint32_t lane = 0; lane < lanes.size(); ++lane) {

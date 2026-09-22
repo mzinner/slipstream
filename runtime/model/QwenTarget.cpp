@@ -69,6 +69,7 @@ QwenTargetGeometry geometryFor(const Qwen4ExpLayout &layout) {
   // The reference's end-of-sequence token, which both fills a fresh n-gram
   // history and restarts the window: config eos_token_id, the first stop.
   result.pleEndToken = layout.stopTokens[0];
+  result.extraKvLayers = layout.mtpLayers;
   return result;
 }
 
@@ -88,7 +89,8 @@ void requireWeights(const Weights &weights,
         return std::holds_alternative<QwenAttentionWeights>(layer.mixer);
       }));
   if (!geometry.valid() || weights.layers.size() != geometry.layers ||
-      attentionLayers != geometry.kvLayout.attentionLayers) {
+      attentionLayers + geometry.extraKvLayers !=
+          geometry.kvLayout.attentionLayers) {
     throw std::invalid_argument(
         "Qwen target weights do not match execution geometry");
   }

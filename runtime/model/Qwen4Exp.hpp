@@ -105,8 +105,12 @@ struct Qwen4ExpLayout final {
     return 2 * attentionQueryHeads * attentionHeadDimension +
            2 * attentionKvHeads * attentionHeadDimension;
   }
+  // One key/value layer past the trunk's for the MTP draft head, whose one
+  // decoder layer has the trunk's attention shape. Unused without the head.
+  uint32_t mtpLayers = 1;
   [[nodiscard]] constexpr kv::Q8Layout q8Layout() const noexcept {
-    return {attentionLayerCount(), attentionKvHeads, attentionHeadDimension};
+    return {attentionLayerCount() + mtpLayers, attentionKvHeads,
+            attentionHeadDimension};
   }
   // The per-layer embedding carries two pieces of history between steps: the
   // last ngramSize - 1 tokens, for the n-gram hash, and the last
@@ -280,6 +284,22 @@ struct Qwen4ExpLayerWeights final {
   Qwen4ExpExpertSource expertSource;
 };
 
+// The multi-token-prediction head's combiner and closing mixer. Its decoder
+// layer is an ordinary attention layer (mtpLayer). Per draft step:
+//
+//   e = fcEmbedding(rms(embed(token)) * (1 + embeddingNorm))
+//   h = fcHidden applied to each stream of rms_per_stream(h_wide) * (1 + hiddenNorm)
+//   residual = h + e broadcast to every stream  -> mtpLayer -> mixer -> lm_head
+//
+// following the llama.cpp fork's qwen4exp graph_mtp ("combiner variant B").
+struct Qwen4ExpMtpCombiner final {
+  metal::MetalBuffer embeddingNorm; // hidden
+  metal::MetalBuffer hiddenNorm;    // hc width
+  ops::Q4Projection fcEmbedding;    // hidden x hidden
+  ops::Q4Projection fcHidden;       // hidden x hidden, per stream
+  Qwen4ExpHyperConnection mixer;    // no injection
+};
+
 struct Qwen4ExpWeights final {
   Qwen4ExpLayout layout;
   std::vector<Qwen4ExpLayerWeights> layers;
@@ -290,6 +310,9 @@ struct Qwen4ExpWeights final {
   // Its own file: the embedding table alone is 26.8 GiB, which does not
   // belong inside a layer file.
   Qwen4ExpPerLayerEmbedding perLayerEmbedding;
+  // Present when the package carries the MTP draft head.
+  std::optional<Qwen4ExpLayerWeights> mtpLayer;
+  std::optional<Qwen4ExpMtpCombiner> mtpCombiner;
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
   std::string manifestFingerprintSha256;
@@ -304,6 +327,9 @@ struct Qwen4ExpWeights final {
   mutable metal::MetalBuffer predictSelected;
   mutable metal::MetalBuffer predictWeights;
   mutable metal::MetalBuffer predictScratch;
+  // MTP draft scratch, allocated on first use.
+  mutable metal::MetalBuffer mtpTokens, mtpEmbed, mtpNorm, mtpE, mtpOnes;
+  mutable metal::MetalBuffer mtpCos, mtpSin, mtpHin;
   mutable uint64_t predictIssued = 0;
   mutable uint64_t predictUseful = 0;
 
