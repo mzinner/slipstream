@@ -372,6 +372,7 @@ struct MetalBackend::Impl {
     __strong id<MTLCommandQueue> queue = nil;
     __strong id<MTL4CommandQueue> sparseQueue = nil;
     __strong id<MTLSharedEvent> sparseEvent = nil;
+    __strong id<MTLResidencySet> residencySet = nil;
     // Gates the stages of submitPipelineAsync; values only grow.
     __strong id<MTLSharedEvent> pipelineEvent = nil;
     uint64_t pipelineValue = 0;
@@ -1220,6 +1221,26 @@ bool MetalBackend::dispatchProfiling() const noexcept {
 
 std::vector<DispatchTiming> MetalBackend::takeDispatchProfile() {
     return std::exchange(impl_->dispatchProfile, {});
+}
+
+void MetalBackend::keepResident(std::span<const MetalBuffer> buffers) {
+    std::lock_guard commandLock(impl_->commandMutex);
+    if (!impl_->residencySet) {
+        MTLResidencySetDescriptor *descriptor = [MTLResidencySetDescriptor new];
+        descriptor.label = @"splash-resident";
+        NSError *error = nil;
+        impl_->residencySet =
+            [impl_->device newResidencySetWithDescriptor:descriptor error:&error];
+        if (!impl_->residencySet)
+            throw MetalBackendError("cannot create a residency set");
+        [impl_->queue addResidencySet:impl_->residencySet];
+    }
+    for (const MetalBuffer &buffer : buffers) {
+        if (buffer.impl_ && buffer.impl_->allocation)
+            [impl_->residencySet addAllocation:buffer.impl_->allocation->buffer];
+    }
+    [impl_->residencySet commit];
+    [impl_->residencySet requestResidency];
 }
 
 uint64_t MetalBackend::reservePipelineEvents(uint32_t stages) {

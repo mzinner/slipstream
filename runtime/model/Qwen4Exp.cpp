@@ -506,6 +506,19 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
       cache.numCached = prewarm;
       cache.clock = 1;
     });
+    // Keep every expert cache resident on the GPU. Otherwise the driver maps
+    // each layer's cache on first use - ~14 ms a layer, ~0.7 s for a step -
+    // and again after a long prompt, streamed through whole layer files,
+    // evicted them.
+    {
+      std::vector<metal::MetalBuffer> resident;
+      for (uint32_t l = residentLayers; l < cachedLayers; ++l) {
+        const auto &cache = streamingLayer(l).expertCache;
+        resident.insert(resident.end(), {cache.cacheGate, cache.cacheUp, cache.cacheDown});
+      }
+      if (!getenv("SPLASH_NO_RESIDENCY_SET"))
+        backend.keepResident(resident);
+    }
     result.streamingCacheCapacity = cacheCapacity;
     result.streamingCacheGate = result.layers[residentLayers].expertCache.cacheGate;
     result.streamingCacheUp = result.layers[residentLayers].expertCache.cacheUp;

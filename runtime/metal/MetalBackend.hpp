@@ -350,6 +350,12 @@ public:
   // stages: waitPipelineEvent(base + 2k - 1), then signalPipelineEvent(base +
   // 2k). The GPU never waits for a submission, only for that signal.
   // reservePipelineEvents(stages) returns a fresh base.
+  // Keeps these buffers resident on the GPU for every command from now on
+  // (a residency set on the queue), instead of the driver making them
+  // resident when a command first uses them - and again after something
+  // large evicted them.
+  void keepResident(std::span<const MetalBuffer> buffers);
+
   [[nodiscard]] uint64_t reservePipelineEvents(uint32_t stages);
   [[nodiscard]] CommandTicket
   submitPipelineAsync(std::span<const ComputeDispatch> dispatches,

@@ -2143,9 +2143,16 @@ void Qwen4ExpTarget::addVerify(
     const uint64_t base = backend.reservePipelineEvents(stages);
     auto tg0 = std::chrono::steady_clock::now();
     metal::CommandTicket ticket = backend.submitPipelineAsync(all, starts, base);
+    static uint32_t tracedSteps = 0;
+    const bool trace = std::getenv("SPLASH_TRACE_STAGES") && tracedSteps++ < 3;
+    std::vector<double> waits;
     for (uint32_t k = 1; k < stages; ++k) {
+      const auto waitStart = std::chrono::steady_clock::now();
       if (!backend.waitPipelineEvent(base + 2 * k - 1, 60000))
         throw std::runtime_error("pipelined decode stage timed out");
+      if (trace)
+        waits.push_back(std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - waitStart).count());
       auto ts = std::chrono::steady_clock::now();
       const uint32_t layer = R + k;
       hostSelect(layer);
@@ -2165,6 +2172,11 @@ void Qwen4ExpTarget::addVerify(
     totalGpuMs += std::chrono::duration<double, std::milli>(
                       std::chrono::steady_clock::now() - tg0).count();
     totalPureGpuMs += timing.gpuSeconds * 1000.0;
+    if (trace) {
+      std::cerr << "[stage waits ms]";
+      for (double w : waits) std::cerr << ' ' << std::lround(w * 10) / 10.0;
+      std::cerr << '\n';
+    }
   } else {
     // Loop through streaming layers R .. geometry.layers - 2
     for (uint32_t L = R; L < geometry.layers - 1; ++L) {
