@@ -14,6 +14,9 @@ struct GdnShape final {
   uint32_t headDimension = 0;
   uint32_t convolutionDimension = 0;
   uint32_t packedWidth = 0;
+  // Output gate activation: silu when false, sigmoid when true. Not part of
+  // the compiled geometry; see GDNPreparePrefillParams.
+  bool sigmoidGate = false;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return keyHeads && valueHeads && valueHeads % keyHeads == 0 &&

@@ -366,7 +366,8 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens) {
         const double z = fromBf16(packed[uint64_t{token} * packedWidth + convDim +
                                          head * kHeadDim + dim]);
         const double ref = roundBf16(
-            roundBf16(row[dim] * inverse * fromBf16(mixerNorm[dim])) * sigmoid(z));
+            roundBf16(row[dim] * inverse * fromBf16(mixerNorm[dim])) *
+            (shape.sigmoidGate ? sigmoid(z) : silu(z)));
         const double got = fromBf16(hidden[base + dim]);
         require(std::isfinite(got), label + "gated output is not finite");
         hiddenUlps = std::max(hiddenUlps, std::fabs(got - ref) / bf16Ulp(ref));
@@ -451,6 +452,11 @@ void run(const std::string &metallib) {
        {GdnShape{16, 48, 128, 10240, 16640}, GdnShape{16, 32, 128, 8192, 12544}}) {
     for (uint32_t tokens : {1u, 37u, 1000u, 2048u})
       runCase(backend, shape, tokens);
+    // qwen4exp shares these dimensions but gates with a sigmoid.
+    GdnShape sigmoidShape = shape;
+    sigmoidShape.sigmoidGate = true;
+    for (uint32_t tokens : {1u, 37u})
+      runCase(backend, sigmoidShape, tokens);
     runSplitCase(backend, shape, 2048, 1000);
     runSplitCase(backend, shape, 37, 17);
   }

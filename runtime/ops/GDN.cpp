@@ -20,9 +20,11 @@ enum class KernelLayout : uint8_t { Value48, Value32 };
 [[nodiscard]] KernelLayout kernelShape(const GdnShape &shape) {
   if (!shape.valid())
     throw std::invalid_argument("invalid GDN shape");
-  if (shape == GdnShape{16, 48, 128, 10240, 16640})
+  GdnShape geometry = shape;
+  geometry.sigmoidGate = false;
+  if (geometry == GdnShape{16, 48, 128, 10240, 16640})
     return KernelLayout::Value48;
-  if (shape == GdnShape{16, 32, 128, 8192, 12544})
+  if (geometry == GdnShape{16, 32, 128, 8192, 12544})
     return KernelLayout::Value32;
   throw std::invalid_argument("unsupported compiled GDN shape");
 }
@@ -40,7 +42,8 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
   if (!tokens)
     throw std::invalid_argument("invalid GDN prefill geometry");
   const KernelLayout kernel = kernelShape(shape);
-  const GDNPreparePrefillParams prepare{tokens, shape.packedWidth};
+  const GDNPreparePrefillParams prepare{tokens, shape.packedWidth,
+                                        shape.sigmoidGate ? 1u : 0u};
   graph.add(kernelName(kernel, "prefill_gdn_prepare",
                        "prefill_gdn_prepare_vh32"),
             {buffers.packed, buffers.convolutionWeights,
@@ -82,7 +85,7 @@ void GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                    buffers.decay, buffers.beta, buffers.recurrent,
                    buffers.mixerNorm, buffers.hidden, buffers.arrived,
                    buffers.generation});
-  const GDNDecodeBatchParams params{0,
+  const GDNDecodeBatchParams params{shape.sigmoidGate ? 1u : 0u,
                                     shape.packedWidth,
                                     lanes,
                                     layer,

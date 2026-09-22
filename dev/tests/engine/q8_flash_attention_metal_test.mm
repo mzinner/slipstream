@@ -35,7 +35,10 @@ struct Shape {
   uint32_t fusedRows() const { return kRows * queryHeadsPerKvHead; }
   Q8Layout layout() const { return {1, kvHeads, kHeadDimension}; }
 };
-constexpr std::array<Shape, 2> kShapes{{{4, 6, ""}, {2, 8, "_kv2_g8"}}};
+// qwen4exp is the last: two KV heads of twelve query heads each, where a
+// fused row group no longer fits one pass of the 256-thread softmax.
+constexpr std::array<Shape, 3> kShapes{
+    {{4, 6, ""}, {2, 8, "_kv2_g8"}, {2, 12, "_kv2_g12"}}};
 
 void require(bool condition, const char *message) {
   if (!condition)

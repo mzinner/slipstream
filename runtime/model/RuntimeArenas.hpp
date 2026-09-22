@@ -144,6 +144,12 @@ enum class PrefillTensor : uint32_t {
   HyperReduced,
   HyperInjection,
   HyperMixed,
+  PleShifted,
+  PleEmbedding,
+  PleKeys,
+  PleValues,
+  PleGated,
+  PleNormalized,
   Count,
 };
 
@@ -285,6 +291,12 @@ enum class DecodeTensor : uint32_t {
   HyperReduced,
   HyperInjection,
   HyperMixed,
+  PleShifted,
+  PleEmbedding,
+  PleKeys,
+  PleValues,
+  PleGated,
+  PleNormalized,
   Count,
 };
 

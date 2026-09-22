@@ -11,6 +11,7 @@
 #include "metal/abi/Linear.h"
 #include "metal/abi/MoE.h"
 #include "metal/abi/PagedAttention.h"
+#include "metal/abi/PerLayerEmbedding.h"
 #include "metal/abi/RoPE.h"
 #include "metal/abi/Sampling.h"
 #include "metal/abi/Vision.h"

@@ -48,6 +48,12 @@ public:
       metal::MetalBuffer headReduced,
       uint32_t normalizedRows);
 
+  // Writes the per-layer embedding history for the rows the verifier kept.
+  static void addPerLayerEmbeddingCommit(
+      const QwenTargetGeometry &geometry, metal::MetalBackend &backend,
+      metal::CommandGraph &graph, const QwenTargetCommitBuffers &buffers,
+      uint32_t lanes);
+
   static void addEmbedding(
       const Qwen4ExpWeights &weights,
       const QwenTargetGeometry &geometry,

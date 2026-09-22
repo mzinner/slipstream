@@ -14,16 +14,20 @@ struct GDNPrefillParams {
 static_assert(sizeof(GDNPrefillParams) == 4,
               "GDN prefill parameters are 4 bytes on both sides");
 
+// sigmoid_gate selects the output gate: 0 is silu (Qwen3.8), 1 is sigmoid
+// (qwen4exp, whose config sets output_gate_type). The two models share every
+// GDN dimension, so the activation cannot be told apart by the compiled shape.
 struct GDNPreparePrefillParams {
   uint32_t tokens;
   uint32_t packed_width;
+  uint32_t sigmoid_gate;
 };
 
-static_assert(sizeof(GDNPreparePrefillParams) == 8,
-              "GDN prefill prepare parameters are 8 bytes on both sides");
+static_assert(sizeof(GDNPreparePrefillParams) == 12,
+              "GDN prefill prepare parameters are 12 bytes on both sides");
 
 struct GDNDecodeBatchParams {
-  uint32_t reserved0; // Explicit zero padding for the uint64_t strides.
+  uint32_t sigmoid_gate; // As in GDNPreparePrefillParams; also pads the strides.
   uint32_t packed_width;
   uint32_t lanes;
   uint32_t layer;

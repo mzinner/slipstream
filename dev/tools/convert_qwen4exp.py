@@ -704,6 +704,9 @@ def write_manifest(root: Path) -> None:
             "selector_rank": 256,
             "selector_top_k": 16,
             "target_capture_layers": [3, 13, 23, 33, 43],
+            # Zero-filled: this model has no DFlash 2 draft. The runtime
+            # keeps only each step's anchor row rather than verify junk.
+            "placeholder": True,
         },
     }
     (root / "manifest.json").write_text(json.dumps(manifest, indent=1))

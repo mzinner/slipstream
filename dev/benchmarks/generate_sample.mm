@@ -13,6 +13,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 #include <iostream>
@@ -85,8 +86,17 @@ int main(int argc, char **argv) {
         maxTokens = parseCount(argv[3], "max_tokens");
       }
       std::vector<uint32_t> prompt;
+      std::vector<std::vector<uint32_t>> prompts;
       if (argc >= 5) {
-        prompt = parseTokens(argv[4]);
+        // Several prompts, separated by ';', run one after another on the
+        // same engine, as a server would see them: caches stay warm.
+        std::string_view all(argv[4]);
+        for (size_t start = 0; start <= all.size();) {
+          const size_t end = std::min(all.find(';', start), all.size());
+          prompts.push_back(parseTokens(all.substr(start, end - start)));
+          start = end + 1;
+        }
+        prompt = prompts.front();
       } else {
         std::string input;
         std::string line;
@@ -94,7 +104,11 @@ int main(int argc, char **argv) {
           input += line + " ";
         }
         prompt = parseTokens(input);
+        prompts.push_back(prompt);
       }
+      for (const auto &each : prompts)
+        if (each.size() > prompt.size())
+          prompt = each;
       if (prompt.empty()) {
         std::cerr << "error: prompt tokens cannot be empty\n";
         return 1;
@@ -136,109 +150,106 @@ int main(int argc, char **argv) {
           executorPlan.runtimeOverheadReserveBytes};
       model::Runtime executor(context);
 
-      const uint64_t laneId = 1;
-      const uint32_t slot = 0;
-      std::vector<uint32_t> lanePages = pageRange(0, pagesPerLane);
+      for (uint32_t promptIndex = 0; promptIndex < prompts.size(); ++promptIndex) {
+        const std::vector<uint32_t> &prompt = prompts[promptIndex];
+        const uint64_t laneId = 1 + promptIndex;
+        const uint32_t slot = 0;
+        std::vector<uint32_t> lanePages = pageRange(0, pagesPerLane);
 
-      EngineRequest request;
-      request.id = laneId;
-      request.prompt.assign(prompt.begin(), prompt.end());
-      request.maxNewTokens = maxTokens;
-      executor.beginColdRequest(request.modelView(), slot);
+        EngineRequest request;
+        request.id = laneId;
+        request.prompt.assign(prompt.begin(), prompt.end());
+        request.maxNewTokens = maxTokens;
+        executor.beginColdRequest(request.modelView(), slot);
 
-      // Prefill phase
-      const auto prefillStart = std::chrono::steady_clock::now();
-      uint32_t offset = 0;
-      std::vector<uint32_t> generatedTokens;
-      while (offset < prompt.size()) {
-        const uint32_t count = std::min<uint32_t>(
-            model::ExecutionLimits::prefillTokenBudget,
-            static_cast<uint32_t>(prompt.size()) - offset);
-        BatchPlan plan{WorkKind::Prefill, BatchCohort::Greedy,
-                       {{laneId, count, offset}}, DecodeStage::Regular};
-        ModelBatchItem item{laneId, slot, offset, offset, count, lanePages};
-        item.inputTokens =
-            std::span<const uint32_t>(prompt).subspan(offset, count);
-        auto results =
-            executor.prefill(plan, std::span<const ModelBatchItem>(&item, 1));
-        if (results.size() != 1 || results[0].consumedPromptTokens != count)
-          throw std::runtime_error("prefill consumed wrong row count");
-        offset += count;
+        // Prefill phase
+        const auto prefillStart = std::chrono::steady_clock::now();
+        uint32_t offset = 0;
+        std::vector<uint32_t> generatedTokens;
+        while (offset < prompt.size()) {
+          const uint32_t count = std::min<uint32_t>(
+              model::ExecutionLimits::prefillTokenBudget,
+              static_cast<uint32_t>(prompt.size()) - offset);
+          BatchPlan plan{WorkKind::Prefill, BatchCohort::Greedy,
+                         {{laneId, count, offset}}, DecodeStage::Regular};
+          ModelBatchItem item{laneId, slot, offset, offset, count, lanePages};
+          item.inputTokens =
+              std::span<const uint32_t>(prompt).subspan(offset, count);
+          auto results =
+              executor.prefill(plan, std::span<const ModelBatchItem>(&item, 1));
+          if (results.size() != 1 || results[0].consumedPromptTokens != count)
+            throw std::runtime_error("prefill consumed wrong row count");
+          // Scoring runs ask for the logits of every prompt position.
+          if (const char *dump = std::getenv("SPLASH_DUMP_PREFILL_LOGITS"))
+            executor.dumpPrefillLogits(count, dump);
+          offset += count;
 
-        for (uint32_t token : results[0].outputTokens) {
-          generatedTokens.push_back(token);
+          for (uint32_t token : results[0].outputTokens) {
+            generatedTokens.push_back(token);
+          }
+          if (results[0].finished) {
+            std::cerr << "Prefill emitted stop token\n";
+            break;
+          }
         }
-        if (results[0].finished) {
-          std::cerr << "Prefill emitted stop token\n";
-          break;
+        const auto prefillFinish = std::chrono::steady_clock::now();
+        const double prefillMs = std::chrono::duration<double, std::milli>(
+                                     prefillFinish - prefillStart)
+                                     .count();
+        std::cerr << "Prefill completed in " << prefillMs << " ms. Prompt tokens: " << prompt.size() << "\n";
+
+        std::vector<double> decodeStepMs;
+
+        uint64_t position = prompt.size();
+        uint32_t totalGenerated = static_cast<uint32_t>(generatedTokens.size());
+        while (totalGenerated < maxTokens) {
+          BatchPlan plan{WorkKind::Decode, BatchCohort::Greedy,
+                         {{laneId, 0, 0}}, DecodeStage::Regular};
+          ModelBatchItem item{laneId, slot, position, 0, 0, lanePages};
+
+          const auto stepStart = std::chrono::steady_clock::now();
+          auto results =
+              executor.decode(plan, std::span<const ModelBatchItem>(&item, 1));
+          const auto stepFinish = std::chrono::steady_clock::now();
+          const double stepMs = std::chrono::duration<double, std::milli>(
+                                    stepFinish - stepStart)
+                                    .count();
+          decodeStepMs.push_back(stepMs);
+
+          if (results.empty())
+            break;
+          const auto &res = results[0];
+          if (res.outputTokens.empty())
+            break;
+
+          for (uint32_t token : res.outputTokens) {
+            generatedTokens.push_back(token);
+            ++totalGenerated;
+            std::cerr << "Token: " << token << " (step: " << decodeStepMs.size() << ", total: " << totalGenerated << ")\n";
+          }
+
+          position += res.outputTokens.size() - res.outputTokensWithoutKv;
+
+          if (res.finished) {
+            std::cerr << "Finished by stop token\n";
+            break;
+          }
         }
+
+        executor.end(laneId);
+
+        // One line of JSON per prompt.
+        std::cout << "{\"prefill_ms\": " << prefillMs
+                  << ", \"prompt_tokens\": " << prompt.size()
+                  << ", \"decode_steps\": " << decodeStepMs.size()
+                  << ", \"generated_tokens\": [";
+        for (size_t i = 0; i < generatedTokens.size(); ++i)
+          std::cout << (i ? ", " : "") << generatedTokens[i];
+        std::cout << "], \"step_ms\": [";
+        for (size_t i = 0; i < decodeStepMs.size(); ++i)
+          std::cout << (i ? ", " : "") << decodeStepMs[i];
+        std::cout << "]}" << std::endl;
       }
-      const auto prefillFinish = std::chrono::steady_clock::now();
-      const double prefillMs = std::chrono::duration<double, std::milli>(
-                                   prefillFinish - prefillStart)
-                                   .count();
-      std::cerr << "Prefill completed in " << prefillMs << " ms. Prompt tokens: " << prompt.size() << "\n";
-
-      std::vector<double> decodeStepMs;
-
-      uint64_t position = prompt.size();
-      uint32_t totalGenerated = static_cast<uint32_t>(generatedTokens.size());
-      while (totalGenerated < maxTokens) {
-        BatchPlan plan{WorkKind::Decode, BatchCohort::Greedy,
-                       {{laneId, 0, 0}}, DecodeStage::Regular};
-        ModelBatchItem item{laneId, slot, position, 0, 0, lanePages};
-
-        const auto stepStart = std::chrono::steady_clock::now();
-        auto results =
-            executor.decode(plan, std::span<const ModelBatchItem>(&item, 1));
-        const auto stepFinish = std::chrono::steady_clock::now();
-        const double stepMs = std::chrono::duration<double, std::milli>(
-                                  stepFinish - stepStart)
-                                  .count();
-        decodeStepMs.push_back(stepMs);
-
-        if (results.empty())
-          break;
-        const auto &res = results[0];
-        if (res.outputTokens.empty())
-          break;
-
-        for (uint32_t token : res.outputTokens) {
-          generatedTokens.push_back(token);
-          ++totalGenerated;
-          std::cerr << "Token: " << token << " (step: " << decodeStepMs.size() << ", total: " << totalGenerated << ")\n";
-        }
-
-        position += res.outputTokens.size() - res.outputTokensWithoutKv;
-
-        if (res.finished) {
-          std::cerr << "Finished by stop token\n";
-          break;
-        }
-      }
-
-      executor.end(laneId);
-
-      // Output JSON
-      std::cout << "{\n";
-      std::cout << "  \"prefill_ms\": " << prefillMs << ",\n";
-      std::cout << "  \"prompt_tokens\": " << prompt.size() << ",\n";
-      std::cout << "  \"decode_steps\": " << decodeStepMs.size() << ",\n";
-      std::cout << "  \"generated_tokens\": [";
-      for (size_t i = 0; i < generatedTokens.size(); ++i) {
-        if (i > 0)
-          std::cout << ", ";
-        std::cout << generatedTokens[i];
-      }
-      std::cout << "],\n";
-      std::cout << "  \"step_ms\": [";
-      for (size_t i = 0; i < decodeStepMs.size(); ++i) {
-        if (i > 0)
-          std::cout << ", ";
-        std::cout << decodeStepMs[i];
-      }
-      std::cout << "]\n";
-      std::cout << "}\n";
 
       return 0;
     } catch (const std::exception &error) {

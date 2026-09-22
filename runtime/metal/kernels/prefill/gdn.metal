@@ -307,7 +307,8 @@ GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare_vh32, 16, 32, 128, 8192)
     threadgroup float reductions[4];                                          \
     gdn_gate_phase<ValueHeads, HeadDim, ConvDim, 4>(                          \
         recurrent, packed, norm_weight, hidden, params.tokens * ValueHeads,   \
-        params.tokens * ValueHeads, params.packed_width, reductions, task,     \
+        params.tokens * ValueHeads, params.packed_width,                      \
+        params.sigmoid_gate != 0, reductions, task,                           \
         thread_index, lane, simd_group);                                      \
   }
 

@@ -63,6 +63,12 @@ QwenTargetGeometry geometryFor(const Qwen4ExpLayout &layout) {
   result.ffnKind = QwenFfnKind::SparseMoe;
   result.hyperConnectionCount = layout.hyperConnectionCount;
   result.hyperConnectionLowRank = layout.hyperConnectionLowRank;
+  result.pleLayer = layout.ngramLayer;
+  result.pleEmbeddingSize = layout.ngramEmbeddingSize;
+  result.pleHistoryRows = layout.pleConvolutionState();
+  // The reference's end-of-sequence token, which both fills a fresh n-gram
+  // history and restarts the window: config eos_token_id, the first stop.
+  result.pleEndToken = layout.stopTokens[0];
   return result;
 }
 
@@ -664,6 +670,9 @@ void QwenTarget::addStateCommit(metal::CommandGraph &graph,
                                 uint32_t lanes) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth)
     throw std::invalid_argument("invalid Qwen state commit batch");
+  if (geometry_.hasPerLayerEmbedding())
+    Qwen4ExpTarget::addPerLayerEmbeddingCommit(geometry_, backend_, graph,
+                                               buffers, lanes);
   ops::GDN::addCommit(
       graph,
       {std::move(buffers.packed), std::move(buffers.mixed),

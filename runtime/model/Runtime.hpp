@@ -36,6 +36,11 @@ public:
               std::function<void()> completion) override;
   [[nodiscard]] std::vector<ModelStepResult>
   decode(const BatchPlan &plan, std::span<const ModelBatchItem> items);
+  // Measurement only: run the output head over every row of the prefill
+  // chunk that just completed on lane 0, appending bf16 logits
+  // [rows x vocabulary] to `path`. It reuses decode scratch, so a request is
+  // not safe to continue decoding afterwards; scoring tools end it instead.
+  void dumpPrefillLogits(uint32_t rows, const char *path);
   [[nodiscard]] std::shared_ptr<const CompositeState>
   snapshot(uint64_t requestId) override;
   [[nodiscard]] uint64_t reclaimIdleState() noexcept override;

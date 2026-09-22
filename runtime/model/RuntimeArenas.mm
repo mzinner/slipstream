@@ -137,6 +137,22 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
         bytesFor<uint16_t>(uint64_t{kPrefillRows} *
                            geometry.target.hiddenSize));
   }
+  if (geometry.target.hasPerLayerEmbedding()) {
+    const uint64_t rows = kPrefillRows;
+    const uint64_t width = geometry.target.residualWidth();
+    put(PrefillTensor::PleShifted, bytesFor<uint32_t>(3 * rows));
+    put(PrefillTensor::PleEmbedding,
+        bytesFor<uint16_t>(rows * geometry.target.pleEmbeddingSize));
+    put(PrefillTensor::PleKeys, bytesFor<uint16_t>(rows * width));
+    put(PrefillTensor::PleValues,
+        bytesFor<uint16_t>(rows * geometry.target.hiddenSize));
+    put(PrefillTensor::PleGated, bytesFor<uint16_t>(rows * width));
+    // Each packed sequence reads its own stored history ahead of its rows.
+    put(PrefillTensor::PleNormalized,
+        bytesFor<uint16_t>(
+            (rows + uint64_t{kLaneCount} * geometry.target.pleHistoryRows) *
+            width));
+  }
   return result;
 }
 
@@ -325,6 +341,20 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
         bytesFor<uint16_t>(r * geometry.target.hyperConnectionCount));
     put(DecodeTensor::HyperMixed,
         bytesFor<uint16_t>(r * geometry.target.hiddenSize));
+  }
+  if (geometry.target.hasPerLayerEmbedding()) {
+    const uint64_t width = geometry.target.residualWidth();
+    put(DecodeTensor::PleShifted, bytesFor<uint32_t>(3 * r));
+    put(DecodeTensor::PleEmbedding,
+        bytesFor<uint16_t>(r * geometry.target.pleEmbeddingSize));
+    put(DecodeTensor::PleKeys, bytesFor<uint16_t>(r * width));
+    put(DecodeTensor::PleValues,
+        bytesFor<uint16_t>(r * geometry.target.hiddenSize));
+    put(DecodeTensor::PleGated, bytesFor<uint16_t>(r * width));
+    // Kept until the state commit, which picks its window once the verifier
+    // has decided how many rows to keep.
+    put(DecodeTensor::PleNormalized,
+        bytesFor<uint16_t>((geometry.target.pleHistoryRows + r) * width));
   }
   return result;
 }

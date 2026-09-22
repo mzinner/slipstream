@@ -28,6 +28,10 @@ struct ModelDescriptor final {
   ModelCapabilities capabilities;
   kv::Q8Layout targetKvLayout;
   CompositeStateLayout stateLayout;
+  // The draft is zero-filled, present only because the format requires one
+  // (qwen4exp has no DFlash 2 draft). Its proposals are never worth keeping,
+  // so the runtime keeps only each step's anchor row.
+  bool draftPlaceholder = false;
   // Exact bytes parsed during package inspection, including artifact digests.
   // Synthetic descriptors retain zero; this is separate from layout identity.
   std::array<uint8_t, 32> packageManifestSha256{};

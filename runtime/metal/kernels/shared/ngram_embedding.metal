@@ -23,14 +23,7 @@
 // restarts the window at an end-of-sequence token, which is a sequence
 // property rather than a per-row one.
 
-struct NgramEmbeddingParams {
-  uint rows;
-  uint heads;
-  uint head_dimension;
-  uint ngram_size;
-  uint heads_per_order;
-  uint group_elements;
-};
+// NgramEmbeddingParams is in metal/abi/PerLayerEmbedding.h.
 
 // One threadgroup per row; one simdgroup per head while heads remain.
 kernel void ngram_embedding_gather(

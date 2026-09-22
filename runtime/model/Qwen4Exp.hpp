@@ -106,10 +106,25 @@ struct Qwen4ExpLayout final {
   [[nodiscard]] constexpr kv::Q8Layout q8Layout() const noexcept {
     return {attentionLayerCount(), attentionKvHeads, attentionHeadDimension};
   }
+  // The per-layer embedding carries two pieces of history between steps: the
+  // last ngramSize - 1 tokens, for the n-gram hash, and the last
+  // pleConvolutionState() normalized rows, for its dilated convolution. They
+  // live in the GDN state cell's auxiliary region:
+  //
+  //   uint32 valid, older token, newer token, padding     16 bytes
+  //   bf16   [pleConvolutionState()][hyperConnectionWidth()]
+  //
+  // A zeroed region (valid = 0) is a fresh sequence, which the reference
+  // treats as two end-of-sequence tokens and a zero convolution history.
+  static constexpr uint32_t pleHistoryHeaderBytes = 16;
+  [[nodiscard]] constexpr uint64_t pleAuxiliaryBytes() const noexcept {
+    return pleHistoryHeaderBytes + uint64_t{pleConvolutionState()} *
+                                       hyperConnectionWidth() * 2;
+  }
   [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {
     return {layers - attentionLayerCount(), kGdnConvolutionTaps - 1,
             convolutionDimension, gdnValueHeads, gdnHeadDimension,
-            gdnHeadDimension};
+            gdnHeadDimension, pleAuxiliaryBytes()};
   }
   [[nodiscard]] constexpr QwenMixerGeometry mixerGeometry() const noexcept {
     return {hiddenSize,     packedGdnWidth, packedFullWidth,

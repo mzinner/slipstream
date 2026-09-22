@@ -45,6 +45,8 @@ void requireLayout(const Qwen4ExpLayout &layout) {
       layout.packedGdnWidth % kQ4StorageN ||
       layout.expertsPerToken > layout.experts ||
       layout.ngramLayer >= layout.layers ||
+      // The history kernels keep exactly two tokens: a window of three.
+      layout.ngramSize != 3 ||
       layout.hiddenCaptureLayers.back() >= layout.layers ||
       !layout.q8Layout().valid() || !layout.gdnStateLayout().valid()) {
     throw WeightStoreError("qwen4exp layout is inconsistent");
@@ -342,6 +344,16 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
         checkedWeightMultiply(width, layout.pleConvolutionTaps,
                               "PLE convolution bytes"),
         "ple-convolution");
+    // Everything but the table leaves the file's buffer. A kernel that binds
+    // any view of it makes the GPU keep all 32 GB resident, which cost
+    // seconds per step; the table itself is gathered on the CPU instead.
+    ple.keyProjection = detachQ4(backend, ple.keyProjection, "ple-key");
+    ple.valueProjection = detachQ4(backend, ple.valueProjection, "ple-value");
+    ple.keyNorm = detachBuffer(backend, ple.keyNorm, "ple-key-norm");
+    ple.queryNorm = detachBuffer(backend, ple.queryNorm, "ple-query-norm");
+    ple.convolutionNorm = detachBuffer(backend, ple.convolutionNorm, "ple-conv-norm");
+    ple.convolutionWeights =
+        detachBuffer(backend, ple.convolutionWeights, "ple-convolution");
     file.finish();
     result.files.push_back(file.record());
   }

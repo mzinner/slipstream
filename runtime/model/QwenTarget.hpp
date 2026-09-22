@@ -156,6 +156,16 @@ struct QwenTargetGeometry final {
   GdnStateLayout stateLayout{};
   uint32_t hyperConnectionCount = 1;
   uint32_t hyperConnectionLowRank = 0;
+  // qwen4exp's per-layer embedding, added to the residual entering pleLayer.
+  // pleEmbeddingSize is zero for models without one.
+  uint32_t pleLayer = 0;
+  uint32_t pleEmbeddingSize = 0;
+  uint32_t pleHistoryRows = 0;
+  uint32_t pleEndToken = 0;
+
+  [[nodiscard]] constexpr bool hasPerLayerEmbedding() const noexcept {
+    return pleEmbeddingSize != 0;
+  }
 
   [[nodiscard]] constexpr uint32_t residualWidth() const noexcept {
     return hiddenSize * (hyperConnectionCount ? hyperConnectionCount : 1);
@@ -203,6 +213,18 @@ struct QwenTargetPrefillCapture final {
   uint32_t rows = 0;
 };
 
+// Scratch for qwen4exp's per-layer embedding, and the token ids it hashes.
+// Empty for models without one.
+struct QwenTargetPleBuffers final {
+  metal::MetalBuffer tokens;     // uint32 per row
+  metal::MetalBuffer shifted;    // uint32 [3][rows], per sequence
+  metal::MetalBuffer embedding;  // bf16 rows x pleEmbeddingSize
+  metal::MetalBuffer keys;       // bf16 rows x residual width
+  metal::MetalBuffer values;     // bf16 rows x hidden
+  metal::MetalBuffer gated;      // bf16 rows x residual width
+  metal::MetalBuffer normalized; // bf16 (history + rows) x width, per sequence
+};
+
 struct QwenTargetPrefillSequence final {
   uint32_t rowBegin = 0;
   uint32_t rows = 0;
@@ -217,6 +239,9 @@ struct QwenTargetPrefillSequence final {
   std::span<const metal::MetalBuffer> recurrentOut;
   std::array<QwenTargetPrefillCapture, 2> captures{};
   uint32_t captureCount = 0;
+  // The GDN cell's auxiliary region, current and next parity.
+  metal::MetalBuffer auxiliaryIn;
+  metal::MetalBuffer auxiliaryOut;
 };
 
 struct QwenTargetPrefillBuffers final {
@@ -259,9 +284,14 @@ struct QwenTargetPrefillBuffers final {
   metal::MetalBuffer hyperReduced;
   metal::MetalBuffer hyperInjection;
   metal::MetalBuffer hyperMixed;
+  QwenTargetPleBuffers ple;
 };
 
 struct QwenTargetVerifyBuffers final {
+  // Rows per lane whose output can be kept. Below targetVerifyRows when the
+  // draft is a placeholder: the other rows are computed only as far as the
+  // cheap layers go, and their expert work is skipped.
+  uint32_t liveRowsPerLane = ExecutionLimits::targetVerifyRows;
   std::array<metal::MetalBuffer, 2> hidden;
   metal::MetalBuffer normalized;
   metal::MetalBuffer recurrent;
@@ -307,6 +337,7 @@ struct QwenTargetVerifyBuffers final {
   metal::MetalBuffer hyperReduced;
   metal::MetalBuffer hyperInjection;
   metal::MetalBuffer hyperMixed;
+  QwenTargetPleBuffers ple;
 };
 
 struct QwenTargetCommitBuffers final {
@@ -319,6 +350,9 @@ struct QwenTargetCommitBuffers final {
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
       nextStates;
   metal::MetalBuffer retainedCounts;
+  // The verify pass's per-layer embedding rows, for choosing what to keep.
+  metal::MetalBuffer pleTokens;
+  metal::MetalBuffer pleNormalized;
 };
 
 [[nodiscard]] QwenTargetGeometry

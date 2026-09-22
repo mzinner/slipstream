@@ -18,14 +18,7 @@
 // and dilated by the n-gram order, so its state spans (taps - 1) * order
 // positions rather than taps - 1.
 
-struct PerLayerEmbeddingParams {
-  uint rows;
-  uint hidden;
-  uint count;
-  uint taps;
-  uint dilation;
-  float epsilon;
-};
+// PerLayerEmbeddingParams is in metal/abi/PerLayerEmbedding.h.
 
 constant constexpr uint kThreads = 256;
 constant constexpr uint kSimdgroups = kThreads / 32;
@@ -174,5 +167,112 @@ kernel void per_layer_embedding_convolve(
     }
     const float activated = sum / (1.0f + exp(-sum));
     gated[element] = bfloat(float(gated[element]) + activated);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// History carried between steps.
+//
+// The state region holds a 16-byte header - valid, older token, newer token,
+// padding - then `history` normalized rows of `width`. A zeroed region is a
+// fresh sequence: two end-of-sequence tokens and a zero convolution history,
+// exactly what the reference starts from.
+// ---------------------------------------------------------------------------
+
+constant constexpr uint kPleHeaderWords = 4;
+
+inline uint ple_history_token(device const uint *header, uint index, uint eos) {
+  return header[0] ? header[1 + index] : eos;
+}
+
+// The shifted token rows the n-gram gather reads, [3][rows]: each token, its
+// predecessor, and the one before that.
+//
+// The reference restarts the window after an end-of-sequence token. With a
+// window of three that reduces to one rule: two back is replaced by the
+// end-of-sequence token whenever one back is one. (One back being itself the
+// end-of-sequence token needs no rule, and neither does two back.)
+kernel void per_layer_embedding_shift(
+    device const uint *tokens [[buffer(0)]],
+    device const uchar *state [[buffer(1)]],
+    device uint *shifted [[buffer(2)]],
+    constant PerLayerEmbeddingStateParams &params [[buffer(3)]],
+    uint row [[thread_position_in_grid]]) {
+  if (row >= params.rows)
+    return;
+  device const uint *header = reinterpret_cast<device const uint *>(state);
+  const uint older = ple_history_token(header, 0, params.eos);
+  const uint newer = ple_history_token(header, 1, params.eos);
+  const uint one_back = row >= 1 ? tokens[row - 1] : newer;
+  const uint two_back_raw =
+      row >= 2 ? tokens[row - 2] : (row == 1 ? newer : older);
+  shifted[row] = tokens[row];
+  shifted[params.rows + row] = one_back;
+  shifted[2 * params.rows + row] =
+      one_back == params.eos ? params.eos : two_back_raw;
+}
+
+// Load the stored convolution history into the rows ahead of this step's.
+kernel void per_layer_embedding_history(
+    device const uchar *state [[buffer(0)]],
+    device bfloat *normalized [[buffer(1)]],
+    constant PerLayerEmbeddingStateParams &params [[buffer(2)]],
+    uint index [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]]) {
+  device const bfloat *rows = reinterpret_cast<device const bfloat *>(
+      state + kPleHeaderWords * sizeof(uint));
+  const uint total = params.history * params.width;
+  for (uint element = index; element < total; element += grid_size)
+    normalized[element] = rows[element];
+}
+
+// Add the embedding's output into the residual the layer reads.
+kernel void per_layer_embedding_add(
+    device const bfloat *gated [[buffer(0)]],
+    device bfloat *residual [[buffer(1)]],
+    constant PerLayerEmbeddingStateParams &params [[buffer(2)]],
+    uint index [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]]) {
+  const uint total = params.rows * params.width;
+  for (uint element = index; element < total; element += grid_size)
+    residual[element] = bfloat(float(residual[element]) + float(gated[element]));
+}
+
+// Write the history the next step starts from, keeping only the rows that
+// were committed. With r rows kept, the convolution history is normalized
+// rows [r, r + history) - the last `history` of the stored history followed
+// by the kept rows - and the two tokens are the last two of the stored pair
+// followed by the kept tokens.
+kernel void per_layer_embedding_commit(
+    device const uint *tokens [[buffer(0)]],
+    device const bfloat *normalized [[buffer(1)]],
+    device const uchar *state_in [[buffer(2)]],
+    device uchar *state_out [[buffer(3)]],
+    device const uint *retained_counts [[buffer(4)]],
+    constant PerLayerEmbeddingStateParams &params [[buffer(5)]],
+    uint index [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]]) {
+  const uint kept = params.retained_from_buffer
+                        ? min(retained_counts[params.lane], params.rows)
+                        : params.retained;
+  device bfloat *rows_out = reinterpret_cast<device bfloat *>(
+      state_out + kPleHeaderWords * sizeof(uint));
+  const uint total = params.history * params.width;
+  for (uint element = index; element < total; element += grid_size)
+    rows_out[element] = normalized[ulong(kept) * params.width + element];
+  if (index == 0) {
+    device const uint *header = reinterpret_cast<device const uint *>(state_in);
+    // The sequence [older, newer, tokens...]; the new pair is its last two.
+    uint sequence[2];
+    for (uint i = 0; i < 2; ++i) {
+      const uint position = kept + i; // index into [older, newer, tokens...]
+      sequence[i] = position < 2 ? ple_history_token(header, position, params.eos)
+                                 : tokens[position - 2];
+    }
+    device uint *out = reinterpret_cast<device uint *>(state_out);
+    out[0] = 1;
+    out[1] = sequence[0];
+    out[2] = sequence[1];
+    out[3] = 0;
   }
 }

@@ -363,8 +363,8 @@ inline void gdn_decode_batch_phase(
   threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
   gdn_gate_phase<ValueHeads, HeadDim, ConvDim, kDecodeSimdgroups>(
       lane_recurrent, packed, gdn_norm_weight, lane_hidden, Rows * ValueHeads,
-      ValueHeads, params.packed_width, scratch, group.x, thread_index, lane,
-      simd_group);
+      ValueHeads, params.packed_width, params.sigmoid_gate != 0, scratch,
+      group.x, thread_index, lane, simd_group);
   grid_completion(arrived[batch], generation[batch], ValueHeads,
                   thread_index);
 }

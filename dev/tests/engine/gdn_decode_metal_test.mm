@@ -33,8 +33,11 @@ constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
 constexpr uint32_t kMaxLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kHeadDim = 128;
 constexpr uint32_t kLayers = 2;
+// The last entry is qwen4exp: the same dimensions as the first, gated with a
+// sigmoid rather than silu.
 constexpr std::array kShapes{GdnShape{16, 48, 128, 10240, 16640},
-                             GdnShape{16, 32, 128, 8192, 12544}};
+                             GdnShape{16, 32, 128, 8192, 12544},
+                             GdnShape{16, 48, 128, 10240, 16640, true}};
 
 void require(bool condition, const std::string &message) {
   if (!condition)
@@ -477,7 +480,11 @@ void checkDecode(const Fixture &fixture, uint32_t layer, uint32_t lane) {
         const double normalized = roundBfloat(
             fromBfloat(recurrent[dim]) * inverse * fromBfloat(norm[dim]));
         const double gate = fromBfloat(packed[zOffset + head * kHeadDim + dim]);
-        require(closeBfloat(hidden[dim], normalized * sigmoid(gate), 2.0,
+        require(closeBfloat(hidden[dim],
+                            normalized * (fixture.shape.sigmoidGate
+                                              ? sigmoid(gate)
+                                              : gate * sigmoid(gate)),
+                            2.0,
                             1e-6),
                 where + ": hidden mismatch");
       }

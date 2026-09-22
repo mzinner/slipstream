@@ -493,6 +493,10 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
     } else if (format == "splash-packed-q4-qwen4exp") {
       descriptor = qwen4expDescriptor(model);
       validateQwen4Exp(manifest, root, descriptor);
+      NSDictionary *draft = requireObject(manifest, @"draft", "draft declaration");
+      if (NSNumber *placeholder = draft[@"placeholder"];
+          [placeholder isKindOfClass:NSNumber.class])
+        descriptor.draftPlaceholder = placeholder.boolValue;
     } else {
       throw std::invalid_argument("unsupported weight format: " + format);
     }

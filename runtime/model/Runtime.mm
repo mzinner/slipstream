@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -764,6 +765,13 @@ struct Runtime::Impl {
     return timing;
   }
 
+  // Rows a verify step may keep: the anchor plus accepted proposals. With a
+  // placeholder draft no proposal is worth keeping, so only the anchor.
+  uint32_t retainedRowLimit(uint32_t remaining) const noexcept {
+    return std::min(remaining,
+                    package.descriptor.draftPlaceholder ? 1u : kDecodeRows);
+  }
+
   Q8ChunkedPrefillParams q8Params(uint64_t logicalPosition,
                                   uint32_t chunkTokens, uint32_t chunkStride,
                                   std::span<const uint32_t> pages) const {
@@ -975,6 +983,8 @@ struct Runtime::Impl {
         recurrentOut[stateBegin + layer] =
             slot.gdn[metadata.activeParity ^ 1].recurrentLayers[layer];
       }
+      destination.auxiliaryIn = slot.gdn[metadata.activeParity].auxiliary;
+      destination.auxiliaryOut = slot.gdn[metadata.activeParity ^ 1].auxiliary;
       destination.captureCount = sequence.captures.size();
       for (uint32_t index = 0; index < sequence.captures.size(); ++index) {
         const DispatchDraftCaptureSpan &capture = sequence.captures[index];
@@ -1026,6 +1036,10 @@ struct Runtime::Impl {
     buffers.hyperReduced = p(PrefillTensor::HyperReduced);
     buffers.hyperInjection = p(PrefillTensor::HyperInjection);
     buffers.hyperMixed = p(PrefillTensor::HyperMixed);
+    buffers.ple = {p(PrefillTensor::InputTokens), p(PrefillTensor::PleShifted),
+                   p(PrefillTensor::PleEmbedding), p(PrefillTensor::PleKeys),
+                   p(PrefillTensor::PleValues), p(PrefillTensor::PleGated),
+                   p(PrefillTensor::PleNormalized)};
     std::vector<kv::Q8LayerStorage> kvLayers(
         geometry.target.kvLayout.attentionLayers);
     for (uint32_t layer = 0; layer < kvLayers.size(); ++layer)
@@ -1256,6 +1270,11 @@ struct Runtime::Impl {
     buffers.hyperReduced = d(DecodeTensor::HyperReduced);
     buffers.hyperInjection = d(DecodeTensor::HyperInjection);
     buffers.hyperMixed = d(DecodeTensor::HyperMixed);
+    buffers.liveRowsPerLane = package.descriptor.draftPlaceholder ? 1u : kDecodeRows;
+    buffers.ple = {d(DecodeTensor::InputTokens), d(DecodeTensor::PleShifted),
+                   d(DecodeTensor::PleEmbedding), d(DecodeTensor::PleKeys),
+                   d(DecodeTensor::PleValues), d(DecodeTensor::PleGated),
+                   d(DecodeTensor::PleNormalized)};
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
       const ModelBatchItem &item = paddedItem(lane);
       q8[lane] = q8Params(item.logicalPosition, kDecodeRows, kTileRows,
@@ -1437,7 +1456,9 @@ struct Runtime::Impl {
          decodeArena->gdnStorage(DecodeTensor::VerifyMixedBase),
          decodeArena->gdnStorage(DecodeTensor::VerifyDecayBase),
          decodeArena->gdnStorage(DecodeTensor::VerifyBetaBase), currentStates,
-         nextStates, decodeArena->packed(DecodeTensor::RetainedCount, width)},
+         nextStates, decodeArena->packed(DecodeTensor::RetainedCount, width),
+         decodeArena->packed(DecodeTensor::InputTokens, width),
+         decodeArena->packed(DecodeTensor::PleNormalized, width)},
         width);
   }
 
@@ -1584,7 +1605,7 @@ struct Runtime::Impl {
 
           const uint32_t remaining = entry.maxNewTokens - entry.generatedTokens;
           laneResult.currentAnchor = *entry.pendingToken;
-          laneResult.maximumRetained = std::min(remaining, kDecodeRows);
+          laneResult.maximumRetained = impl_.retainedRowLimit(remaining);
           laneResult.verify = true;
           entries[lane] = &entry;
 
@@ -2158,7 +2179,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
     // output budget only lowers the token-exact commit count; it never
     // changes the Metal graph shape.
     laneResult.currentAnchor = *entry.pendingToken;
-    laneResult.maximumRetained = std::min(remaining, kDecodeRows);
+    laneResult.maximumRetained = impl_->retainedRowLimit(remaining);
 
     impl_->prepareDecodeLane(entry, item, lane);
     impl_->loadPolicyBuffers(entry, lane, {});
@@ -2326,6 +2347,37 @@ void Runtime::provideMask(uint64_t requestId, std::span<const uint32_t> words) {
     }
   }
   entry.maskWords.assign(words.begin(), words.end());
+}
+
+void Runtime::dumpPrefillLogits(uint32_t rows, const char *path) {
+  Impl &impl = *impl_;
+  const uint32_t vocabulary = impl.geometry.target.vocabularySize;
+  const uint32_t width = impl.geometry.target.residualWidth();
+  auto d = [&](DecodeTensor tensor) {
+    return impl.decodeArena->get(0, tensor);
+  };
+  FILE *file = std::fopen(path, "ab");
+  if (!file)
+    throw std::runtime_error(std::string("cannot open logits file ") + path);
+  for (uint32_t begin = 0; begin < rows; begin += kDecodeRows) {
+    const uint32_t count = std::min(kDecodeRows, rows - begin);
+    CommandGraph graph;
+    ops::DraftAttention::gatherLastRows(
+        graph, impl.prefillU16(PrefillTensor::Hidden0, begin, count, width),
+        d(DecodeTensor::Hidden0), count, width);
+    impl.targetModel.addHead(graph, d(DecodeTensor::Hidden0),
+                             d(DecodeTensor::FinalHidden),
+                             d(DecodeTensor::Logits), count);
+    (void)impl.backend.submitCommand(graph.dispatches());
+    const auto *logits =
+        contents<uint16_t>(d(DecodeTensor::Logits), "dumped logits");
+    if (std::fwrite(logits, sizeof(uint16_t), uint64_t{count} * vocabulary,
+                    file) != uint64_t{count} * vocabulary) {
+      std::fclose(file);
+      throw std::runtime_error("short write to logits file");
+    }
+  }
+  std::fclose(file);
 }
 
 void Runtime::end(uint64_t requestId) {

@@ -59,7 +59,7 @@ template <uint ValueHeads, uint HeadDim, uint ConvDim, uint Simdgroups = 8>
 inline void
 gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
                device const bfloat *norm_weight, device bfloat *hidden,
-               uint tasks, uint groups, uint packed_width,
+               uint tasks, uint groups, uint packed_width, bool sigmoid_gate,
                threadgroup float *scratch, uint group, uint thread_index,
                uint lane, uint simd_group) {
   constexpr uint ZOffset = ConvDim;
@@ -86,7 +86,8 @@ gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
       float gate = float(packed[token * packed_width + ZOffset +
                                 head * HeadDim + thread_index]);
       float sigmoid = 1.0f / (1.0f + fast::exp2(-1.44269504089f * gate));
-      hidden[base + thread_index] = bfloat(float(normalized) * sigmoid);
+      float activation = sigmoid_gate ? sigmoid : gate * sigmoid;
+      hidden[base + thread_index] = bfloat(float(normalized) * activation);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }

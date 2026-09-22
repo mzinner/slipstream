@@ -450,6 +450,9 @@ MOE_ROUTE_SELECT_ENTRY(moe_route_select_q8_n512, 512)
 // expert's last route carry the route ~0u. One threadgroup covers all routes
 // and thread e owns expert e's count, offsets and tile descriptors. The shared
 // expert's tiles follow the routed tiles and hold every row in order.
+// A route with no expert; see moe_group_routes_impl.
+constant constexpr uint kMoeSkippedRoute = 0xFFFFFFFFu;
+
 template <uint Experts>
 __attribute__((always_inline)) inline void moe_group_routes_impl(
     device const uint *selected,
@@ -471,8 +474,11 @@ __attribute__((always_inline)) inline void moe_group_routes_impl(
   atomic_store_explicit(&counts[thread_index], 0u, memory_order_relaxed);
   atomic_store_explicit(&cursors[thread_index], 0u, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  // A route selecting kMoeSkippedRoute has no expert: a row whose output
+  // will be discarded, whose expert work the caller chose not to pay for.
   for (uint route = thread_index; route < routes; route += Experts) {
-    if (route % routes_per_row != params.top_k) {
+    if (route % routes_per_row != params.top_k &&
+        selected[route] != kMoeSkippedRoute) {
       atomic_fetch_add_explicit(&counts[selected[route]], 1u,
                                 memory_order_relaxed);
     }
@@ -504,6 +510,10 @@ __attribute__((always_inline)) inline void moe_group_routes_impl(
     if (route % routes_per_row == params.top_k)
       continue;
     uint expert = selected[route];
+    if (expert == kMoeSkippedRoute) {
+      route_rows[route] = kMoeSkippedRoute;
+      continue;
+    }
     uint slot =
         atomic_fetch_add_explicit(&cursors[expert], 1u, memory_order_relaxed);
     uint row = tile_offsets[expert] * params.tile_rows + slot;
@@ -725,6 +735,8 @@ kernel void moe_combine(
   float value = float(residual[ulong(row) * params.hidden_size + dimension]);
   ulong route = ulong(row) * params.routes_per_row;
   for (uint slot = 0; slot < params.routes_per_row; ++slot) {
+    if (route_rows[route + slot] == kMoeSkippedRoute)
+      continue;
     value += float(routing_weights[route + slot]) *
              float(expert_output[ulong(route_rows[route + slot]) *
                                      params.hidden_size +
@@ -748,6 +760,8 @@ kernel void moe_combine_no_residual(
   float value = 0.0f;
   ulong route = ulong(row) * params.routes_per_row;
   for (uint slot = 0; slot < params.routes_per_row; ++slot) {
+    if (route_rows[route + slot] == kMoeSkippedRoute)
+      continue;
     value += float(routing_weights[route + slot]) *
              float(expert_output[ulong(route_rows[route + slot]) *
                                      params.hidden_size +

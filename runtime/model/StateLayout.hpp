@@ -20,6 +20,11 @@ struct GdnStateLayout final {
   uint32_t recurrentGroups = 0;
   uint32_t recurrentRows = 0;
   uint32_t recurrentColumns = 0;
+  // Extra per-request state a model keeps beside its GDN layers, placed after
+  // them in the same cell so caching, restore and parity swaps carry it
+  // unchanged. qwen4exp keeps its per-layer embedding history here; the other
+  // models keep none.
+  uint64_t auxiliaryBytes = 0;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return layers && convolutionHistory && convolutionChannels &&
@@ -42,8 +47,11 @@ struct GdnStateLayout final {
   [[nodiscard]] constexpr uint64_t recurrentBytes() const noexcept {
     return uint64_t{layers} * recurrentLayerBytes();
   }
-  [[nodiscard]] constexpr uint64_t cellBytes() const noexcept {
+  [[nodiscard]] constexpr uint64_t auxiliaryOffset() const noexcept {
     return convolutionBytes() + recurrentBytes();
+  }
+  [[nodiscard]] constexpr uint64_t cellBytes() const noexcept {
+    return auxiliaryOffset() + align(auxiliaryBytes);
   }
 
   bool operator==(const GdnStateLayout &) const = default;

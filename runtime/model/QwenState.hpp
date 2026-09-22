@@ -19,6 +19,7 @@ struct GdnParityBuffers final {
   metal::MetalBuffer stateBase;
   metal::MetalBuffer convolutionBase;
   metal::MetalBuffer recurrentBase;
+  metal::MetalBuffer auxiliary; // Empty unless the layout reserves some.
   std::vector<metal::MetalBuffer> convolutionLayers;
   std::vector<metal::MetalBuffer> recurrentLayers;
 };
