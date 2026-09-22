@@ -343,12 +343,27 @@ public:
   submitCommandAsync(std::span<const ComputeDispatch> dispatches,
                      CommandCompletion completion = {});
 
+  // A pipeline: the dispatches split into stages at `stageStarts`, one
+  // command buffer each, committed together. Stage k > 0 waits for the
+  // pipeline event to reach base + 2k and raises it to base + 2k + 1 when it
+  // completes (stage 0 raises base + 1). The caller does host work between
+  // stages: waitPipelineEvent(base + 2k - 1), then signalPipelineEvent(base +
+  // 2k). The GPU never waits for a submission, only for that signal.
+  // reservePipelineEvents(stages) returns a fresh base.
+  [[nodiscard]] uint64_t reservePipelineEvents(uint32_t stages);
+  [[nodiscard]] CommandTicket
+  submitPipelineAsync(std::span<const ComputeDispatch> dispatches,
+                      std::span<const size_t> stageStarts, uint64_t base);
+  [[nodiscard]] bool waitPipelineEvent(uint64_t value, uint64_t timeoutMs);
+  void signalPipelineEvent(uint64_t value);
+
   // Development profiling replays a multi-dispatch command synchronously,
   // one dispatch per command buffer. Even submitCommandAsync() then blocks,
   // invokes completion inline and returns an already-completed ticket.
   // Production serving leaves this disabled. Benchmarks read and clear the
   // per-dispatch timings with takeDispatchProfile().
   void setDispatchProfiling(bool enabled) noexcept;
+  [[nodiscard]] bool dispatchProfiling() const noexcept;
   [[nodiscard]] std::vector<DispatchTiming> takeDispatchProfile();
 
   [[nodiscard]] MetalMemoryStats memoryStats() const noexcept;

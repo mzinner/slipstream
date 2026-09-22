@@ -1,6 +1,7 @@
 #include "model/Qwen4ExpTarget.hpp"
 
 #include "metal/abi/HyperConnection.h"
+#include "metal/abi/MoE.h"
 #include "metal/abi/PerLayerEmbedding.h"
 #include "model/WeightStore.hpp"
 #include "ops/DraftAttention.hpp"
@@ -10,6 +11,8 @@
 #include "ops/PagedAttention.hpp"
 
 #include <algorithm>
+#include <deque>
+#include <functional>
 #include <cstdio>
 #include <cstring>
 #include <bit>
@@ -71,15 +74,25 @@ void addPleGather(const Qwen4ExpWeights &weights, metal::MetalBackend &backend,
                   metal::CommandGraph &graph, const QwenTargetPleBuffers &ple,
                   const QwenTargetGeometry &geometry, metal::MetalBuffer state,
                   uint32_t rowBegin, uint32_t rows, bool onCpu,
-                  uint32_t liveRows) {
+                  uint32_t liveRows,
+                  std::vector<std::function<void()>> *deferred = nullptr) {
   if (onCpu) {
-    gatherNgramRowsOnCpu(
-        weights, geometry,
-        static_cast<const uint32_t *>(ple.tokens.contents()) + rowBegin,
-        static_cast<const uint8_t *>(state.contents()),
-        static_cast<uint16_t *>(ple.embedding.contents()) +
-            uint64_t{rowBegin} * geometry.pleEmbeddingSize,
-        rows, rows, liveRows);
+    auto gather = [&weights, &geometry, tokens = ple.tokens, state,
+                   embedding = ple.embedding, rowBegin, rows, liveRows] {
+      gatherNgramRowsOnCpu(
+          weights, geometry,
+          static_cast<const uint32_t *>(tokens.contents()) + rowBegin,
+          static_cast<const uint8_t *>(state.contents()),
+          static_cast<uint16_t *>(embedding.contents()) +
+              uint64_t{rowBegin} * geometry.pleEmbeddingSize,
+          rows, rows, liveRows);
+    };
+    // A pipelined step encodes every layer before its inputs exist; the
+    // gather then runs between stages, once they do.
+    if (deferred)
+      deferred->push_back(std::move(gather));
+    else
+      gather();
     return;
   }
   const Qwen4ExpLayout &layout = weights.layout;
@@ -262,6 +275,56 @@ void readMissedExperts(const Qwen4ExpExpertSource &source, const Miss *misses,
       done += static_cast<uint64_t>(got);
     }
   });
+}
+
+// Top-k of one row of the router's bf16 scores, as moe_route_select picks
+// them: highest first, ties to the lower expert id; weights are the softmax
+// over just the k chosen scores.
+void topExperts(const uint16_t *scores, uint32_t experts, uint32_t k,
+                uint32_t *ids, float *weights) {
+  auto widen = [](uint16_t bits) { return std::bit_cast<float>(uint32_t{bits} << 16); };
+  float chosen[16];
+  for (uint32_t rank = 0; rank < k; ++rank) {
+    float best = -INFINITY;
+    uint32_t bestId = 0;
+    for (uint32_t e = 0; e < experts; ++e) {
+      bool taken = false;
+      for (uint32_t r = 0; r < rank; ++r) taken |= ids[r] == e;
+      const float v = widen(scores[e]);
+      if (!taken && v > best) { best = v; bestId = e; }
+    }
+    ids[rank] = bestId;
+    chosen[rank] = best;
+  }
+  if (!weights) return;
+  float total = 0.0f;
+  for (uint32_t r = 0; r < k; ++r) total += std::exp(chosen[r] - chosen[0]);
+  for (uint32_t r = 0; r < k; ++r) weights[r] = std::exp(chosen[r] - chosen[0]) / total;
+}
+
+// sigmoid of the shared expert's scalar gate: a Q8 projection padded to 256
+// outputs, of which output 0 is used (see moe_route_select_impl).
+float sharedExpertGate(const ops::Q8Projection &gate, const uint16_t *input,
+                       uint32_t size) {
+  constexpr uint32_t kStorageN = 256;
+  const auto *w = static_cast<const uint8_t *>(gate.weights.contents());
+  const auto *scales = static_cast<const uint16_t *>(gate.scales.contents());
+  const auto *biases = static_cast<const uint16_t *>(gate.biases.contents());
+  auto widen = [](uint16_t bits) { return std::bit_cast<float>(uint32_t{bits} << 16); };
+  float total = 0.0f;
+  for (uint32_t d = 0; d < size; ++d) {
+    const uint32_t group = d / 64;
+    const float value = float(w[uint64_t{group} * kStorageN * 64 + d % 64]) *
+                            widen(scales[uint64_t{group} * kStorageN]) +
+                        widen(biases[uint64_t{group} * kStorageN]);
+    total += widen(input[d]) * value;
+  }
+  return 1.0f / (1.0f + std::exp(-total));
+}
+
+uint16_t toBf16(float value) {
+  const uint32_t bits = std::bit_cast<uint32_t>(value);
+  return static_cast<uint16_t>((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16);
 }
 
 // One sequence's gate, convolution and residual update. `normalized` holds
@@ -975,6 +1038,8 @@ void Qwen4ExpTarget::addVerify(
   uint32_t gdnIndex = 0;
   uint32_t attentionIndex = 0;
 
+  // Set while a pipelined step is being encoded; see the staged loop.
+  std::vector<std::function<void()>> *pipelineDeferred = nullptr;
   auto encodePerLayerEmbedding = [&](metal::CommandGraph &g,
                                      uint32_t layerIndex, bool onCpu) {
     constexpr uint32_t laneRows = ExecutionLimits::targetVerifyRows;
@@ -985,7 +1050,8 @@ void Qwen4ExpTarget::addVerify(
       addPleGather(weights, backend, g, buffers.ple, geometry,
                    auxiliaryView(backend, geometry,
                                  buffers.currentGdnStates[lane]),
-                   lane * laneRows, laneRows, onCpu, buffers.liveRowsPerLane);
+                   lane * laneRows, laneRows, onCpu, buffers.liveRowsPerLane,
+                   pipelineDeferred);
     operators.linear().addDecodeBatch(
         g, buffers.ple.embedding, weights.perLayerEmbedding.keyProjection,
         buffers.ple.keys,
@@ -1109,7 +1175,33 @@ void Qwen4ExpTarget::addVerify(
         layer.ffn, moePlan);
   };
 
-  auto encodeMoEExecute = [&](metal::CommandGraph &g, const ops::MoeWeights &weightsToUse) {
+  // Lookahead: layer `target`'s router applied to the input the previous
+  // layer's router just read. Only a guess, used to start reads early.
+  auto encodePredictRoute = [&](metal::CommandGraph &g, uint32_t target) {
+    if (!weights.predictSelected) {
+      weights.predictSelected = backend.allocateBuffer(
+          buffers.selectedExperts.sizeBytes(), metal::BufferStorage::Shared,
+          "qwen4exp-predict-selected");
+      weights.predictWeights = backend.allocateBuffer(
+          buffers.routingWeights.sizeBytes(), metal::BufferStorage::Shared,
+          "qwen4exp-predict-weights");
+      weights.predictScratch = backend.allocateBuffer(
+          buffers.groupedInput.sizeBytes(), metal::BufferStorage::Shared,
+          "qwen4exp-predict-scratch");
+    }
+    // Scores only; the host picks the likely experts from them.
+    ops::MoE::addRouteScores(
+        g,
+        {buffers.hyperMixed, buffers.hyperMixed, buffers.gdnOutput,
+         weights.predictSelected, weights.predictWeights,
+         buffers.tileDescriptors, buffers.tileCount, buffers.groupedRoutes,
+         buffers.routeRows, weights.predictScratch, buffers.expertIntermediate,
+         buffers.expertOutput},
+        weights.layers[target].ffn, moePlan);
+  };
+
+  auto encodeMoEExecute = [&](metal::CommandGraph &g, const ops::MoeWeights &weightsToUse,
+                              bool hostGrouped = false) {
     ops::MoE::addExecute(
         g,
         {buffers.hyperMixed, buffers.hyperMixed, buffers.gdnOutput,
@@ -1117,7 +1209,7 @@ void Qwen4ExpTarget::addVerify(
          buffers.tileDescriptors, buffers.tileCount, buffers.groupedRoutes,
          buffers.routeRows, buffers.groupedInput, buffers.expertIntermediate,
          buffers.expertOutput},
-        weightsToUse, moePlan, /*addResidual=*/false);
+        weightsToUse, moePlan, /*addResidual=*/false, hostGrouped);
   };
 
   auto encodeMlpUpdate = [&](metal::CommandGraph &g, uint32_t layerIndex) {
@@ -1186,6 +1278,11 @@ void Qwen4ExpTarget::addVerify(
 
   auto stageActiveExperts = [&](uint32_t layerIndex) -> bool {
     auto &cache = weights.layers[layerIndex].expertCache;
+    // Predicted experts may still be loading; their slots are already claimed.
+    if (cache.pending) {
+      dispatch_group_wait(cache.inflight, DISPATCH_TIME_FOREVER);
+      cache.pending = false;
+    }
     auto *selPtr = static_cast<uint32_t *>(buffers.selectedExperts.contents());
     const uint32_t routesPerRow = moePlan.shape().routesPerToken();
     const uint32_t expertsPerToken = weights.layout.expertsPerToken;
@@ -1299,6 +1396,174 @@ void Qwen4ExpTarget::addVerify(
     return true;
   };
 
+  // Start background reads for the experts lookahead predicts layer `layer`
+  // will want. Claims least-recently-used slots of that layer only; nothing
+  // on the GPU reads that layer's cache until its own stage.
+  auto prefetchPredicted = [&](uint32_t layer) {
+    if (!weights.predictSelected || layer >= geometry.layers)
+      return;
+    auto &cache = weights.layers[layer].expertCache;
+    const auto *predictedScores =
+        static_cast<const uint16_t *>(weights.predictScratch.contents());
+    const uint32_t perToken = weights.layout.expertsPerToken;
+    const uint32_t width = moePlan.shape().routerWidth();
+    struct Miss { uint32_t expert; uint32_t slot; };
+    std::vector<Miss> misses;
+    ++cache.clock;
+    for (uint32_t r = 0; r < rows; ++r) {
+      if (r % ExecutionLimits::targetVerifyRows >= buffers.liveRowsPerLane)
+        continue;
+      uint32_t ids[16];
+      topExperts(predictedScores + uint64_t{r} * width, weights.layout.experts,
+                 perToken, ids, nullptr);
+      for (uint32_t k = 0; k < perToken; ++k) {
+        const uint32_t expert = ids[k];
+        if (expert >= weights.layout.experts)
+          continue;
+        const int16_t existing = cache.expertToSlot[expert];
+        if (existing >= 0) {
+          cache.lruTime[existing] = cache.clock;
+          continue;
+        }
+        uint32_t slot = 0;
+        if (cache.numCached < cache.capacity) {
+          slot = cache.numCached++;
+        } else {
+          uint32_t oldest = UINT32_MAX;
+          for (uint32_t s = 0; s < cache.capacity; ++s)
+            if (cache.lruTime[s] != cache.clock && cache.lruTime[s] < oldest) {
+              oldest = cache.lruTime[s];
+              slot = s;
+            }
+          if (oldest == UINT32_MAX)
+            break;
+          if (cache.slotToExpert[slot] >= 0)
+            cache.expertToSlot[cache.slotToExpert[slot]] = -1;
+        }
+        cache.slotToExpert[slot] = static_cast<int16_t>(expert);
+        cache.expertToSlot[expert] = static_cast<int16_t>(slot);
+        cache.lruTime[slot] = cache.clock;
+        misses.push_back({expert, slot});
+      }
+    }
+    if (misses.empty())
+      return;
+    weights.predictIssued += misses.size();
+    if (!cache.inflight)
+      cache.inflight = dispatch_group_create();
+    const auto &source = weights.layers[layer].expertSource;
+    const uint64_t stride = weights.layers[layer].ffn.expertGate.expertStrideBytes;
+    char *gate = static_cast<char *>(cache.cacheGate.contents());
+    char *up = static_cast<char *>(cache.cacheUp.contents());
+    char *down = static_cast<char *>(cache.cacheDown.contents());
+    auto owned = std::make_shared<std::vector<Miss>>(std::move(misses));
+    dispatch_group_async(cache.inflight,
+                         dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+      readMissedExperts(source, owned->data(), owned->size(), stride, gate, up, down);
+    });
+    cache.pending = true;
+  };
+
+  // Host routing for a pipelined step. The GPU stage ends at the router's
+  // scores; the host, already paused there to stage experts, selects and
+  // groups. Two single-threadgroup kernels that each cost ~0.1-0.2 ms of
+  // latency per layer, a third of decode GPU time, become microseconds here.
+  auto encodeRouteScores = [&](metal::CommandGraph &g, uint32_t layerIndex,
+                               metal::MetalBuffer scores) {
+    ops::MoE::addRouteScores(
+        g,
+        {buffers.hyperMixed, buffers.hyperMixed, buffers.gdnOutput,
+         buffers.selectedExperts, buffers.routingWeights,
+         buffers.tileDescriptors, buffers.tileCount, buffers.groupedRoutes,
+         buffers.routeRows, std::move(scores), buffers.expertIntermediate,
+         buffers.expertOutput},
+        weights.layers[layerIndex].ffn, moePlan);
+  };
+  const uint32_t hostRoutesPerRow = moePlan.shape().routesPerToken();
+  auto isLive = [&](uint32_t row) {
+    return row % ExecutionLimits::targetVerifyRows < buffers.liveRowsPerLane;
+  };
+  auto hostSelect = [&](uint32_t layerIndex) {
+    const auto *scores = static_cast<const uint16_t *>(buffers.groupedInput.contents());
+    const auto *input = static_cast<const uint16_t *>(buffers.hyperMixed.contents());
+    auto *selected = static_cast<uint32_t *>(buffers.selectedExperts.contents());
+    auto *routing = static_cast<uint16_t *>(buffers.routingWeights.contents());
+    const uint32_t k = weights.layout.expertsPerToken;
+    const uint32_t width = moePlan.shape().routerWidth();
+    for (uint32_t r = 0; r < rows; ++r) {
+      if (!isLive(r)) continue;
+      uint32_t ids[16];
+      float w[16];
+      topExperts(scores + uint64_t{r} * width, weights.layout.experts, k, ids, w);
+      for (uint32_t j = 0; j < k; ++j) {
+        selected[r * hostRoutesPerRow + j] = ids[j];
+        routing[r * hostRoutesPerRow + j] = toBf16(w[j]);
+      }
+      selected[r * hostRoutesPerRow + k] = weights.layout.experts;
+      routing[r * hostRoutesPerRow + k] = toBf16(sharedExpertGate(
+          weights.layers[layerIndex].ffn.sharedExpertGate,
+          input + uint64_t{r} * geometry.hiddenSize, geometry.hiddenSize));
+    }
+  };
+  // As moe_group_routes lays it out: routed tiles in ascending slot order,
+  // tile_rows each, padding marked ~0; then the shared expert's tiles. Rows
+  // that cannot be kept get no routes at all.
+  auto hostGroup = [&]() {
+    const auto *selected = static_cast<const uint32_t *>(buffers.selectedExperts.contents());
+    auto *tiles = static_cast<MoeTileDescriptor *>(buffers.tileDescriptors.contents());
+    auto *tileCount = static_cast<uint32_t *>(buffers.tileCount.contents());
+    auto *grouped = static_cast<uint32_t *>(buffers.groupedRoutes.contents());
+    auto *routeRows = static_cast<uint32_t *>(buffers.routeRows.contents());
+    const uint32_t k = weights.layout.expertsPerToken;
+    const uint32_t tileRows = moePlan.tileRows();
+    const uint32_t experts = moePlan.shape().experts;
+    std::vector<std::vector<uint32_t>> byExpert(experts);
+    for (uint32_t r = 0; r < rows; ++r)
+      for (uint32_t j = 0; j <= k; ++j) {
+        const uint32_t route = r * hostRoutesPerRow + j;
+        routeRows[route] = 0xFFFFFFFFu;
+        if (!isLive(r) || j == k) continue;
+        const uint32_t e = selected[route];
+        if (e < experts) byExpert[e].push_back(route);
+      }
+    uint32_t tile = 0;
+    for (uint32_t e = 0; e < experts; ++e) {
+      const auto &routes = byExpert[e];
+      for (uint32_t first = 0; first < routes.size(); first += tileRows) {
+        const uint32_t count = std::min<uint32_t>(tileRows, routes.size() - first);
+        tiles[tile] = MoeTileDescriptor{e, count};
+        for (uint32_t i = 0; i < tileRows; ++i) {
+          const uint32_t row = tile * tileRows + i;
+          if (i < count) {
+            grouped[row] = routes[first + i];
+            routeRows[routes[first + i]] = row;
+          } else {
+            grouped[row] = 0xFFFFFFFFu;
+          }
+        }
+        ++tile;
+      }
+    }
+    std::vector<uint32_t> shared;
+    for (uint32_t r = 0; r < rows; ++r)
+      if (isLive(r)) shared.push_back(r * hostRoutesPerRow + k);
+    for (uint32_t first = 0; first < shared.size(); first += tileRows) {
+      const uint32_t count = std::min<uint32_t>(tileRows, shared.size() - first);
+      tiles[tile] = MoeTileDescriptor{experts, count};
+      for (uint32_t i = 0; i < tileRows; ++i) {
+        const uint32_t row = tile * tileRows + i;
+        if (i < count) {
+          grouped[row] = shared[first + i];
+          routeRows[shared[first + i]] = row;
+        } else {
+          grouped[row] = 0xFFFFFFFFu;
+        }
+      }
+      ++tile;
+    }
+    *tileCount = tile;
+  };
+
   auto makeCacheWeights = [&](uint32_t layerIndex) -> ops::MoeWeights {
     const auto &layer = weights.layers[layerIndex];
     const auto &cache = layer.expertCache;
@@ -1357,37 +1622,119 @@ void Qwen4ExpTarget::addVerify(
   double totalGpuMs = 0.0;
   double totalPureGpuMs = 0.0;
 
-  // Loop through streaming layers R .. geometry.layers - 2
-  for (uint32_t L = R; L < geometry.layers - 1; ++L) {
+  const bool pipelined = !backend.dispatchProfiling() &&
+                         !std::getenv("SPLASH_NO_PIPELINE") &&
+                         weights.layers[R].expertCache.capacity >=
+                             rows * weights.layout.expertsPerToken;
+  if (pipelined) {
+    const bool lookahead = !std::getenv("SPLASH_NO_LOOKAHEAD");
+    // Every layer is encoded and committed up front. Stage k runs layer
+    // R+k-1's experts and layer R+k up to its router, then raises the
+    // pipeline event; the host stages layer R+k's experts (and any deferred
+    // work) and signals the GPU on. Nothing waits for a submission; the GPU
+    // waits only for experts that were actually missing.
+    std::vector<metal::ComputeDispatch> all;
+    std::vector<size_t> starts;
+    std::vector<std::vector<std::function<void()>>> deferredPerStage;
+    // Dispatches point into their graph's parameter storage, so every stage
+    // graph must outlive the submission.
+    std::deque<metal::CommandGraph> stageGraphs;
+    auto append = [&](metal::CommandGraph &g) {
+      starts.push_back(all.size());
+      for (auto &d : g.dispatches()) all.push_back(d);
+    };
+    // Stage 0 has already been submitted and completed above (resident
+    // graph), so stages here start at layer R's experts.
+    for (uint32_t L = R; L < geometry.layers - 1; ++L) {
+      deferredPerStage.emplace_back();
+      pipelineDeferred = &deferredPerStage.back();
+      metal::CommandGraph &stepGraph = stageGraphs.emplace_back();
+      encodeMoEExecute(stepGraph, makeCacheWeights(L), /*hostGrouped=*/true);
+      encodeMlpUpdate(stepGraph, L);
+      encodeCapture(stepGraph, L);
+      encodeAttentionHC(stepGraph, L + 1, /*priorWorkComplete=*/true);
+      metal::MetalBuffer mixerOutNext = encodeMixer(stepGraph, L + 1, gdnIndex, attentionIndex);
+      encodeMixerUpdate(stepGraph, L + 1, mixerOutNext);
+      encodeMlpHC(stepGraph, L + 1);
+      encodeRouteScores(stepGraph, L + 1, buffers.groupedInput);
+      if (lookahead && L + 2 < geometry.layers)
+        encodePredictRoute(stepGraph, L + 2);
+      append(stepGraph);
+      pipelineDeferred = nullptr;
+    }
+    // The first stage's host work (layer R's experts) happens before commit:
+    // its router result is already in memory. Shift so stage 0 needs none.
     auto ts0 = std::chrono::steady_clock::now();
-    bool staged = stageActiveExperts(L);
-    auto ts1 = std::chrono::steady_clock::now();
-    totalStageMs += std::chrono::duration<double, std::milli>(ts1 - ts0).count();
-
-    ops::MoeWeights cacheW = staged ? makeCacheWeights(L) : weights.layers[L].ffn;
-
-    metal::CommandGraph stepGraph;
-    encodeMoEExecute(stepGraph, cacheW);
-    encodeMlpUpdate(stepGraph, L);
-    encodeCapture(stepGraph, L);
-
-    // Layer L + 1 base up to router
-    encodeAttentionHC(stepGraph, L + 1, /*priorWorkComplete=*/true);
-    metal::MetalBuffer mixerOutNext = encodeMixer(stepGraph, L + 1, gdnIndex, attentionIndex);
-    encodeMixerUpdate(stepGraph, L + 1, mixerOutNext);
-    encodeMlpHC(stepGraph, L + 1);
-    encodeMoERoute(stepGraph, L + 1);
-
+    if (!stageActiveExperts(R))
+      throw std::logic_error("pipelined decode found more experts than the cache holds");
+    hostGroup();
+    for (auto &work : deferredPerStage[0]) work();
+    totalStageMs += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - ts0).count();
+    const uint32_t stages = static_cast<uint32_t>(starts.size());
+    const uint64_t base = backend.reservePipelineEvents(stages);
     auto tg0 = std::chrono::steady_clock::now();
-    metal::CommandTiming timing = backend.submitCommandAsync(stepGraph.dispatches()).wait();
-    auto tg1 = std::chrono::steady_clock::now();
-    totalGpuMs += std::chrono::duration<double, std::milli>(tg1 - tg0).count();
+    metal::CommandTicket ticket = backend.submitPipelineAsync(all, starts, base);
+    for (uint32_t k = 1; k < stages; ++k) {
+      if (!backend.waitPipelineEvent(base + 2 * k - 1, 60000))
+        throw std::runtime_error("pipelined decode stage timed out");
+      auto ts = std::chrono::steady_clock::now();
+      const uint32_t layer = R + k;
+      hostSelect(layer);
+      if (!stageActiveExperts(layer))
+        throw std::logic_error("pipelined decode found more experts than the cache holds");
+      hostGroup();
+      // Stage k-1 also predicted layer + 1; start those reads now so they
+      // land while stage k runs.
+      if (lookahead)
+        prefetchPredicted(layer + 1);
+      for (auto &work : deferredPerStage[k]) work();
+      totalStageMs += std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - ts).count();
+      backend.signalPipelineEvent(base + 2 * k);
+    }
+    metal::CommandTiming timing = ticket.wait();
+    totalGpuMs += std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - tg0).count();
     totalPureGpuMs += timing.gpuSeconds * 1000.0;
+  } else {
+    // Loop through streaming layers R .. geometry.layers - 2
+    for (uint32_t L = R; L < geometry.layers - 1; ++L) {
+      auto ts0 = std::chrono::steady_clock::now();
+      bool staged = stageActiveExperts(L);
+      auto ts1 = std::chrono::steady_clock::now();
+      totalStageMs += std::chrono::duration<double, std::milli>(ts1 - ts0).count();
+
+      ops::MoeWeights cacheW = staged ? makeCacheWeights(L) : weights.layers[L].ffn;
+
+      metal::CommandGraph stepGraph;
+      encodeMoEExecute(stepGraph, cacheW);
+      encodeMlpUpdate(stepGraph, L);
+      encodeCapture(stepGraph, L);
+
+      // Layer L + 1 base up to router
+      encodeAttentionHC(stepGraph, L + 1, /*priorWorkComplete=*/true);
+      metal::MetalBuffer mixerOutNext = encodeMixer(stepGraph, L + 1, gdnIndex, attentionIndex);
+      encodeMixerUpdate(stepGraph, L + 1, mixerOutNext);
+      encodeMlpHC(stepGraph, L + 1);
+      encodeMoERoute(stepGraph, L + 1);
+
+      auto tg0 = std::chrono::steady_clock::now();
+      metal::CommandTiming timing = backend.submitCommandAsync(stepGraph.dispatches()).wait();
+      auto tg1 = std::chrono::steady_clock::now();
+      totalGpuMs += std::chrono::duration<double, std::milli>(tg1 - tg0).count();
+      totalPureGpuMs += timing.gpuSeconds * 1000.0;
+    }
   }
 
   const uint32_t lastL = geometry.layers - 1;
   auto ts0 = std::chrono::steady_clock::now();
+  // The pipeline's last stage stopped at the last layer's router scores.
+  if (pipelined)
+    hostSelect(lastL);
   bool stagedLast = stageActiveExperts(lastL);
+  if (pipelined)
+    hostGroup();
   auto ts1 = std::chrono::steady_clock::now();
   totalStageMs += std::chrono::duration<double, std::milli>(ts1 - ts0).count();
 
@@ -1399,7 +1746,7 @@ void Qwen4ExpTarget::addVerify(
   }
 
   // Encode final layer's MoE, MLP update, capture, and head into the caller's graph
-  encodeMoEExecute(graph, cacheWLast);
+  encodeMoEExecute(graph, cacheWLast, /*hostGrouped=*/pipelined);
   encodeMlpUpdate(graph, lastL);
   encodeCapture(graph, lastL);
   encodeHead(graph);

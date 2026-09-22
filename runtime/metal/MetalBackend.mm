@@ -372,6 +372,12 @@ struct MetalBackend::Impl {
     __strong id<MTLCommandQueue> queue = nil;
     __strong id<MTL4CommandQueue> sparseQueue = nil;
     __strong id<MTLSharedEvent> sparseEvent = nil;
+    // Gates the stages of submitPipelineAsync; values only grow.
+    __strong id<MTLSharedEvent> pipelineEvent = nil;
+    uint64_t pipelineValue = 0;
+    // Set only for the duration of a pipelined submission.
+    const std::vector<size_t> *pipelineStarts = nullptr;
+    uint64_t pipelineBase = 0;
     __strong id<MTLLibrary> library = nil;
     __strong NSMutableDictionary<NSString *, id<MTLComputePipelineState>>
         *pipelines = nil;
@@ -1208,8 +1214,56 @@ void MetalBackend::setDispatchProfiling(bool enabled) noexcept {
     impl_->dispatchProfiling = enabled;
 }
 
+bool MetalBackend::dispatchProfiling() const noexcept {
+    return impl_->dispatchProfiling;
+}
+
 std::vector<DispatchTiming> MetalBackend::takeDispatchProfile() {
     return std::exchange(impl_->dispatchProfile, {});
+}
+
+uint64_t MetalBackend::reservePipelineEvents(uint32_t stages) {
+    std::lock_guard commandLock(impl_->commandMutex);
+    if (!impl_->pipelineEvent)
+        impl_->pipelineEvent = [impl_->device newSharedEvent];
+    const uint64_t base = impl_->pipelineValue;
+    impl_->pipelineValue += 2ull * stages + 2;
+    return base;
+}
+
+bool MetalBackend::waitPipelineEvent(uint64_t value, uint64_t timeoutMs) {
+    // Poll first: a pipeline hands off once per layer, and a blocking wait's
+    // wake-up latency, paid 47 times a token, cost ~9 ms. Spinning costs one
+    // core for the few hundred microseconds a stage takes.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (impl_->pipelineEvent.signaledValue >= value) return true;
+    }
+    return [impl_->pipelineEvent waitUntilSignaledValue:value timeoutMS:timeoutMs];
+}
+
+void MetalBackend::signalPipelineEvent(uint64_t value) {
+    impl_->pipelineEvent.signaledValue = value;
+}
+
+CommandTicket MetalBackend::submitPipelineAsync(
+    std::span<const ComputeDispatch> dispatches,
+    std::span<const size_t> stageStarts, uint64_t base) {
+    if (stageStarts.empty() || stageStarts.front() != 0 ||
+        !std::is_sorted(stageStarts.begin(), stageStarts.end()) ||
+        stageStarts.back() >= dispatches.size() || !impl_->pipelineEvent)
+        throw MetalBackendError("invalid pipeline stages");
+    const std::vector<size_t> starts(stageStarts.begin(), stageStarts.end());
+    impl_->pipelineStarts = &starts;
+    impl_->pipelineBase = base;
+    try {
+        CommandTicket ticket = submitCommandAsync(dispatches);
+        impl_->pipelineStarts = nullptr;
+        return ticket;
+    } catch (...) {
+        impl_->pipelineStarts = nullptr;
+        throw;
+    }
 }
 
 CommandTicket MetalBackend::submitCommandAsync(
@@ -1351,7 +1405,13 @@ CommandTicket MetalBackend::submitCommandAsync(
         }
     }
 
-    if (roughTotalBytes <= maxCommandWorkingSetBytes) {
+    if (const std::vector<size_t> *starts = impl_->pipelineStarts) {
+        for (size_t s = 0; s < starts->size(); ++s) {
+            const size_t begin = (*starts)[s];
+            const size_t end = s + 1 < starts->size() ? (*starts)[s + 1] : prepared.size();
+            chunks.emplace_back(prepared.begin() + begin, prepared.begin() + end);
+        }
+    } else if (roughTotalBytes <= maxCommandWorkingSetBytes) {
         chunks.push_back(std::move(prepared));
     } else {
         std::unordered_set<const MetalAllocation *> currentAllocations;
@@ -1406,14 +1466,37 @@ CommandTicket MetalBackend::submitCommandAsync(
             // Keep the queue dependency explicit; the CPU resolves it before commit.
             [command encodeWaitForEvent:impl_->sparseEvent value:sparseEventValue];
         }
+        const bool pipelined = impl_->pipelineStarts != nullptr;
+        if (pipelined && c > 0)
+            [command encodeWaitForEvent:impl_->pipelineEvent
+                                  value:impl_->pipelineBase + 2 * c];
         @autoreleasepool {
             id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
             if (!encoder) {
                 failBeforeCommit("unable to create Metal compute encoder");
             }
             try {
+                // SPLASH_SKIP_KERNELS=a,b (measurement only): leave out every
+                // dispatch whose pipeline name contains one of the parts, to
+                // measure what a kernel family costs. Results are garbage.
+                static const std::vector<std::string> skipped = [] {
+                    std::vector<std::string> parts;
+                    if (const char *value = getenv("SPLASH_SKIP_KERNELS")) {
+                        std::string all(value), part;
+                        for (char ch : all + ",") {
+                            if (ch == ',') { if (!part.empty()) parts.push_back(part); part.clear(); }
+                            else part += ch;
+                        }
+                    }
+                    return parts;
+                }();
                 for (const PreparedDispatch &item : chunks[c]) {
                     const ComputeDispatch &dispatch = *item.source;
+                    if (!skipped.empty() &&
+                        std::any_of(skipped.begin(), skipped.end(), [&](const std::string &part) {
+                            return dispatch.pipelineName.find(part) != std::string::npos;
+                        }))
+                        continue;
                     [encoder setComputePipelineState:item.pipeline];
                     for (const BufferBinding &binding : dispatch.buffers) {
                         const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
@@ -1437,6 +1520,9 @@ CommandTicket MetalBackend::submitCommandAsync(
                 throw;
             }
         }
+        if (pipelined)
+            [command encodeSignalEvent:impl_->pipelineEvent
+                                 value:impl_->pipelineBase + 2 * c + 1];
         commands.push_back(command);
     }
 

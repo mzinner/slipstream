@@ -181,9 +181,16 @@ struct MoE final {
                   bool addResidual = true);
   static void addRoute(metal::CommandGraph &graph, const MoeBuffers &buffers,
                        const MoeWeights &weights, const MoePlan &plan);
+  // Only the router's scores, parked as bf16 [rows][routerWidth] in
+  // buffers.groupedInput, for a caller that selects and groups on the host.
+  static void addRouteScores(metal::CommandGraph &graph,
+                             const MoeBuffers &buffers,
+                             const MoeWeights &weights, const MoePlan &plan);
+  // hostGrouped: tile descriptors, tile count, grouped routes and route rows
+  // were written by the host, so the grouping kernel is skipped.
   static void addExecute(metal::CommandGraph &graph, const MoeBuffers &buffers,
                          const MoeWeights &weights, const MoePlan &plan,
-                         bool addResidual = true);
+                         bool addResidual = true, bool hostGrouped = false);
 };
 
 } // namespace splash::ops

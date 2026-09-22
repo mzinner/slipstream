@@ -1,5 +1,7 @@
 #pragma once
 
+#include <dispatch/dispatch.h>
+
 #include "QwenTarget.hpp"
 #include "StateLayout.hpp"
 #include "WeightStore.hpp"
@@ -246,6 +248,10 @@ struct Qwen4ExpLayerExpertCache final {
   std::vector<int16_t> expertToSlot;
   std::vector<int16_t> slotToExpert;
   std::vector<uint32_t> lruTime;
+  // Background reads of predicted experts (lookahead). Staging the layer
+  // waits for them first; the slots are already claimed in expertToSlot.
+  dispatch_group_t inflight = nullptr;
+  bool pending = false;
 };
 
 // Section order per layer file, which the packer must follow exactly:
@@ -293,6 +299,13 @@ struct Qwen4ExpWeights final {
   metal::MetalBuffer streamingCacheDown;
   uint32_t streamingCacheCapacity = 0;
   mutable std::vector<std::vector<uint32_t>> lastSelectedExperts;
+  // Lookahead routing: the router of layer L+2 applied to layer L+1's input,
+  // a guess at which experts L+2 will want. Sized on first use.
+  mutable metal::MetalBuffer predictSelected;
+  mutable metal::MetalBuffer predictWeights;
+  mutable metal::MetalBuffer predictScratch;
+  mutable uint64_t predictIssued = 0;
+  mutable uint64_t predictUseful = 0;
 
   void prefetchStreamingExperts() const noexcept;
   void evictStreamingExperts() const noexcept;

@@ -115,7 +115,7 @@ void validateScratch(const MoeBuffers &buffers, const MoePlan &plan, bool addRes
 }
 } // namespace
 
-void MoE::addRoute(metal::CommandGraph &graph, const MoeBuffers &buffers,
+void MoE::addRouteScores(metal::CommandGraph &graph, const MoeBuffers &buffers,
                    const MoeWeights &weights, const MoePlan &plan) {
   const MoeShape shape = plan.shape();
   const uint32_t rows = plan.rows();
@@ -136,6 +136,15 @@ void MoE::addRoute(metal::CommandGraph &graph, const MoeBuffers &buffers,
             routeParams,
             {(rows + route.rows - 1) / route.rows,
              shape.routerWidth() / route.experts, 1});
+}
+
+void MoE::addRoute(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                   const MoeWeights &weights, const MoePlan &plan) {
+  addRouteScores(graph, buffers, weights, plan);
+  const MoeShape shape = plan.shape();
+  const uint32_t rows = plan.rows();
+  const MoeRouteParams routeParams{rows, shape.hiddenSize, shape.experts,
+                                   shape.expertsPerToken};
   graph.add(shape.routerWidth() == 512 ? "moe_route_select_q8_n512"
                                        : "moe_route_select_q8",
             {buffers.groupedInput, buffers.input,
@@ -148,7 +157,7 @@ void MoE::addRoute(metal::CommandGraph &graph, const MoeBuffers &buffers,
 
 void MoE::addExecute(metal::CommandGraph &graph, const MoeBuffers &buffers,
                      const MoeWeights &weights, const MoePlan &plan,
-                     bool addResidual) {
+                     bool addResidual, bool hostGrouped) {
   validateScratch(buffers, plan, addResidual);
   const MoeShape shape = plan.shape();
   const uint32_t rows = plan.rows();
@@ -158,12 +167,13 @@ void MoE::addExecute(metal::CommandGraph &graph, const MoeBuffers &buffers,
   const bool m8 = plan.config().expertTile == MoeExpertTile::M8;
   const bool wide = shape.storageN == 256;
   const uint32_t groupThreads = shape.experts == 512 ? 512 : 256;
-  graph.add(shape.experts == 512 ? "moe_group_routes_512" : "moe_group_routes",
-            {buffers.selectedExperts, buffers.tileDescriptors,
-             buffers.tileCount, buffers.groupedRoutes, buffers.routeRows},
-            MoeGroupParams{rows, shape.expertsPerToken, tileRows,
-                           shape.experts},
-            {1, 1, 1}, {groupThreads, 1, 1});
+  if (!hostGrouped)
+    graph.add(shape.experts == 512 ? "moe_group_routes_512" : "moe_group_routes",
+              {buffers.selectedExperts, buffers.tileDescriptors,
+               buffers.tileCount, buffers.groupedRoutes, buffers.routeRows},
+              MoeGroupParams{rows, shape.expertsPerToken, tileRows,
+                             shape.experts},
+              {1, 1, 1}, {groupThreads, 1, 1});
   graph.add("moe_gather_rows",
             {buffers.input, buffers.groupedRoutes, buffers.tileCount,
              buffers.groupedInput},
