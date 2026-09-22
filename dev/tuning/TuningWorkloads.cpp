@@ -110,9 +110,13 @@ TuningWorkloads collectTuningWorkloads(
     if (target.layers.empty())
       throw std::invalid_argument("operator probes require target layers");
     for (const auto &layer : target.layers) {
+      // 8-bit projections (qwen4exp's) leave the 4-bit ones empty; only
+      // 4-bit kernels are tuned.
       std::visit([&](const auto &mixer) {
-        bothPhases(mixer.inputProjection);
-        bothPhases(mixer.outputProjection, LinearEpilogue::Residual);
+        if (mixer.inputProjection.outputSize)
+          bothPhases(mixer.inputProjection);
+        if (mixer.outputProjection.outputSize)
+          bothPhases(mixer.outputProjection, LinearEpilogue::Residual);
       }, layer.mixer);
       if constexpr (requires { layer.gateProjection; }) {
         projection(layer.gateProjection, LinearPhase::Prefill,
@@ -134,7 +138,9 @@ TuningWorkloads collectTuningWorkloads(
         }
       }
     }
-    projection(target.logitsProjection, LinearPhase::Decode,
+    if constexpr (std::is_same_v<std::remove_cvref_t<decltype(target.logitsProjection)>,
+                                 ops::Q4Projection>)
+      projection(target.logitsProjection, LinearPhase::Decode,
                  LinearEpilogue::None);
   }, package.target);
 
