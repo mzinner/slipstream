@@ -163,7 +163,7 @@ def quantized_tile(values, storage_n=STORAGE_N, group=GROUP, pad_to=None):
 # are 8-bit. At 4-bit they cost the most quality of anything but the experts
 # (reference_logits.py --quant: same top pick 81% -> 89% on the code prompt).
 LAYER_MAGIC = b"MDFN0011"
-HEAD_MAGIC = b"MDFN0012"
+HEAD_MAGIC = b"MDFN0014"  # 0014 adds the 4-bit draft head
 EMBEDDING_MAGIC = b"MDFN0013"
 OLD_LAYER_MAGIC = b"MDFN0001"
 NGRAM_MAGIC = b"MDFN0004"
@@ -279,6 +279,7 @@ def head_sections() -> list[tuple[int, str]]:
         hyper_sections(False)
         + [(LAYOUT["hidden"] * BF16, "final-norm")]
         + [(q8_bytes(LAYOUT["vocabulary"], LAYOUT["hidden"]), "logits")]
+        + [(q4_bytes(LAYOUT["vocabulary"], LAYOUT["hidden"]), "draft-logits")]
     )
 
 
@@ -558,7 +559,12 @@ def write_head(source: Checkpoint, destination: Path) -> int:
         packed.section(source.raw("model.language_model.norm.weight"))
     else:
         packed.section(b"\0" * (LAYOUT["hidden"] * BF16))
-    packed.section(quantized_q8_tile(source.tensor("lm_head.weight")))
+    head = source.tensor("lm_head.weight")
+    packed.section(quantized_q8_tile(head))
+    # The MTP head drafts through this 4-bit copy: its guesses are verified
+    # against the 8-bit head, so they only need to be likely, and it is read
+    # once per guess - half the bytes is ~1 ms per guess.
+    packed.section(quantized_tile(head))
     return packed.finish()
 
 
@@ -875,6 +881,8 @@ def main() -> int:
     parser.add_argument("--requantize-mixers", action="store_true",
                         help="rewrite an existing 0001 package's layer files "
                         "with 8-bit mixers, keeping its experts")
+    parser.add_argument("--head-only", action="store_true",
+                        help="rewrite only head.bin in an existing package")
     parser.add_argument("--mtp-only", action="store_true",
                         help="write only the MTP draft head into an existing package")
     parser.add_argument(
@@ -924,6 +932,10 @@ def main() -> int:
         manifest = json.loads(manifest_path.read_text())
         manifest["format"]["target_layer_magic"] = LAYER_MAGIC.decode()
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        return 0
+    if arguments.head_only:
+        write_head(source, arguments.destination / "target")
+        print("  head.bin", flush=True)
         return 0
     if arguments.mtp_only:
         written = write_mtp(source, arguments.destination / "target")

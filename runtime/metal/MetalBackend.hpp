@@ -361,6 +361,10 @@ public:
   submitPipelineAsync(std::span<const ComputeDispatch> dispatches,
                       std::span<const size_t> stageStarts, uint64_t base);
   [[nodiscard]] bool waitPipelineEvent(uint64_t value, uint64_t timeoutMs);
+  // Waits until stage `stage` of the pipeline at `base` has finished on the
+  // GPU, whatever the host has signalled since.
+  [[nodiscard]] bool waitPipelineStageDone(uint64_t base, uint32_t stage,
+                                           uint64_t timeoutMs);
   void signalPipelineEvent(uint64_t value);
 
   // Development profiling replays a multi-dispatch command synchronously,

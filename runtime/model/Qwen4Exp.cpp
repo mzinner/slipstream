@@ -13,7 +13,7 @@
 namespace splash::model {
 namespace {
 
-constexpr std::string_view kNextHeadMagic = "MDFN0012";  // 8-bit logits
+constexpr std::string_view kNextHeadMagic = "MDFN0014";  // 8-bit logits, 4-bit draft copy
 constexpr std::string_view kNextEmbeddingMagic = "MDFN0013";  // 8-bit rows
 constexpr std::string_view kNextNgramMagic = "MDFN0004";
 
@@ -342,6 +342,8 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
         "final-norm");
     result.logitsProjection = readQ8Projection(
         file, backend, layout.vocabularySize, layout.hiddenSize, "logits");
+    result.draftLogitsProjection = readQ4Projection(
+        file, backend, layout.vocabularySize, layout.hiddenSize, "draft-logits");
     file.finish();
     result.files.push_back(file.record());
   }

@@ -313,6 +313,8 @@ struct Qwen4ExpWeights final {
   Qwen4ExpHyperConnection hyperConnectionMixer;
   metal::MetalBuffer finalNorm;
   ops::Q8Projection logitsProjection;
+  // The same head at 4 bits, for the MTP head's guesses only.
+  ops::Q4Projection draftLogitsProjection;
   ops::Q8Projection tokenEmbedding;
   // Its own file: the embedding table alone is 26.8 GiB, which does not
   // belong inside a layer file.
@@ -334,6 +336,10 @@ struct Qwen4ExpWeights final {
   mutable metal::MetalBuffer predictSelected;
   mutable metal::MetalBuffer predictWeights;
   mutable metal::MetalBuffer predictScratch;
+  // Prompt expert waves: one tile count per wave, 256 bytes apart.
+  mutable metal::MetalBuffer prefillRangeCounts;
+  // The split prompt kernels' gate outputs, kept apart from expertOutput.
+  mutable metal::MetalBuffer prefillGateScratch;
   // MTP draft scratch, allocated on first use.
   mutable metal::MetalBuffer mtpTokens, mtpEmbed, mtpNorm, mtpE, mtpOnes;
   mutable metal::MetalBuffer mtpCos, mtpSin, mtpHin;

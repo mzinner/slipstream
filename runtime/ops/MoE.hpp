@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/CommandGraph.hpp"
+#include "metal/MetalBackend.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "ops/Linear.hpp"
 
@@ -191,6 +192,22 @@ struct MoE final {
   static void addExecute(metal::CommandGraph &graph, const MoeBuffers &buffers,
                          const MoeWeights &weights, const MoePlan &plan,
                          bool addResidual = true, bool hostGrouped = false);
+  // Host-grouped execution in pieces, for a caller that loads experts in
+  // waves: gather every tile's inputs (buffers.tileCount holds the total),
+  // run the experts of tiles [firstTile, firstTile + tiles) - `rangeCount`
+  // must hold `tiles` - and combine once every range has run. A split plan's
+  // gate pass writes `gateScratch` (grouped rows x intermediate, bf16), not
+  // expertOutput, where it would overwrite earlier ranges' results.
+  static void addGather(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                        const MoePlan &plan);
+  static void addExpertRange(metal::CommandGraph &graph,
+                             const MoeBuffers &buffers,
+                             const MoeWeights &weights, const MoePlan &plan,
+                             metal::MetalBackend &backend, uint32_t firstTile,
+                             uint32_t tiles, metal::MetalBuffer rangeCount,
+                             metal::MetalBuffer gateScratch);
+  static void addCombine(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                         const MoePlan &plan, bool addResidual);
 };
 
 } // namespace splash::ops

@@ -375,6 +375,10 @@ struct MetalBackend::Impl {
     __strong id<MTLResidencySet> residencySet = nil;
     // Gates the stages of submitPipelineAsync; values only grow.
     __strong id<MTLSharedEvent> pipelineEvent = nil;
+    // Signalled by the GPU alone, as each pipeline stage ends. A wait on the
+    // shared event above returns early once the host has signalled a later
+    // stage's start; this one only moves when a stage is really done.
+    __strong id<MTLSharedEvent> pipelineDoneEvent = nil;
     uint64_t pipelineValue = 0;
     // Set only for the duration of a pipelined submission.
     const std::vector<size_t> *pipelineStarts = nullptr;
@@ -1252,6 +1256,8 @@ uint64_t MetalBackend::reservePipelineEvents(uint32_t stages) {
     std::lock_guard commandLock(impl_->commandMutex);
     if (!impl_->pipelineEvent)
         impl_->pipelineEvent = [impl_->device newSharedEvent];
+    if (!impl_->pipelineDoneEvent)
+        impl_->pipelineDoneEvent = [impl_->device newSharedEvent];
     const uint64_t base = impl_->pipelineValue;
     impl_->pipelineValue += 2ull * stages + 2;
     return base;
@@ -1266,6 +1272,16 @@ bool MetalBackend::waitPipelineEvent(uint64_t value, uint64_t timeoutMs) {
         if (impl_->pipelineEvent.signaledValue >= value) return true;
     }
     return [impl_->pipelineEvent waitUntilSignaledValue:value timeoutMS:timeoutMs];
+}
+
+bool MetalBackend::waitPipelineStageDone(uint64_t base, uint32_t stage,
+                                         uint64_t timeoutMs) {
+    const uint64_t value = base + 2ull * stage + 1;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (impl_->pipelineDoneEvent.signaledValue >= value) return true;
+    }
+    return [impl_->pipelineDoneEvent waitUntilSignaledValue:value timeoutMS:timeoutMs];
 }
 
 void MetalBackend::signalPipelineEvent(uint64_t value) {
@@ -1546,9 +1562,12 @@ CommandTicket MetalBackend::submitCommandAsync(
                 throw;
             }
         }
-        if (pipelined)
+        if (pipelined) {
             [command encodeSignalEvent:impl_->pipelineEvent
                                  value:impl_->pipelineBase + 2 * c + 1];
+            [command encodeSignalEvent:impl_->pipelineDoneEvent
+                                 value:impl_->pipelineBase + 2 * c + 1];
+        }
         commands.push_back(command);
     }
 

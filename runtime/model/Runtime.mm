@@ -1,4 +1,5 @@
 #include "model/Runtime.hpp"
+#include "model/Qwen4ExpTarget.hpp"
 #include "model/Qwen4Exp.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
@@ -778,18 +779,18 @@ struct Runtime::Impl {
   // token and reports it as certain, so a sampled request keeps each guess
   // with the target's own probability and resamples from the rest on a
   // rejection: its output distribution is exactly the target's.
-  static constexpr uint32_t kMtpProposals = 3;
+  static uint32_t mtpProposals() noexcept { return mtpDraftLimit(); }
   bool mtpProposing(const Request &) const noexcept {
     return mtpDrafting() && !std::getenv("SPLASH_MTP_SHADOW");
   }
 
   // Proposals the MTP head made this step (it stops when unsure).
-  uint32_t mtpProposed = kMtpProposals;
+  uint32_t mtpProposed = mtpProposals();
 
   uint32_t retainedRowLimit(uint32_t remaining,
                             const Request *entry = nullptr) const noexcept {
     if (entry && mtpProposing(*entry))
-      return std::min(remaining, 1 + kMtpProposals);
+      return std::min(remaining, 1 + mtpProposals());
     return std::min(remaining,
                     package.descriptor.draftPlaceholder ? 1u : kDecodeRows);
   }
@@ -1305,14 +1306,14 @@ struct Runtime::Impl {
     buffers.hyperMixed = d(DecodeTensor::HyperMixed);
     buffers.liveRowsPerLane = package.descriptor.draftPlaceholder ? 1u : kDecodeRows;
     if (mtpPhase != MtpPhase::AlreadyDrafted)
-      mtpProposed = kMtpProposals;
+      mtpProposed = mtpProposals();
     buffers.mtpProposedOut = &mtpProposed;
     buffers.mtpDraftOnly = mtpPhase == MtpPhase::DraftOnly;
     buffers.mtpDrafted = mtpPhase == MtpPhase::AlreadyDrafted;
     buffers.mtpEnabled = mtpDrafting();
     buffers.mtpShadow = !(lanes == 1 && mtpProposing(laneEntry(entries, 0)));
     if (!buffers.mtpShadow)
-      buffers.liveRowsPerLane = 1 + kMtpProposals;
+      buffers.liveRowsPerLane = 1 + mtpProposals();
     buffers.kvPageCount = kvPages.pageCount();
     buffers.proposedTokens = d(DecodeTensor::ProposedTokens);
     buffers.proposalCandidates = d(DecodeTensor::Candidates);

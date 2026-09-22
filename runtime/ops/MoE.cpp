@@ -251,6 +251,108 @@ void MoE::addExecute(metal::CommandGraph &graph, const MoeBuffers &buffers,
   }
 }
 
+void MoE::addGather(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                    const MoePlan &plan) {
+  const MoeShape shape = plan.shape();
+  graph.add("moe_gather_rows",
+            {buffers.input, buffers.groupedRoutes, buffers.tileCount,
+             buffers.groupedInput},
+            MoeGatherParams{plan.tileRows(), shape.hiddenSize,
+                            shape.routesPerToken()},
+            {plan.maximumTiles(), shape.hiddenSize / 256, 1});
+}
+
+void MoE::addExpertRange(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                         const MoeWeights &weights, const MoePlan &plan,
+                         metal::MetalBackend &backend, uint32_t firstTile,
+                         uint32_t tiles, metal::MetalBuffer rangeCount,
+                         metal::MetalBuffer gateScratch) {
+  if (!tiles)
+    return;
+  const MoeShape shape = plan.shape();
+  const uint32_t tileRows = plan.tileRows();
+  if (firstTile + tiles > plan.maximumTiles())
+    throw std::invalid_argument("MoE expert range exceeds the plan's tiles");
+  const bool m8 = plan.config().expertTile == MoeExpertTile::M8;
+  const bool wide = shape.storageN == 256;
+  const uint64_t firstRow = uint64_t{firstTile} * tileRows;
+  const uint64_t rangeRows = uint64_t{tiles} * tileRows;
+  auto rowsOf = [&](const metal::MetalBuffer &buffer, uint64_t width) {
+    return backend.view(buffer, firstRow * width * 2, rangeRows * width * 2);
+  };
+  const metal::MetalBuffer descriptors = backend.view(
+      buffers.tileDescriptors, uint64_t{firstTile} * sizeof(MoeTileDescriptor),
+      uint64_t{tiles} * sizeof(MoeTileDescriptor));
+  const metal::MetalBuffer input = rowsOf(buffers.groupedInput, shape.hiddenSize);
+  const metal::MetalBuffer intermediate =
+      rowsOf(buffers.expertIntermediate, shape.expertIntermediateSize);
+  const metal::MetalBuffer output = rowsOf(buffers.expertOutput, shape.hiddenSize);
+  const MoeExpertParams gateUp{shape.hiddenSize, shape.expertIntermediateSize,
+                               shape.experts, 0,
+                               weights.expertGate.expertStrideBytes,
+                               weights.expertUp.expertStrideBytes};
+  const MoeExpertParams gate{shape.hiddenSize, shape.expertIntermediateSize,
+                             shape.experts, 0,
+                             weights.expertGate.expertStrideBytes,
+                             weights.expertGate.expertStrideBytes};
+  const MoeExpertParams up{shape.hiddenSize, shape.expertIntermediateSize,
+                           shape.experts, 0, weights.expertUp.expertStrideBytes,
+                           weights.expertUp.expertStrideBytes};
+  const MoeExpertParams down{shape.expertIntermediateSize, shape.hiddenSize,
+                             shape.experts, 0,
+                             weights.expertDown.expertStrideBytes,
+                             weights.expertDown.expertStrideBytes};
+  if (plan.splitExperts()) {
+    if (gateScratch.sizeBytes() <
+        uint64_t{plan.maximumTiles()} * tileRows * shape.expertIntermediateSize * 2)
+      throw std::invalid_argument("MoE gate scratch is too small");
+    const metal::MetalBuffer gated = rowsOf(gateScratch, shape.expertIntermediateSize);
+    graph.add(wide ? "prefill_moe_expert_q4_n256_m32" : "prefill_moe_expert_q4_n128_m32",
+              {input, descriptors, rangeCount, weights.expertGate.packed,
+               weights.sharedGate.packed, gated},
+              gate, {shape.expertIntermediateSize / shape.storageN, tiles, 1});
+    graph.add(wide ? "prefill_moe_expert_q4_n256_up_silu_m32"
+                   : "prefill_moe_expert_q4_n128_up_silu_m32",
+              {input, descriptors, rangeCount, weights.expertUp.packed,
+               weights.sharedUp.packed, gated, intermediate},
+              up, {shape.expertIntermediateSize / shape.storageN, tiles, 1});
+    graph.add(wide ? "prefill_moe_expert_q4_n256_m32" : "prefill_moe_expert_q4_n128_m32",
+              {intermediate, descriptors, rangeCount, weights.expertDown.packed,
+               weights.sharedDown.packed, output},
+              down, {shape.hiddenSize / shape.storageN, tiles, 1});
+    return;
+  }
+  graph.add(wide ? (m8 ? "moe_expert_gate_up_q4_m8" : "moe_expert_gate_up_q4_m32")
+                 : (m8 ? "moe_expert_gate_up_q4_n128_m8" : "moe_expert_gate_up_q4_n128_m32"),
+            {input, descriptors, rangeCount, weights.expertGate.packed,
+             weights.expertUp.packed, weights.sharedGate.packed,
+             weights.sharedUp.packed, intermediate},
+            gateUp, {shape.expertIntermediateSize / 128, tiles, 1});
+  graph.add(wide ? (m8 ? "moe_expert_down_q4_m8" : "moe_expert_down_q4_m32")
+                 : (m8 ? "moe_expert_down_q4_n128_m8" : "moe_expert_down_q4_n128_m32"),
+            {intermediate, descriptors, rangeCount, weights.expertDown.packed,
+             weights.sharedDown.packed, output},
+            down, {shape.hiddenSize / 128, tiles, 1});
+}
+
+void MoE::addCombine(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                     const MoePlan &plan, bool addResidual) {
+  const MoeShape shape = plan.shape();
+  const uint32_t rows = plan.rows();
+  if (addResidual)
+    graph.add("moe_combine",
+              {buffers.expertOutput, buffers.routeRows, buffers.routingWeights,
+               buffers.residual, buffers.output},
+              MoeCombineParams{rows, shape.hiddenSize, shape.routesPerToken()},
+              {rows, shape.hiddenSize / 256, 1});
+  else
+    graph.add("moe_combine_no_residual",
+              {buffers.expertOutput, buffers.routeRows, buffers.routingWeights,
+               buffers.output},
+              MoeCombineParams{rows, shape.hiddenSize, shape.routesPerToken()},
+              {rows, shape.hiddenSize / 256, 1});
+}
+
 void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
               const MoeWeights &weights, const MoePlan &plan,
               bool addResidual) {
