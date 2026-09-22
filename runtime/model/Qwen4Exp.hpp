@@ -1,5 +1,8 @@
 #pragma once
 
+#include <atomic>
+#include <memory>
+
 #include <dispatch/dispatch.h>
 
 #include "QwenTarget.hpp"
@@ -278,6 +281,10 @@ struct Qwen4ExpLayerExpertCache final {
   // waits for them first; the slots are already claimed in expertToSlot.
   dispatch_group_t inflight = nullptr;
   bool pending = false;
+  // Background reads still writing each slot (three per expert, one per
+  // matrix). Decode waits only for the slots it needs, and never evicts a
+  // slot whose read has not landed.
+  std::shared_ptr<std::atomic<uint32_t>[]> slotReads;
 };
 
 // Section order per layer file, which the packer must follow exactly:

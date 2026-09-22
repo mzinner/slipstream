@@ -265,7 +265,7 @@ void addHyperConnection(metal::CommandGraph &graph,
 template <class Miss>
 void readMissedExperts(const Qwen4ExpExpertSource &source, const Miss *misses,
                        size_t count, uint64_t stride, char *gate, char *up,
-                       char *down) {
+                       char *down, std::atomic<uint32_t> *slotReads = nullptr) {
   if (!count)
     return;
   // One read per matrix. Splitting each into 4 smaller reads in flight
@@ -294,6 +294,8 @@ void readMissedExperts(const Qwen4ExpExpertSource &source, const Miss *misses,
         break; // Leaves the slot short; the file was validated at load.
       done += static_cast<uint64_t>(got);
     }
+    if (slotReads)
+      slotReads[miss.slot].fetch_sub(1, std::memory_order_release);
   });
 }
 
@@ -369,6 +371,7 @@ int32_t pickVictim(const Qwen4ExpLayerExpertCache &cache) {
   uint64_t bestKey = UINT64_MAX;
   for (uint32_t s = 0; s < cache.capacity; ++s) {
     if (cache.lruTime[s] == cache.clock) continue;
+    if (cache.slotReads && cache.slotReads[s].load(std::memory_order_acquire)) continue;
     const int16_t expert = cache.slotToExpert[s];
     const uint64_t count = expert >= 0 && !cache.frequency.empty()
                                ? cache.frequency[expert] : 0;
@@ -1789,13 +1792,8 @@ void Qwen4ExpTarget::addVerify(
   auto stageActiveExperts = [&](uint32_t layerIndex) -> bool {
     auto &cache = layerRef(layerIndex).expertCache;
     // Predicted experts may still be loading; their slots are already claimed.
-    if (cache.pending) {
-      const auto waitStart = std::chrono::steady_clock::now();
-      dispatch_group_wait(cache.inflight, DISPATCH_TIME_FOREVER);
-      hostParts[0] += std::chrono::duration<double, std::milli>(
-                          std::chrono::steady_clock::now() - waitStart).count();
-      cache.pending = false;
-    }
+    // Predicted experts may still be loading; their slots are claimed. Wait
+    // only for the ones this step uses (below, once they are known).
     auto *selPtr = static_cast<uint32_t *>(buffers.selectedExperts.contents());
     const uint32_t routesPerRow = moePlan.shape().routesPerToken();
     const uint32_t expertsPerToken = weights.layout.expertsPerToken;
@@ -1846,6 +1844,16 @@ void Qwen4ExpTarget::addVerify(
 
     for (uint32_t exp : uniqueExperts)
       countExpertUse(cache, exp);
+    if (cache.slotReads) {
+      const auto waitStart = std::chrono::steady_clock::now();
+      for (uint32_t exp : uniqueExperts) {
+        const int16_t slot = cache.expertToSlot[exp];
+        if (slot >= 0)
+          while (cache.slotReads[slot].load(std::memory_order_acquire)) {}
+      }
+      hostParts[0] += std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - waitStart).count();
+    }
     if (layerIndex < geometry.layers && predictedWide[layerIndex].any())
       for (uint32_t exp : uniqueExperts) {
         ++predictionCounts[0];
@@ -1979,6 +1987,13 @@ void Qwen4ExpTarget::addVerify(
     weights.predictIssued += misses.size();
     if (!cache.inflight)
       cache.inflight = dispatch_group_create();
+    if (!cache.slotReads) {
+      cache.slotReads.reset(new std::atomic<uint32_t>[cache.capacity]);
+      for (uint32_t slot = 0; slot < cache.capacity; ++slot) cache.slotReads[slot] = 0;
+    }
+    for (const Miss &miss : misses)
+      cache.slotReads[miss.slot].fetch_add(3, std::memory_order_relaxed);
+    auto slotReads = cache.slotReads;
     const auto &source = weights.layers[layer].expertSource;
     const uint64_t stride = weights.layers[layer].ffn.expertGate.expertStrideBytes;
     char *gate = static_cast<char *>(cache.cacheGate.contents());
@@ -1987,7 +2002,8 @@ void Qwen4ExpTarget::addVerify(
     auto owned = std::make_shared<std::vector<Miss>>(std::move(misses));
     dispatch_group_async(cache.inflight,
                          dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-      readMissedExperts(source, owned->data(), owned->size(), stride, gate, up, down);
+      readMissedExperts(source, owned->data(), owned->size(), stride, gate, up, down,
+                        slotReads.get());
     });
     cache.pending = true;
   };
