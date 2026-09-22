@@ -19,7 +19,10 @@ struct HyperConnectionParams {
   // Logical row r is physical row r * row_step (0 means 1). Decode with one
   // live row per 8-row lane processes only rows 0, 8, 16, ...
   uint32_t row_step;
-  uint32_t reserved;
+  // hyper_connection_down splits each output's dot product across this many
+  // threadgroups (0 or 1: no split) and leaves float partial sums for
+  // hyper_connection_down_finish. Decode's few rows need the parallelism.
+  uint32_t splits;
 };
 
 static_assert(sizeof(HyperConnectionParams) == 32,

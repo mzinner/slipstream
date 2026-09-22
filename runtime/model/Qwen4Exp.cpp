@@ -13,7 +13,7 @@
 namespace splash::model {
 namespace {
 
-constexpr std::string_view kNextHeadMagic = "MDFN0014";  // 8-bit logits, 4-bit draft copy
+constexpr std::string_view kNextHeadMagic = "MDFN0024";  // 8-bit logits and mixer, 4-bit draft copy
 constexpr std::string_view kNextEmbeddingMagic = "MDFN0013";  // 8-bit rows
 constexpr std::string_view kNextNgramMagic = "MDFN0004";
 
@@ -85,10 +85,16 @@ Qwen4ExpHyperConnection readHyperConnection(WeightFile &file,
       checkedWeightMultiply(layout.hyperConnectionLowRank, width,
                             "hyper-connection mix bytes");
   const std::string prefix(label);
+  const uint64_t codes = mix / kBFloat16Bytes;
+  const uint64_t parameters = codes / 64 * kBFloat16Bytes;
   Qwen4ExpHyperConnection result;
   result.norm = file.section(width, prefix + "-norm");
-  result.mixDown = file.section(mix, prefix + "-mix-down");
-  result.mixUp = file.section(mix, prefix + "-mix-up");
+  result.mixDown = file.section(codes, prefix + "-mix-down");
+  result.mixDownScales = file.section(parameters, prefix + "-mix-down-scales");
+  result.mixDownBiases = file.section(parameters, prefix + "-mix-down-biases");
+  result.mixUp = file.section(codes, prefix + "-mix-up");
+  result.mixUpScales = file.section(parameters, prefix + "-mix-up-scales");
+  result.mixUpBiases = file.section(parameters, prefix + "-mix-up-biases");
   if (withInject) {
     result.blockInject =
         file.section(checkedWeightMultiply(layout.hyperConnectionCount, width,
@@ -179,7 +185,11 @@ ops::ExpertQ4Projection detachExpert(metal::MetalBackend &backend, const ops::Ex
   // 1. Attention Hyper-connection
   layer.attentionHyperConnection.norm = detachBuffer(backend, layer.attentionHyperConnection.norm, "att-norm");
   layer.attentionHyperConnection.mixDown = detachBuffer(backend, layer.attentionHyperConnection.mixDown, "att-down");
+  layer.attentionHyperConnection.mixDownScales = detachBuffer(backend, layer.attentionHyperConnection.mixDownScales, "att-down-s");
+  layer.attentionHyperConnection.mixDownBiases = detachBuffer(backend, layer.attentionHyperConnection.mixDownBiases, "att-down-b");
   layer.attentionHyperConnection.mixUp = detachBuffer(backend, layer.attentionHyperConnection.mixUp, "att-up");
+  layer.attentionHyperConnection.mixUpScales = detachBuffer(backend, layer.attentionHyperConnection.mixUpScales, "att-up-s");
+  layer.attentionHyperConnection.mixUpBiases = detachBuffer(backend, layer.attentionHyperConnection.mixUpBiases, "att-up-b");
   if (layer.attentionHyperConnection.blockInject) {
     layer.attentionHyperConnection.blockInject = detachBuffer(backend, *layer.attentionHyperConnection.blockInject, "att-inject");
   }
@@ -211,7 +221,11 @@ ops::ExpertQ4Projection detachExpert(metal::MetalBackend &backend, const ops::Ex
   // 4. MLP Hyper-connection
   layer.mlpHyperConnection.norm = detachBuffer(backend, layer.mlpHyperConnection.norm, "mlp-norm");
   layer.mlpHyperConnection.mixDown = detachBuffer(backend, layer.mlpHyperConnection.mixDown, "mlp-down");
+  layer.mlpHyperConnection.mixDownScales = detachBuffer(backend, layer.mlpHyperConnection.mixDownScales, "mlp-down-s");
+  layer.mlpHyperConnection.mixDownBiases = detachBuffer(backend, layer.mlpHyperConnection.mixDownBiases, "mlp-down-b");
   layer.mlpHyperConnection.mixUp = detachBuffer(backend, layer.mlpHyperConnection.mixUp, "mlp-up");
+  layer.mlpHyperConnection.mixUpScales = detachBuffer(backend, layer.mlpHyperConnection.mixUpScales, "mlp-up-s");
+  layer.mlpHyperConnection.mixUpBiases = detachBuffer(backend, layer.mlpHyperConnection.mixUpBiases, "mlp-up-b");
   if (layer.mlpHyperConnection.blockInject) {
     layer.mlpHyperConnection.blockInject = detachBuffer(backend, *layer.mlpHyperConnection.blockInject, "mlp-inject");
   }
@@ -303,7 +317,7 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
       std::filesystem::exists(directory / "mtp-combiner.bin")) {
     result.mtpLayer = readLayer("mtp-layer.bin", layout.layers, true);
     WeightFile file(backend, directory / "mtp-combiner.bin",
-                    "target/mtp-combiner.bin", "MDFN0005", layout.layers, 3);
+                    "target/mtp-combiner.bin", "MDFN0025", layout.layers, 3);
     Qwen4ExpMtpCombiner combiner;
     const uint64_t hidden = uint64_t{layout.hiddenSize} * kBFloat16Bytes;
     combiner.embeddingNorm = detachBuffer(
@@ -322,7 +336,11 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     combiner.mixer = readHyperConnection(file, layout, "mtp-mixer", false);
     combiner.mixer.norm = detachBuffer(backend, combiner.mixer.norm, "mtp-mix-norm");
     combiner.mixer.mixDown = detachBuffer(backend, combiner.mixer.mixDown, "mtp-mix-down");
+    combiner.mixer.mixDownScales = detachBuffer(backend, combiner.mixer.mixDownScales, "mtp-mix-down-s");
+    combiner.mixer.mixDownBiases = detachBuffer(backend, combiner.mixer.mixDownBiases, "mtp-mix-down-b");
     combiner.mixer.mixUp = detachBuffer(backend, combiner.mixer.mixUp, "mtp-mix-up");
+    combiner.mixer.mixUpScales = detachBuffer(backend, combiner.mixer.mixUpScales, "mtp-mix-up-s");
+    combiner.mixer.mixUpBiases = detachBuffer(backend, combiner.mixer.mixUpBiases, "mtp-mix-up-b");
     file.finish();
     result.files.push_back(file.record());
     result.mtpCombiner = std::move(combiner);
@@ -426,6 +444,24 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
   result.actualAllocatedBytes = metal::allocationDelta(
       allocationBaseline, backend.memoryStats().allocatedBytes);
 
+  {
+    // Partial sums of the split down projection: splits x rows x outputs.
+    const metal::MetalBuffer partials = backend.allocateBuffer(
+        uint64_t{kHyperDownSplits} * kHyperDownSplitRows *
+            (layout.hyperConnectionLowRank + layout.hyperConnectionCount) * sizeof(float),
+        metal::BufferStorage::Private, "qwen4exp-hyper-partials");
+    for (auto &layer : result.layers) {
+      layer.attentionHyperConnection.downPartials = partials;
+      layer.mlpHyperConnection.downPartials = partials;
+    }
+    if (result.mtpLayer) {
+      result.mtpLayer->attentionHyperConnection.downPartials = partials;
+      result.mtpLayer->mlpHyperConnection.downPartials = partials;
+    }
+    if (result.mtpCombiner)
+      result.mtpCombiner->mixer.downPartials = partials;
+    result.hyperConnectionMixer.downPartials = partials;
+  }
   result.lastSelectedExperts.resize(layout.layers);
   if (residentLayers < layout.layers) {
     const uint64_t expertStride = uint64_t{layout.expertIntermediateSize} * layout.hiddenSize * 9 / 16;
@@ -442,6 +478,9 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
       double budgetGiB = std::max(8.0, physicalGiB - 28.0);
       if (const char *envGiB = getenv("SPLASH_EXPERT_CACHE_GIB"))
         budgetGiB = std::max(1.0, std::atof(envGiB));
+      // The prompt staging buffer comes out of the same budget.
+      budgetGiB -= double(kPromptStagingExperts) * 3 * double(expertStride) /
+                   double(1ULL << 30);
       const uint64_t perSlot =
           3 * expertStride * uint64_t(layout.layers - residentLayers);
       cacheCapacity = static_cast<uint32_t>(std::min<double>(
@@ -454,6 +493,14 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     std::cerr << "[Qwen4Exp] expert cache: " << cacheCapacity
               << " experts per layer\n";
     const uint64_t cacheBytes = uint64_t{cacheCapacity} * expertStride;
+    {
+      auto &staging = result.promptStaging;
+      staging.capacity = kPromptStagingExperts;
+      const uint64_t bytes = uint64_t{kPromptStagingExperts} * expertStride;
+      staging.cacheGate = backend.allocateBuffer(bytes, metal::BufferStorage::Shared, "prompt-staging-gate");
+      staging.cacheUp = backend.allocateBuffer(bytes, metal::BufferStorage::Shared, "prompt-staging-up");
+      staging.cacheDown = backend.allocateBuffer(bytes, metal::BufferStorage::Shared, "prompt-staging-down");
+    }
     auto streamingLayer = [&](uint32_t l) -> Qwen4ExpLayerWeights & {
       return l < layout.layers ? result.layers[l] : *result.mtpLayer;
     };
@@ -525,6 +572,10 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
         const auto &cache = streamingLayer(l).expertCache;
         resident.insert(resident.end(), {cache.cacheGate, cache.cacheUp, cache.cacheDown});
       }
+      const auto &staging = result.promptStaging;
+      resident.insert(resident.end(), {staging.cacheGate, staging.cacheUp, staging.cacheDown});
+      for (const auto &buffer : {staging.cacheGate, staging.cacheUp, staging.cacheDown})
+        (void)::mlock(buffer.contents(), buffer.sizeBytes());
       if (!getenv("SPLASH_NO_RESIDENCY_SET"))
         backend.keepResident(resident);
     }

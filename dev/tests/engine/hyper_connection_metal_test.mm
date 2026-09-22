@@ -14,6 +14,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -41,7 +42,7 @@ struct Params {
   float epsilon;
   uint32_t withInject;
   uint32_t rowStep;
-  uint32_t reserved;
+  uint32_t splits;
 };
 
 uint16_t toBf16(float value) {
@@ -68,14 +69,56 @@ uint16_t *hostOf(MetalBuffer &buffer) {
   return static_cast<uint16_t *>(buffer.contents());
 }
 
+// The package's 8-bit mix weights: per 64 along a row, a bf16 bias at the
+// larger-magnitude end and a bf16 scale, codes 0..255 (tools/quantize.py).
+// `dequantized` gets the exact values the kernels compute with.
+struct Quantized {
+  std::vector<uint8_t> codes;
+  std::vector<uint16_t> scales, biases;
+  std::vector<float> dequantized;
+};
+Quantized quantize8(const std::vector<uint16_t> &values, size_t rows, size_t columns) {
+  Quantized q;
+  q.codes.resize(rows * columns);
+  q.dequantized.resize(rows * columns);
+  for (size_t row = 0; row < rows; ++row)
+    for (size_t group = 0; group < columns / 64; ++group) {
+      const size_t first = row * columns + group * 64;
+      float low = INFINITY, high = -INFINITY;
+      for (size_t i = 0; i < 64; ++i) {
+        low = std::min(low, fromBf16(values[first + i]));
+        high = std::max(high, fromBf16(values[first + i]));
+      }
+      const bool anchorLow = std::fabs(low) > std::fabs(high);
+      const float bias = fromBf16(toBf16(anchorLow ? low : high));
+      const float scale = fromBf16(toBf16(((anchorLow ? high : low) - (anchorLow ? low : high)) / 255.0f));
+      q.scales.push_back(toBf16(scale));
+      q.biases.push_back(toBf16(bias));
+      for (size_t i = 0; i < 64; ++i) {
+        const float code = scale == 0.0f ? 0.0f
+            : std::clamp(std::nearbyint((fromBf16(values[first + i]) - bias) / scale), 0.0f, 255.0f);
+        q.codes[first + i] = static_cast<uint8_t>(code);
+        q.dequantized[first + i] = code * scale + bias;
+      }
+    }
+  return q;
+}
+
+template <class T>
+MetalBuffer bufferOf(MetalBackend &backend, const std::vector<T> &data, const char *label) {
+  MetalBuffer buffer = backend.allocateBuffer(data.size() * sizeof(T), BufferStorage::Shared, label);
+  std::memcpy(buffer.contents(), data.data(), data.size() * sizeof(T));
+  return buffer;
+}
+
 // Transcribed from Qwen4ExpTextGatedResidual.forward.
 struct Reference {
   std::vector<float> mixed, injection, updated;
 };
 Reference cpuReference(const Params &p, const std::vector<uint16_t> &x,
                        const std::vector<uint16_t> &gain,
-                       const std::vector<uint16_t> &down,
-                       const std::vector<uint16_t> &up,
+                       const std::vector<float> &down,
+                       const std::vector<float> &up,
                        const std::vector<uint16_t> &inject,
                        const std::vector<uint16_t> &block) {
   const uint32_t width = p.count * p.hidden;
@@ -108,7 +151,7 @@ Reference cpuReference(const Params &p, const std::vector<uint16_t> &x,
     for (uint32_t o = 0; o < p.lowRank; ++o) {
       float sum = 0.0f;
       for (uint32_t i = 0; i < width; ++i)
-        sum += fromBf16(down[size_t(o) * width + i]) * normalized[i];
+        sum += down[size_t(o) * width + i] * normalized[i];
       const float v = sum / float(p.count);
       low[o] = fromBf16(toBf16(v / (1.0f + std::exp(-v))));
     }
@@ -118,7 +161,7 @@ Reference cpuReference(const Params &p, const std::vector<uint16_t> &x,
         const uint32_t index = stream * p.hidden + dimension;
         float sum = 0.0f;
         for (uint32_t r = 0; r < p.lowRank; ++r)
-          sum += fromBf16(up[size_t(index) * p.lowRank + r]) * low[r];
+          sum += up[size_t(index) * p.lowRank + r] * low[r];
         accumulated += (1.0f / (1.0f + std::exp(-sum))) * normalized[index];
       }
       out.mixed[size_t(row) * p.hidden + dimension] =
@@ -168,7 +211,9 @@ double worstRelative(const uint16_t *got, const std::vector<float> &want,
 
 void runCase(MetalBackend &backend, uint32_t rows) {
     // Production geometry: four streams of 2560, low rank 320.
-    const Params params{rows, 2560, 4, 320, 1e-6f, 1, 1, 0};
+    // Decode-sized calls split the down projection 10 ways, as production does.
+    const uint32_t splits = rows <= 32 ? 10 : 1;
+    const Params params{rows, 2560, 4, 320, 1e-6f, 1, 1, splits};
     const uint32_t width = params.count * params.hidden;
 
     std::mt19937 engine(20260919);
@@ -190,8 +235,17 @@ void runCase(MetalBackend &backend, uint32_t rows) {
 
     MetalBuffer xBuffer = bufferFrom(backend, x, "hc-residual");
     MetalBuffer gainBuffer = bufferFrom(backend, gain, "hc-gain");
-    MetalBuffer downBuffer = bufferFrom(backend, down, "hc-down");
-    MetalBuffer upBuffer = bufferFrom(backend, up, "hc-up");
+    const Quantized down8 = quantize8(down, params.lowRank, width);
+    const Quantized up8 = quantize8(up, width, params.lowRank);
+    MetalBuffer downBuffer = bufferOf(backend, down8.codes, "hc-down");
+    MetalBuffer downScales = bufferOf(backend, down8.scales, "hc-down-s");
+    MetalBuffer downBiases = bufferOf(backend, down8.biases, "hc-down-b");
+    MetalBuffer upBuffer = bufferOf(backend, up8.codes, "hc-up");
+    MetalBuffer upScales = bufferOf(backend, up8.scales, "hc-up-s");
+    MetalBuffer upBiases = bufferOf(backend, up8.biases, "hc-up-b");
+    const uint32_t outputs = params.lowRank + params.count;
+    MetalBuffer partials = backend.allocateBuffer(
+        size_t(10) * std::max(rows, 1u) * outputs * 4, BufferStorage::Shared, "hc-partials");
     MetalBuffer injectBuffer = bufferFrom(backend, inject, "hc-inject");
     MetalBuffer blockBuffer = bufferFrom(backend, block, "hc-block");
     MetalBuffer normalized = backend.allocateBuffer(
@@ -212,11 +266,14 @@ void runCase(MetalBackend &backend, uint32_t rows) {
     graph.add("hyper_connection_rms", {xBuffer, gainBuffer, normalized}, params,
               {params.rows, params.count, 1}, {256, 1, 1});
     graph.add("hyper_connection_down",
-              {normalized, downBuffer, injectBuffer, reduced, injection},
-              params, {(params.lowRank + params.count + 7) / 8, 1, 1},
-              {256, 1, 1});
+              {normalized, downBuffer, downScales, downBiases, injectBuffer,
+               reduced, injection, partials},
+              params, {(outputs + 7) / 8, splits, 1}, {256, 1, 1});
+    if (splits > 1)
+      graph.add("hyper_connection_down_finish", {partials, reduced, injection},
+                params, {(rows * outputs + 255) / 256, 1, 1}, {256, 1, 1});
     graph.add("hyper_connection_up_mix",
-              {normalized, reduced, upBuffer, mixed}, params,
+              {normalized, reduced, upBuffer, upScales, upBiases, mixed}, params,
               {params.hidden / 8, 1, 1}, {256, 1, 1});
     graph.add("hyper_connection_update",
               {xBuffer, blockBuffer, injection}, params, {64, 1, 1},
@@ -224,7 +281,7 @@ void runCase(MetalBackend &backend, uint32_t rows) {
     (void)backend.submitCommand(graph.dispatches());
 
     const Reference reference =
-        cpuReference(params, x, gain, down, up, inject, block);
+        cpuReference(params, x, gain, down8.dequantized, up8.dequantized, inject, block);
 
     std::cout << "hyper-connection, " << rows << " rows, " << params.count << " streams of "
               << params.hidden << ", low rank " << params.lowRank << '\n';

@@ -234,21 +234,28 @@ void addHyperConnection(metal::CommandGraph &graph,
                         metal::MetalBuffer injection, uint32_t rows,
                         uint32_t rowStep = 1) {
   const bool withInject = weights.blockInject.has_value();
+  const uint32_t splits = rows <= kHyperDownSplitRows ? kHyperDownSplits : 1;
   const HyperConnectionParams params{
       rows, geometry.hiddenSize, geometry.hyperConnectionCount,
-      geometry.hyperConnectionLowRank, 1e-6f, withInject ? 1u : 0u, rowStep, 0};
+      geometry.hyperConnectionLowRank, 1e-6f, withInject ? 1u : 0u, rowStep,
+      splits};
   graph.add("hyper_connection_rms", {std::move(input), weights.norm, normalized},
             params, {rows, geometry.hyperConnectionCount, 1}, {256, 1, 1});
   const uint32_t outputs = geometry.hyperConnectionLowRank +
                            (withInject ? geometry.hyperConnectionCount : 0);
   graph.add("hyper_connection_down",
-            {normalized, weights.mixDown,
-             withInject ? *weights.blockInject : weights.mixDown, reduced,
-             withInject ? std::move(injection) : reduced},
-            params, {(outputs + 7) / 8, 1, 1}, {256, 1, 1});
+            {normalized, weights.mixDown, weights.mixDownScales,
+             weights.mixDownBiases,
+             withInject ? *weights.blockInject : weights.mixDownScales, reduced,
+             withInject ? injection : reduced, weights.downPartials},
+            params, {(outputs + 7) / 8, splits, 1}, {256, 1, 1});
+  if (splits > 1)
+    graph.add("hyper_connection_down_finish",
+              {weights.downPartials, reduced, withInject ? injection : reduced},
+              params, {(rows * outputs + 255) / 256, 1, 1}, {256, 1, 1});
   graph.add("hyper_connection_up_mix",
             {std::move(normalized), std::move(reduced), weights.mixUp,
-             std::move(mixed)},
+             weights.mixUpScales, weights.mixUpBiases, std::move(mixed)},
             params, {geometry.hiddenSize / 8, 1, 1}, {256, 1, 1});
 }
 
@@ -297,17 +304,20 @@ void topExperts(const uint16_t *scores, uint32_t experts, uint32_t k,
                 uint32_t *ids, float *weights) {
   auto widen = [](uint16_t bits) { return std::bit_cast<float>(uint32_t{bits} << 16); };
   float chosen[16];
-  for (uint32_t rank = 0; rank < k; ++rank) {
-    float best = -INFINITY;
-    uint32_t bestId = 0;
-    for (uint32_t e = 0; e < experts; ++e) {
-      bool taken = false;
-      for (uint32_t r = 0; r < rank; ++r) taken |= ids[r] == e;
-      const float v = widen(scores[e]);
-      if (!taken && v > best) { best = v; bestId = e; }
+  // One pass, keeping the k best in order. Scanning ids upward and moving a
+  // value past only strictly smaller ones keeps ties at the lower id.
+  uint32_t filled = 0;
+  for (uint32_t e = 0; e < experts; ++e) {
+    const float v = widen(scores[e]);
+    if (filled == k && !(v > chosen[k - 1])) continue;
+    uint32_t at = filled < k ? filled++ : k - 1;
+    while (at > 0 && chosen[at - 1] < v) {
+      chosen[at] = chosen[at - 1];
+      ids[at] = ids[at - 1];
+      --at;
     }
-    ids[rank] = bestId;
-    chosen[rank] = best;
+    chosen[at] = v;
+    ids[at] = e;
   }
   if (!weights) return;
   float total = 0.0f;
@@ -1071,62 +1081,98 @@ void Qwen4ExpTarget::addPrefill(
       (cache.expertToSlot[e] >= 0 ? hits : misses).push_back(e);
     }
     ++cache.clock;
-    // Two slot sets alternate: while the GPU runs the experts in one, the
-    // host reads the next wave into the other. A wave may load into a set
-    // only once the last stage that read that set is done. Normally the
-    // hits (already loaded) are stage 0 and the free slots take the first
-    // misses; when the hits fill nearly every slot, as a long chunk does,
-    // they are split in two stages so half their slots free up early.
+    // Waves. After this chunk the cache should hold the chunk's most-used
+    // experts: they are what decoding the same text needs next. Stage 0 runs
+    // the cached experts (and the shared expert). Missing experts among the
+    // most-used are read into cache slots - first those holding experts this
+    // chunk never uses (free at once), then those of rarely used cached ones
+    // (free once stage 0 is done). The rest, used by few routes, are read
+    // into the prompt staging buffer, whose two halves alternate so reads
+    // overlap the GPU. Every expert is read at most once.
     struct Load { uint32_t expert, slot; };
-    std::vector<std::vector<Load>> waves;
-    std::vector<int> waveSet;          // the slot set each wave reads
-    std::array<std::vector<uint32_t>, 2> sets;
-    std::vector<bool> holdsHit(cache.capacity, false);
-    for (uint32_t e : hits) holdsHit[cache.expertToSlot[e]] = true;
-    std::vector<uint32_t> freeSlots;
-    for (uint32_t slot = 0; slot < cache.capacity; ++slot)
-      if (!holdsHit[slot]) freeSlots.push_back(slot);
-    cache.numCached = cache.capacity;
-    // Balanced halves, so each read overlaps a GPU pass of similar size.
-    const size_t half = cache.capacity / 2;
-    if (hits.size() <= half) {
-      // Hits go in set 1, topped up with free slots; the rest are set 0.
-      waves.emplace_back();
-      for (uint32_t e : hits) {
-        const uint32_t slot = static_cast<uint32_t>(cache.expertToSlot[e]);
-        waves[0].push_back({e, slot});
-        sets[1].push_back(slot);
-      }
-      size_t i = 0;
-      for (; i < freeSlots.size() && sets[1].size() < half; ++i)
-        sets[1].push_back(freeSlots[i]);
-      for (; i < freeSlots.size(); ++i) sets[0].push_back(freeSlots[i]);
-      waveSet.push_back(1);
-    } else {
-      // More hits than half the slots: run them as two stages, so the
-      // first stage's slots free up while the second runs.
-      const size_t split = hits.size() / 2;
-      for (int part = 0; part < 2; ++part) {
-        auto &wave = waves.emplace_back();
-        const size_t from = part ? split : 0, to = part ? hits.size() : split;
-        for (size_t i = from; i < to; ++i) {
-          const uint32_t slot = static_cast<uint32_t>(cache.expertToSlot[hits[i]]);
-          wave.push_back({hits[i], slot});
-          sets[part].push_back(slot);
+    struct Wave {
+      std::vector<Load> loads;
+      bool staging = false;  // runs from the staging buffer
+      int after = -1;        // stage that must finish before these reads
+      int set = -1;          // staging half
+    };
+    // Recent use first: decoding continues from the chunk's last rows.
+    static const uint32_t recentRows = [] {
+      const char *value = std::getenv("SPLASH_PROMPT_RECENT_ROWS");
+      return value ? static_cast<uint32_t>(std::atoi(value)) : 256u;
+    }();
+    const uint32_t recentFrom = rows > recentRows ? rows - recentRows : 0;
+    std::vector<uint32_t> recent(experts, 0);
+    for (uint32_t e = 0; e < experts; ++e)
+      for (uint32_t route : routesOf[e])
+        recent[e] += route / routesPerRow >= recentFrom;
+    auto usage = [&](uint32_t e) {
+      return uint64_t{recent[e]} * 65536 + routesOf[e].size();
+    };
+    std::vector<uint32_t> used(hits);
+    used.insert(used.end(), misses.begin(), misses.end());
+    // Ranked by this chunk's (recent) use; SPLASH_PROMPT_KEEP=frequency ranks
+    // by the long-run use counts instead (measured worse: 54.6 decode misses
+    // a step after the code prompt, against 51.8).
+    static const bool byUsage = [] {
+      const char *value = std::getenv("SPLASH_PROMPT_KEEP");
+      return !(value && std::string_view(value) == "frequency");
+    }();
+    std::sort(used.begin(), used.end(), [&](uint32_t x, uint32_t y) {
+      if (byUsage && usage(x) != usage(y)) return usage(x) > usage(y);
+      if (cache.frequency[x] != cache.frequency[y]) return cache.frequency[x] > cache.frequency[y];
+      if (usage(x) != usage(y)) return usage(x) > usage(y);
+      return x < y;
+    });
+    std::vector<bool> keep(experts, false);
+    for (size_t i = 0; i < used.size() && i < cache.capacity; ++i) keep[used[i]] = true;
+    std::vector<bool> usedNow(experts, false);
+    for (uint32_t e : used) usedNow[e] = true;
+    std::vector<uint32_t> freeNow, freeAfterFirst;
+    for (uint32_t slot = 0; slot < cache.capacity; ++slot) {
+      const int16_t holder = cache.slotToExpert[slot];
+      if (holder < 0 || !usedNow[holder]) freeNow.push_back(slot);
+      else if (!keep[holder]) freeAfterFirst.push_back(slot);
+    }
+    std::vector<uint32_t> keepMisses, restMisses;
+    for (uint32_t e : used)
+      if (cache.expertToSlot[e] < 0) (keep[e] ? keepMisses : restMisses).push_back(e);
+    std::vector<Wave> waves(1);
+    for (uint32_t e : hits)
+      waves[0].loads.push_back({e, static_cast<uint32_t>(cache.expertToSlot[e])});
+    size_t next = 0;
+    for (int pass = 0; pass < 2; ++pass) {
+      const auto &slots = pass ? freeAfterFirst : freeNow;
+      Wave wave;
+      wave.after = pass ? 0 : -1;
+      for (size_t i = 0; i < slots.size() && next < keepMisses.size(); ++i)
+        wave.loads.push_back({keepMisses[next++], slots[i]});
+      if (!wave.loads.empty()) waves.push_back(std::move(wave));
+    }
+    auto &staging = weights.promptStaging;
+    const uint32_t halfSlots = staging.capacity / 2;
+    std::array<int, 2> lastUser{-1, -1};
+    for (size_t i = 0, set = 0; i < restMisses.size(); set ^= 1) {
+      Wave wave;
+      wave.staging = true;
+      wave.set = static_cast<int>(set);
+      wave.after = lastUser[set];
+      for (uint32_t k = 0; k < halfSlots && i < restMisses.size(); ++k)
+        wave.loads.push_back({restMisses[i++], static_cast<uint32_t>(set * halfSlots + k)});
+      lastUser[set] = static_cast<int>(waves.size());
+      waves.push_back(std::move(wave));
+    }
+    for (const Wave &wave : waves)
+      if (!wave.staging)
+        for (const Load &load : wave.loads) {
+          const int16_t old = cache.slotToExpert[load.slot];
+          if (old >= 0 && old != static_cast<int16_t>(load.expert))
+            cache.expertToSlot[old] = -1;
+          cache.slotToExpert[load.slot] = static_cast<int16_t>(load.expert);
+          cache.expertToSlot[load.expert] = static_cast<int16_t>(load.slot);
+          cache.lruTime[load.slot] = cache.clock;
+          cache.numCached = std::max(cache.numCached, load.slot + 1);
         }
-        waveSet.push_back(part);
-      }
-      for (uint32_t slot : freeSlots) sets[0].push_back(slot);
-    }
-    const size_t loadedWaves = waves.size();
-    for (size_t next = 0; next < misses.size();) {
-      // Alternate sets, starting with the one the last stage is not using.
-      const int set = 1 - waveSet.back();
-      auto &wave = waves.emplace_back();
-      for (size_t i = 0; i < sets[set].size() && next < misses.size(); ++i, ++next)
-        wave.push_back({misses[next], sets[set][i]});
-      waveSet.push_back(set);
-    }
     // Tiles in wave order; each wave's tiles are one contiguous range.
     auto *tiles = static_cast<MoeTileDescriptor *>(buffers.tileDescriptors.contents());
     auto *grouped = static_cast<uint32_t *>(buffers.groupedRoutes.contents());
@@ -1148,7 +1194,7 @@ void Qwen4ExpTarget::addPrefill(
     std::vector<std::pair<uint32_t, uint32_t>> ranges;
     for (size_t w = 0; w < waves.size(); ++w) {
       const uint32_t begin = tile;
-      for (const Load &load : waves[w]) addTiles(load.slot, routesOf[load.expert]);
+      for (const Load &load : waves[w].loads) addTiles(load.slot, routesOf[load.expert]);
       if (w == 0) {
         std::vector<uint32_t> shared(rows);
         for (uint32_t r = 0; r < rows; ++r) shared[r] = r * routesPerRow + perToken;
@@ -1175,6 +1221,13 @@ void Qwen4ExpTarget::addPrefill(
         buffers.tileCount, buffers.groupedRoutes, buffers.routeRows,
         buffers.groupedInput, buffers.expertIntermediate, buffers.expertOutput};
     const ops::MoeWeights cacheWeights = makeCacheWeights(L);
+    ops::MoeWeights stagingWeights = cacheWeights;
+    const uint64_t stride = weights.layers[L].ffn.expertGate.expertStrideBytes;
+    stagingWeights.expertGate.packed = staging.cacheGate;
+    stagingWeights.expertUp.packed = staging.cacheUp;
+    stagingWeights.expertDown.packed = staging.cacheDown;
+    stagingWeights.expertGate.experts = stagingWeights.expertUp.experts =
+        stagingWeights.expertDown.experts = staging.capacity;
     if (!weights.prefillGateScratch) {
       // Sized for the largest chunk, not this one.
       const ops::MoePlan largest =
@@ -1184,54 +1237,46 @@ void Qwen4ExpTarget::addPrefill(
               largest.shape().expertIntermediateSize * 2,
           metal::BufferStorage::Private, "qwen4exp-prefill-gate");
     }
-    const auto &layer = weights.layers[L];
-    const uint64_t stride = layer.ffn.expertGate.expertStrideBytes;
-    char *cg = static_cast<char *>(cache.cacheGate.contents());
-    char *cu = static_cast<char *>(cache.cacheUp.contents());
-    char *cd = static_cast<char *>(cache.cacheDown.contents());
     totalStageMs += std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - ts0).count();
-    // Loads wave w's experts into their slots (bookkeeping, then the reads).
+    const auto &source = weights.layers[L].expertSource;
     auto loadWave = [&](size_t w) {
       const auto readStart = std::chrono::steady_clock::now();
+      const Wave &wave = waves[w];
       struct Miss { uint32_t expert, slot; };
       std::vector<Miss> reads;
-      for (const Load &load : waves[w]) {
-        const int16_t old = cache.slotToExpert[load.slot];
-        if (old >= 0) cache.expertToSlot[old] = -1;
-        cache.slotToExpert[load.slot] = static_cast<int16_t>(load.expert);
-        cache.expertToSlot[load.expert] = static_cast<int16_t>(load.slot);
-        cache.lruTime[load.slot] = cache.clock;
-        reads.push_back({load.expert, load.slot});
-      }
+      for (const Load &load : wave.loads) reads.push_back({load.expert, load.slot});
       totalMisses += static_cast<uint32_t>(reads.size());
-      readMissedExperts(layer.expertSource, reads.data(), reads.size(), stride,
-                        cg, cu, cd);
+      const auto &into = wave.staging ? staging : cache;
+      readMissedExperts(source, reads.data(), reads.size(), stride,
+                        static_cast<char *>(into.cacheGate.contents()),
+                        static_cast<char *>(into.cacheUp.contents()),
+                        static_cast<char *>(into.cacheDown.contents()));
       totalStageMs += std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - readStart).count();
     };
-    for (size_t w = 0; w < loadedWaves; ++w)
-      for (const Load &load : waves[w]) cache.lruTime[load.slot] = cache.clock;
+    for (const Load &load : waves[0].loads) cache.lruTime[load.slot] = cache.clock;
+    auto addWave = [&](metal::CommandGraph &stage, size_t w) {
+      if (w == 0) ops::MoE::addGather(stage, moe, moePlan);
+      ops::MoE::addExpertRange(stage, moe, waves[w].staging ? stagingWeights : cacheWeights,
+                               moePlan, backend, ranges[w].first, ranges[w].second,
+                               rangeCount(w), weights.prefillGateScratch);
+    };
     if (waves.size() == 1) {
-      ops::MoE::addGather(g, moe, moePlan);
-      ops::MoE::addExpertRange(g, moe, cacheWeights, moePlan, backend,
-                               ranges[0].first, ranges[0].second, rangeCount(0),
-                               weights.prefillGateScratch);
+      addWave(g, 0);
       ops::MoE::addCombine(g, moe, moePlan, /*addResidual=*/false);
       totalSlices += 1;
       return;
     }
-    // One pipelined submission, a stage per wave: stage w waits for the host
-    // to finish wave w's reads, which wait for stage w - 2 to free its slots.
+    // One pipelined submission, a stage per wave. Stage w starts once the
+    // host has read wave w, which first waits for the last stage that read
+    // the same staging half.
     std::deque<metal::CommandGraph> stages;
     std::vector<metal::ComputeDispatch> all;
     std::vector<size_t> starts;
     for (size_t w = 0; w < waves.size(); ++w) {
       metal::CommandGraph &stage = stages.emplace_back();
-      if (w == 0) ops::MoE::addGather(stage, moe, moePlan);
-      ops::MoE::addExpertRange(stage, moe, cacheWeights, moePlan, backend,
-                               ranges[w].first, ranges[w].second, rangeCount(w),
-                               weights.prefillGateScratch);
+      addWave(stage, w);
       starts.push_back(all.size());
       for (const auto &d : stage.dispatches()) all.push_back(d);
     }
@@ -1239,17 +1284,10 @@ void Qwen4ExpTarget::addPrefill(
     const auto gpuStart = std::chrono::steady_clock::now();
     metal::CommandTicket ticket = backend.submitPipelineAsync(all, starts, base);
     for (size_t w = 1; w < waves.size(); ++w) {
-      if (w >= loadedWaves) {
-        // Wait for the last stage that read this wave's slot set.
-        static const bool serial = std::getenv("SPLASH_PREFILL_SERIAL_WAVES") != nullptr;
-        for (size_t before = w; before-- > 0;)
-          if (serial || waveSet[before] == waveSet[w]) {
-            if (!backend.waitPipelineStageDone(base, static_cast<uint32_t>(before), 60000))
-              throw std::runtime_error("prompt expert wave timed out");
-            break;
-          }
-        loadWave(w);
-      }
+      if (waves[w].after >= 0 &&
+          !backend.waitPipelineStageDone(base, static_cast<uint32_t>(waves[w].after), 60000))
+        throw std::runtime_error("prompt expert wave timed out");
+      loadWave(w);
       backend.signalPipelineEvent(base + 2 * w);
     }
     (void)ticket.wait();
@@ -1987,18 +2025,33 @@ void Qwen4ExpTarget::addVerify(
     const uint32_t k = weights.layout.expertsPerToken;
     const uint32_t tileRows = moePlan.tileRows();
     const uint32_t experts = moePlan.shape().experts;
-    std::vector<std::vector<uint32_t>> byExpert(experts);
+    // Counting sort of the live routes by slot, without allocating: a
+    // step has at most rows x k of them.
+    std::array<uint16_t, 513> start{};
+    std::array<uint32_t, ExecutionLimits::maximumBatchWidth *
+                             ExecutionLimits::targetVerifyRows * 16> sorted;
     for (uint32_t r = 0; r < rows; ++r)
       for (uint32_t j = 0; j <= k; ++j) {
         const uint32_t route = r * hostRoutesPerRow + j;
         routeRows[route] = 0xFFFFFFFFu;
         if (!isLive(r) || j == k) continue;
         const uint32_t e = selected[route];
-        if (e < experts) byExpert[e].push_back(route);
+        if (e < experts) ++start[e + 1];
       }
+    for (uint32_t e = 0; e < experts; ++e) start[e + 1] += start[e];
+    std::array<uint16_t, 512> fill{};
+    for (uint32_t r = 0; r < rows; ++r) {
+      if (!isLive(r)) continue;
+      for (uint32_t j = 0; j < k; ++j) {
+        const uint32_t route = r * hostRoutesPerRow + j;
+        const uint32_t e = selected[route];
+        if (e < experts) sorted[start[e] + fill[e]++] = route;
+      }
+    }
     uint32_t tile = 0;
     for (uint32_t e = 0; e < experts; ++e) {
-      const auto &routes = byExpert[e];
+      const std::span<const uint32_t> routes(sorted.data() + start[e],
+                                             start[e + 1] - start[e]);
       for (uint32_t first = 0; first < routes.size(); first += tileRows) {
         const uint32_t count = std::min<uint32_t>(tileRows, routes.size() - first);
         tiles[tile] = MoeTileDescriptor{e, count};

@@ -31,7 +31,8 @@ namespace splash::model {
 struct Qwen4ExpLayout final {
   // 0011: mixer projections 8-bit (they were 4-bit in 0001; see
   // dev/benchmarks/qwen4exp/reference_logits.py --quant for why).
-  static constexpr std::string_view layerMagic = "MDFN0011";
+  // 0021: hyper-connection mix weights 8-bit as well.
+  static constexpr std::string_view layerMagic = "MDFN0021";
 
   // Provisional: the draft is deferred, so these five indices are evenly
   // spaced rather than chosen against a trained DFlash 2 draft.
@@ -203,15 +204,29 @@ struct Qwen4ExpLayout final {
 //
 //   x = x + outer(inj, y)               [hc,d], flattened back to H
 //
-// The mix projections are stored bf16, not Q4: the down projection is 320
-// wide, which is not a multiple of either tile width.
+// The mix projections are 8-bit, row-major (not tiled: the down projection
+// is 320 wide, not a multiple of a tile), with a bf16 scale and bias per 64
+// weights along each row: w = code * scale + bias.
+// The down projection splits its 10240-long dot products across this many
+// threadgroups when a call has at most kHyperDownSplitRows rows.
+inline constexpr uint32_t kHyperDownSplits = 10;
+inline constexpr uint32_t kPromptStagingExperts = 144;
+inline constexpr uint32_t kHyperDownSplitRows = 32;
+
 struct Qwen4ExpHyperConnection final {
   metal::MetalBuffer norm;         // hyperConnectionWidth
-  metal::MetalBuffer mixDown;      // lowRank x hyperConnectionWidth
-  metal::MetalBuffer mixUp;        // hyperConnectionWidth x lowRank
+  metal::MetalBuffer mixDown;      // lowRank x hyperConnectionWidth codes
+  metal::MetalBuffer mixDownScales;
+  metal::MetalBuffer mixDownBiases;
+  metal::MetalBuffer mixUp;        // hyperConnectionWidth x lowRank codes
+  metal::MetalBuffer mixUpScales;
+  metal::MetalBuffer mixUpBiases;
   // Absent on the final mixer, which collapses the streams before the head
   // and never injects a block result back (use_combine=False upstream).
   std::optional<metal::MetalBuffer> blockInject;  // count x width
+  // Scratch for the split down projection's partial sums, shared by every
+  // hyper-connection (they run one at a time).
+  metal::MetalBuffer downPartials;
 };
 
 // The per-layer embedding on layer ngramLayer. It gathers a hashed n-gram
@@ -350,8 +365,14 @@ struct Qwen4ExpWeights final {
   void prefetchStreamingExperts() const noexcept;
   void evictStreamingExperts() const noexcept;
 
+  // Where a prompt's missing experts are read, so they never evict decode's
+  // cached ones: two halves of kPromptStagingExperts / 2 experts each.
+  mutable Qwen4ExpLayerExpertCache promptStaging;
+
   [[nodiscard]] uint64_t expertCacheActualAllocatedBytes() const noexcept {
-    uint64_t total = 0;
+    uint64_t total = promptStaging.cacheGate.sizeBytes() +
+                     promptStaging.cacheUp.sizeBytes() +
+                     promptStaging.cacheDown.sizeBytes();
     for (const auto &layer : layers) {
       total += layer.expertCache.cacheGate.sizeBytes();
       total += layer.expertCache.cacheUp.sizeBytes();

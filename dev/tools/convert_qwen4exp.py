@@ -162,10 +162,12 @@ def quantized_tile(values, storage_n=STORAGE_N, group=GROUP, pad_to=None):
 # 0011-0013: the mixer projections, the output head and the token embedding
 # are 8-bit. At 4-bit they cost the most quality of anything but the experts
 # (reference_logits.py --quant: same top pick 81% -> 89% on the code prompt).
-LAYER_MAGIC = b"MDFN0011"
-HEAD_MAGIC = b"MDFN0014"  # 0014 adds the 4-bit draft head
+# 0021-0025: the hyper-connection mix weights are 8-bit too (a byte each,
+# bf16 scale and bias per 64), halving the ~1.3 GB of them read every step.
+LAYER_MAGIC = b"MDFN0021"
+HEAD_MAGIC = b"MDFN0024"  # 8-bit logits, 4-bit draft copy, 8-bit mixer
 EMBEDDING_MAGIC = b"MDFN0013"
-OLD_LAYER_MAGIC = b"MDFN0001"
+OLD_LAYER_MAGIC = b"MDFN0011"
 NGRAM_MAGIC = b"MDFN0004"
 DRAFT_MAGIC = b"MDFD0004"
 VISION_MAGIC = b"MDFV0001"
@@ -216,10 +218,18 @@ def q8_bytes(out_size: int, in_size: int) -> int:
     return elements + 2 * (elements // GROUP) * BF16
 
 
-def hyper_sections(with_inject: bool) -> list[tuple[int, str]]:
+def hyper_sections(with_inject: bool, eight_bit: bool = True) -> list[tuple[int, str]]:
     width = hyper_width() * BF16
     mix = LAYOUT["hyper_low_rank"] * width
-    out = [(width, "hyper-norm"), (mix, "hyper-mix-down"), (mix, "hyper-mix-up")]
+    out = [(width, "hyper-norm")]
+    if eight_bit:
+        codes = mix // BF16
+        parameters = codes // GROUP * BF16
+        for name in ("down", "up"):
+            out += [(codes, f"hyper-mix-{name}"), (parameters, f"hyper-mix-{name}-scales"),
+                    (parameters, f"hyper-mix-{name}-biases")]
+    else:
+        out += [(mix, "hyper-mix-down"), (mix, "hyper-mix-up")]
     # The final mixer collapses the streams before the head and never writes a
     # block result back, so it carries no injection weight.
     if with_inject:
@@ -244,13 +254,15 @@ def expert_sections() -> list[tuple[int, str]]:
 
 
 def layer_sections(index: int, eight_bit: bool = True,
-                   full: bool | None = None) -> tuple[int, list[tuple[int, str]]]:
-    """Sections of a layer file; eight_bit=False is the 0001 layout."""
+                   full: bool | None = None,
+                   hyper_eight_bit: bool = True) -> tuple[int, list[tuple[int, str]]]:
+    """Sections of a layer file: 0021 by default, 0011 with
+    hyper_eight_bit=False, 0001 with both False."""
     hidden = LAYOUT["hidden"]
     if full is None:
         full = (index + 1) % LAYOUT["full_attention_period"] == 0
     mixer = q8_bytes if eight_bit else q4_bytes
-    entries = hyper_sections(True)
+    entries = hyper_sections(True, hyper_eight_bit)
     if full:
         entries += [
             (mixer(LAYOUT["packed_full"], hidden), "attention-input"),
@@ -270,7 +282,7 @@ def layer_sections(index: int, eight_bit: bool = True,
             (LAYOUT["head_dimension"] * BF16, "gdn-norm"),
             (mixer(hidden, LAYOUT["attention_width"]), "gdn-output"),
         ]
-    entries += hyper_sections(True) + expert_sections()
+    entries += hyper_sections(True, hyper_eight_bit) + expert_sections()
     return (1 if full else 0), entries
 
 
@@ -315,10 +327,15 @@ def ngram_sections() -> list[tuple[int, str]]:
 
 
 def write_hyper(packed, source: Checkpoint, prefix: str, with_inject: bool):
-    """Order matches readHyperConnection: norm, mix down, mix up, inject."""
+    """Order matches readHyperConnection: norm, mix down and mix up (each as
+    8-bit codes then a bf16 scale and bias per 64, row-major), inject."""
     packed.section(source.raw(prefix + ".hc_norm.weight"))
-    packed.section(source.raw(prefix + ".input_mix_weight_down.weight"))
-    packed.section(source.raw(prefix + ".input_mix_weight_up.weight"))
+    for name in ("input_mix_weight_down", "input_mix_weight_up"):
+        codes, scales, biases = quantize_affine(source.tensor(f"{prefix}.{name}.weight"),
+                                                group=GROUP, bits=8)
+        packed.section(codes.tobytes())
+        packed.section(scales.tobytes())
+        packed.section(biases.tobytes())
     if with_inject:
         packed.section(source.raw(prefix + ".block_inject_weight.weight"))
 
@@ -466,25 +483,23 @@ def write_gdn(packed, source: Checkpoint, linear: str) -> None:
 
 def requantize_layer(source: Checkpoint, path: Path, index: int, prefix: str,
                      full: bool) -> int:
-    """Rewrite a 0001 layer file as 0011: the mixer is requantized from the
-    checkpoint at 8 bits, and everything else - both hyper-connections and
-    the 4-bit experts - is copied byte for byte. Much faster than a full
-    conversion and needs one layer file of spare disk, not a package."""
-    kind, old = layer_sections(index, eight_bit=False, full=full)
+    """Rewrite a 0011 layer file as 0021: both hyper-connections are
+    requantized from the checkpoint at 8 bits; the mixer and the experts are
+    copied byte for byte. Needs one layer file of spare disk."""
+    kind, old = layer_sections(index, full=full, hyper_eight_bit=False)
     magic, _, old_kind, sections = read_sections(path, [size for size, _ in old])
     if magic != OLD_LAYER_MAGIC or old_kind != kind:
         raise ValueError(f"{path.name}: expected a {OLD_LAYER_MAGIC!r} layer, found {magic!r}")
-    mixer_count = len(old) - 2 * len(hyper_sections(True)) - len(expert_sections())
-    hyper = len(hyper_sections(True))
+    hyper = len(hyper_sections(True, False))
+    experts = len(expert_sections())
+    mixer = sections[hyper:len(sections) - hyper - experts]
     temporary = path.with_suffix(".bin.partial")
     packed = WeightFile(temporary, LAYER_MAGIC, index, kind)
-    for section in sections[:hyper]:
+    write_hyper(packed, source, prefix + ".attn_hyper_connection", True)
+    for section in mixer:
         packed.section(section)
-    if full:
-        write_attention(packed, source, prefix + ".self_attn")
-    else:
-        write_gdn(packed, source, prefix + ".linear_attn")
-    for section in sections[hyper + mixer_count:]:
+    write_hyper(packed, source, prefix + ".mlp_hyper_connection", True)
+    for section in sections[len(sections) - experts:]:
         packed.section(section)
     written = packed.finish()
     temporary.replace(path)
@@ -568,7 +583,7 @@ def write_head(source: Checkpoint, destination: Path) -> int:
     return packed.finish()
 
 
-MTP_COMBINER_MAGIC = b"MDFN0005"
+MTP_COMBINER_MAGIC = b"MDFN0025"
 
 
 def write_mtp(source: Checkpoint, destination: Path) -> int:
@@ -596,6 +611,10 @@ def write_mtp(source: Checkpoint, destination: Path) -> int:
     write_experts(packed, source, prefix + ".mlp")
     total = packed.finish()
 
+    return total + write_mtp_combiner(source, destination)
+
+
+def write_mtp_combiner(source: Checkpoint, destination: Path) -> int:
     combiner = WeightFile(destination / "mtp-combiner.bin", MTP_COMBINER_MAGIC,
                           LAYOUT["layers"], 3)
     combiner.section(source.raw("mtp.pre_fc_norm_embedding.weight"))
@@ -603,7 +622,7 @@ def write_mtp(source: Checkpoint, destination: Path) -> int:
     combiner.section(quantized_tile(source.tensor("mtp.fc_embedding.weight")))
     combiner.section(quantized_tile(source.tensor("mtp.fc_hidden.weight")))
     write_hyper(combiner, source, "mtp.hyper_connection_mixer", False)
-    return total + combiner.finish()
+    return combiner.finish()
 
 
 def write_embedding(source: Checkpoint, destination: Path) -> int:
@@ -879,8 +898,8 @@ def main() -> int:
     parser.add_argument("--source", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--requantize-mixers", action="store_true",
-                        help="rewrite an existing 0001 package's layer files "
-                        "with 8-bit mixers, keeping its experts")
+                        help="rewrite an existing 0011 package's layer files with 8-bit "
+                        "hyper-connections, keeping its mixers and experts")
     parser.add_argument("--head-only", action="store_true",
                         help="rewrite only head.bin in an existing package")
     parser.add_argument("--mtp-only", action="store_true",
@@ -924,10 +943,10 @@ def main() -> int:
         written = requantize_layer(source, target / "mtp-layer.bin",
                                    LAYOUT["layers"], "mtp.layers.0", True)
         print(f"  mtp-layer.bin {written / 2**30:.2f} GiB", flush=True)
+        write_mtp_combiner(source, target)
+        print("  mtp-combiner.bin", flush=True)
         write_head(source, target)
         print("  head.bin", flush=True)
-        write_embedding(source, target)
-        print("  embedding.bin", flush=True)
         manifest_path = arguments.destination / "manifest.json"
         manifest = json.loads(manifest_path.read_text())
         manifest["format"]["target_layer_magic"] = LAYER_MAGIC.decode()

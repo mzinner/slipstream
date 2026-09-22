@@ -351,30 +351,44 @@ kernel void hyper_connection_rms(
 // so it is read from device memory once per threadgroup rather than once
 // per output, and each weight element is read exactly once.
 constant constexpr uint kDownSlice = 512;
+inline float hc_down_activation(float total, bool is_inject, uint count) {
+  const float v = total / float(count);
+  return is_inject ? 2.0f / (1.0f + exp(-v)) : v / (1.0f + exp(-v));
+}
+
 kernel void hyper_connection_down(
     device const bfloat *normalized [[buffer(0)]],
-    device const bfloat *down [[buffer(1)]],
-    device const bfloat *inject [[buffer(2)]],
-    device bfloat *reduced [[buffer(3)]],
-    device bfloat *injection [[buffer(4)]],
-    constant HyperConnectionParams &params [[buffer(5)]],
-    uint group [[threadgroup_position_in_grid]],
+    device const uchar *down [[buffer(1)]],
+    device const bfloat *down_scales [[buffer(2)]],
+    device const bfloat *down_biases [[buffer(3)]],
+    device const bfloat *inject [[buffer(4)]],
+    device bfloat *reduced [[buffer(5)]],
+    device bfloat *injection [[buffer(6)]],
+    device float *partials [[buffer(7)]],
+    constant HyperConnectionParams &params [[buffer(8)]],
+    uint2 group2 [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   const uint width = params.count * params.hidden;
   const uint outputs = params.low_rank + (params.with_inject ? params.count : 0);
+  const uint group = group2.x;
+  const uint splits = max(params.splits, 1u);
+  const uint per_split = width / splits;
   const uint output = group * kSimdgroups + simd_group;
   const bool active = output < outputs;
   const bool is_inject = output >= params.low_rank;
-  device const bfloat *w = active ? (is_inject ? inject + ulong(output - params.low_rank) * width
-                                               : down + ulong(output) * width)
-                                  : down;
+  // Low-rank rows are 8-bit (scale and bias per 64); the few inject rows
+  // stay bf16. The branch is uniform across a simdgroup (one output each).
+  device const bfloat *w = inject + ulong(active && is_inject ? output - params.low_rank : 0) * width;
+  const ulong row_codes = ulong(active && !is_inject ? output : 0) * width;
+  const ulong row_groups = row_codes / 64;
   threadgroup float4 staged[kRowBlock][kDownSlice / 4];
   for (uint first = 0; first < params.rows; first += kRowBlock) {
     const uint count = min(kRowBlock, params.rows - first);
     float acc[kRowBlock] = {0};
-    for (uint slice = 0; slice < width; slice += kDownSlice) {
+    for (uint slice = group2.y * per_split; slice < (group2.y + 1) * per_split;
+         slice += kDownSlice) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
       for (uint e = thread_index; e < kRowBlock * kDownSlice / 4; e += kThreads) {
         const uint r = e / (kDownSlice / 4), c = e % (kDownSlice / 4);
@@ -384,10 +398,18 @@ kernel void hyper_connection_down(
             : float4(0);
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (active) {
+      if (active && is_inject) {
         device const bfloat4 *w4 = reinterpret_cast<device const bfloat4 *>(w + slice);
         for (uint i = simd_lane; i < kDownSlice / 4; i += kSimdWidth) {
           const float4 wv = float4(w4[i]);
+          for (uint r = 0; r < kRowBlock; ++r)
+            acc[r] += dot(wv, staged[r][i]);
+        }
+      } else if (active) {
+        device const uchar4 *c4 = reinterpret_cast<device const uchar4 *>(down + row_codes + slice);
+        for (uint i = simd_lane; i < kDownSlice / 4; i += kSimdWidth) {
+          const ulong g = row_groups + (slice + 4 * i) / 64;
+          const float4 wv = float4(c4[i]) * float(down_scales[g]) + float(down_biases[g]);
           for (uint r = 0; r < kRowBlock; ++r)
             acc[r] += dot(wv, staged[r][i]);
         }
@@ -396,16 +418,41 @@ kernel void hyper_connection_down(
     for (uint r = 0; r < kRowBlock; ++r) {
       const float total = simd_sum(acc[r]);
       if (active && simd_lane == 0 && r < count) {
-        const float v = total / float(params.count);
-        if (is_inject)
+        if (splits > 1) {
+          partials[(ulong(group2.y) * params.rows + first + r) * outputs + output] = total;
+        } else if (is_inject) {
           injection[hc_row(params, first + r) * params.count + (output - params.low_rank)] =
-              bfloat(2.0f / (1.0f + exp(-v)));
-        else
+              bfloat(hc_down_activation(total, true, params.count));
+        } else {
           reduced[hc_row(params, first + r) * params.low_rank + output] =
-              bfloat(v / (1.0f + exp(-v)));
+              bfloat(hc_down_activation(total, false, params.count));
+        }
       }
     }
   }
+}
+
+// 2b. Sums hyper_connection_down's split partials and applies its activation.
+// One thread per (row, output).
+kernel void hyper_connection_down_finish(
+    device const float *partials [[buffer(0)]],
+    device bfloat *reduced [[buffer(1)]],
+    device bfloat *injection [[buffer(2)]],
+    constant HyperConnectionParams &params [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+  const uint outputs = params.low_rank + (params.with_inject ? params.count : 0);
+  if (index >= params.rows * outputs)
+    return;
+  const uint row = index / outputs, output = index % outputs;
+  float total = 0.0f;
+  for (uint split = 0; split < params.splits; ++split)
+    total += partials[(ulong(split) * params.rows + row) * outputs + output];
+  const bool is_inject = output >= params.low_rank;
+  const bfloat value = bfloat(hc_down_activation(total, is_inject, params.count));
+  if (is_inject)
+    injection[hc_row(params, row) * params.count + (output - params.low_rank)] = value;
+  else
+    reduced[hc_row(params, row) * params.low_rank + output] = value;
 }
 
 // 3. mixed = mean over streams of sigmoid(up . reduced) * xn.
@@ -416,9 +463,11 @@ kernel void hyper_connection_down(
 kernel void hyper_connection_up_mix(
     device const bfloat *normalized [[buffer(0)]],
     device const bfloat *reduced [[buffer(1)]],
-    device const bfloat *up [[buffer(2)]],
-    device bfloat *mixed [[buffer(3)]],
-    constant HyperConnectionParams &params [[buffer(4)]],
+    device const uchar *up [[buffer(2)]],
+    device const bfloat *up_scales [[buffer(3)]],
+    device const bfloat *up_biases [[buffer(4)]],
+    device bfloat *mixed [[buffer(5)]],
+    constant HyperConnectionParams &params [[buffer(6)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
@@ -432,12 +481,16 @@ kernel void hyper_connection_up_mix(
   // This lane's slice of the position's four up rows.
   float w[kStreams][kPerLane];
   for (uint k = 0; k < kStreams; ++k) {
-    device const bfloat2 *row2 = reinterpret_cast<device const bfloat2 *>(
-        up + ulong(k * hidden + position) * kLowRank + simd_lane * kPerLane);
+    const ulong row = ulong(k * hidden + position);
+    device const uchar2 *codes2 = reinterpret_cast<device const uchar2 *>(
+        up + row * kLowRank + simd_lane * kPerLane);
     for (uint j = 0; j < kPerLane / 2; ++j) {
-      const float2 v = float2(row2[j]);
-      w[k][2 * j] = v.x;
-      w[k][2 * j + 1] = v.y;
+      const float2 v = float2(codes2[j]);
+      // The pair never straddles a group: 64 and the lane's 10 are even.
+      const ulong g = row * (kLowRank / 64) + (simd_lane * kPerLane + 2 * j) / 64;
+      const float scale = float(up_scales[g]), bias = float(up_biases[g]);
+      w[k][2 * j] = v.x * scale + bias;
+      w[k][2 * j + 1] = v.y * scale + bias;
     }
   }
   for (uint first = 0; first < params.rows; first += kRowBlock) {
