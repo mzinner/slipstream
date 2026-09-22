@@ -851,6 +851,11 @@ MetalBuffer MetalBackend::allocateBuffer(uint64_t bytes,
         options:options];
     if (!buffer) throw MetalAllocationError("Metal buffer allocation failed");
     if (!label.empty()) buffer.label = checkedNSString(label, "buffer label");
+    static const bool logAllocations = getenv("SPLASH_LOG_ALLOCATIONS") != nullptr;
+    if (logAllocations && bytes >= (1u << 20)) {
+        fprintf(stderr, "[alloc] %8.1f MiB %.*s\n", double(bytes) / 1048576.0,
+                int(label.size()), label.data());
+    }
     return impl_->registerBuffer(buffer, storage);
 }
 

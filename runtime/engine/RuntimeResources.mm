@@ -390,30 +390,16 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     };
 
     // A target whose experts alone outgrow the working set cannot be planned
-    // as if every weight were held at once. Those weights are mapped read-only
-    // from the package, so their pages are file-backed and the kernel can drop
-    // and refetch them; what the budget has to hold is a cache, not the whole
-    // of them. The cache is whatever the budget can spare once the resident
-    // weights and the smallest useful dynamic reserve are paid for, so it
-    // follows the machine rather than a constant.
+    // as if every weight were held at once. Those weights are read from the
+    // package on demand; what the budget has to hold is the expert cache,
+    // which the model has already sized and allocated (the same budget
+    // llama.cpp's stream cache gets). Plan that exact size, so the audit
+    // compares like with like; the plan below still rejects it if the rest
+    // no longer fits.
     if (const uint64_t streamable = package.streamableWeightBytes()) {
-      const uint64_t hardBudget = EngineMemoryPolicy::hardBudgetBytes(
-          device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
-      uint64_t committed = footprint.targetWeightsBytes - streamable;
-      for (uint64_t value :
-           {footprint.draftWeightsBytes, footprint.visionWeightsBytes,
-            footprint.sharedPrefillBytes, footprint.sharedDecodeBytes,
-            footprint.pipelineReserveBytes,
-            footprint.runtimeOverheadReserveBytes}) {
-        committed += value;
-      }
-      const uint64_t spare =
-          hardBudget > committed ? hardBudget - committed : 0;
-      // Leave room for the KV pool and request state; a cache that consumed
-      // the whole remainder would plan a model that cannot serve anything.
-      const uint64_t reserved = spare / 4;
       footprint.streamableWeightsBytes = streamable;
-      footprint.streamCacheBytes = std::min(streamable, spare - reserved);
+      footprint.streamCacheBytes =
+          std::min(streamable, package.streamCacheActualAllocatedBytes());
     }
 
     ModelMemoryProfile modelProfile{

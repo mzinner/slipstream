@@ -133,10 +133,19 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
                 "unclassified memory sum overflowed", actual);
   }
   if (unclassified > reserves) {
-    return fail(
-        MemoryAuditError::RuntimeReserveExceeded,
-        "pipeline and runtime allocations exceed their explicit reserve",
-        actual);
+    std::ostringstream message;
+    message << "pipeline and runtime allocations exceed their explicit "
+               "reserve: backend unclassified "
+            << backendUnclassified << ", device untracked " << deviceUntracked
+            << ", reserve " << reserves << "; target " << actual.targetWeightsBytes
+            << ", stream cache " << actual.streamCacheBytes << ", draft "
+            << actual.draftWeightsBytes << ", vision " << actual.visionWeightsBytes
+            << ", prefill " << actual.sharedPrefillBytes << ", decode "
+            << actual.sharedDecodeBytes << ", kv " << actual.kvResidentBytes
+            << ", state " << actual.stateResidentBytes << ", backend "
+            << actual.backendAllocatedBytes;
+    return fail(MemoryAuditError::RuntimeReserveExceeded, message.str(),
+                actual);
   }
   uint64_t difference =
       actual.devicePeakAllocatedBytes > actual.estimatedWarmupPeakBytes
