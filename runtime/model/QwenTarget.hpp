@@ -315,6 +315,10 @@ struct QwenTargetVerifyBuffers final {
   uint32_t kvPageCount = 0;
   std::array<QwenMtpLane, ExecutionLimits::maximumBatchWidth> mtp{};
   metal::MetalBuffer proposedTokens;
+  // The draft's distribution per proposal as the acceptance reads it: 16
+  // candidate ids and their probabilities.
+  metal::MetalBuffer proposalCandidates;
+  metal::MetalBuffer proposalProbabilities;
   std::array<metal::MetalBuffer, 2> hidden;
   metal::MetalBuffer normalized;
   metal::MetalBuffer recurrent;

@@ -774,12 +774,13 @@ struct Runtime::Impl {
     const auto *weights = std::get_if<Qwen4ExpWeights>(&package.target);
     return weights && weights->mtpLayer && !std::getenv("SPLASH_NO_MTP");
   }
-  // MTP guesses are verified, not only measured. Greedy requests only: a
-  // sampled request's acceptance needs the head's probabilities.
+  // MTP guesses are verified, not only measured. The head drafts its top
+  // token and reports it as certain, so a sampled request keeps each guess
+  // with the target's own probability and resamples from the rest on a
+  // rejection: its output distribution is exactly the target's.
   static constexpr uint32_t kMtpProposals = 3;
-  bool mtpProposing(const Request &entry) const noexcept {
-    return mtpDrafting() && !std::getenv("SPLASH_MTP_SHADOW") &&
-           !samplingEnabled(entry);
+  bool mtpProposing(const Request &) const noexcept {
+    return mtpDrafting() && !std::getenv("SPLASH_MTP_SHADOW");
   }
 
   uint32_t retainedRowLimit(uint32_t remaining,
@@ -1295,6 +1296,8 @@ struct Runtime::Impl {
       buffers.liveRowsPerLane = 1 + kMtpProposals;
     buffers.kvPageCount = kvPages.pageCount();
     buffers.proposedTokens = d(DecodeTensor::ProposedTokens);
+    buffers.proposalCandidates = d(DecodeTensor::Candidates);
+    buffers.proposalProbabilities = d(DecodeTensor::ProposalProbs);
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       buffers.mtp[lane] = laneEntry(entries, lane).mtp;
       buffers.mtp[lane].pageTable = items[lane].pageTable;

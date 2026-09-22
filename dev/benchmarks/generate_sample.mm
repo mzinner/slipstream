@@ -166,6 +166,16 @@ int main(int argc, char **argv) {
         request.id = laneId;
         request.prompt.assign(prompt.begin(), prompt.end());
         request.maxNewTokens = maxTokens;
+        // SPLASH_TEMPERATURE=t samples instead of taking the top token.
+        if (const char *temperature = std::getenv("SPLASH_TEMPERATURE")) {
+          request.sampling.temperature = static_cast<float>(std::atof(temperature));
+          if (request.sampling.temperature > 0.0f) {
+            // Qwen's recommended sampling: top-k 20, top-p 0.95.
+            request.sampling.topK = 20;
+            request.sampling.topP = 0.95f;
+            request.cohort = BatchCohort::Sampling;
+          }
+        }
         executor.beginColdRequest(request.modelView(), slot);
 
         // Prefill phase
@@ -176,7 +186,7 @@ int main(int argc, char **argv) {
           const uint32_t count = std::min<uint32_t>(
               model::ExecutionLimits::prefillTokenBudget,
               static_cast<uint32_t>(prompt.size()) - offset);
-          BatchPlan plan{WorkKind::Prefill, BatchCohort::Greedy,
+          BatchPlan plan{WorkKind::Prefill, request.cohort,
                          {{laneId, count, offset}}, DecodeStage::Regular};
           ModelBatchItem item{laneId, slot, offset, offset, count, lanePages};
           item.inputTokens =
@@ -229,7 +239,7 @@ int main(int argc, char **argv) {
         uint64_t position = prompt.size();
         uint32_t totalGenerated = static_cast<uint32_t>(generatedTokens.size());
         while (totalGenerated < maxTokens) {
-          BatchPlan plan{WorkKind::Decode, BatchCohort::Greedy,
+          BatchPlan plan{WorkKind::Decode, request.cohort,
                          {{laneId, 0, 0}}, DecodeStage::Regular};
           ModelBatchItem item{laneId, slot, position, 0, 0, lanePages};
 

@@ -1881,8 +1881,16 @@ void Qwen4ExpTarget::addVerify(
       // The verify rows are the anchor then these proposals. Past the third
       // the proposals repeat it: the retained-row cap keeps them from counting.
       auto *proposed = static_cast<uint32_t *>(buffers.proposedTokens.contents());
-      for (uint32_t k = 0; k < ExecutionLimits::draftProposalTokens; ++k)
+      auto *candidates = static_cast<uint32_t *>(buffers.proposalCandidates.contents());
+      auto *probabilities = static_cast<float *>(buffers.proposalProbabilities.contents());
+      for (uint32_t k = 0; k < ExecutionLimits::draftProposalTokens; ++k) {
         proposed[k] = drafts[std::min<uint32_t>(k, 2)];
+        // A one-point draft distribution: the guess, with certainty.
+        for (uint32_t c = 0; c < 16; ++c) {
+          candidates[k * 16 + c] = c == 0 ? proposed[k] : UINT32_MAX;
+          probabilities[k * 16 + c] = c == 0 ? 1.0f : 0.0f;
+        }
+      }
     }
     // Score each guess when the token it guessed is decided. The anchor of
     // this step is the target's token at position firstPosition + rows.
