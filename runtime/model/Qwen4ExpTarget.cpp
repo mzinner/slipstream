@@ -1933,7 +1933,6 @@ void Qwen4ExpTarget::addVerify(
     auto &cache = weights.layers[layer].expertCache;
     const auto *predictedScores =
         static_cast<const uint16_t *>(weights.predictScratch.contents());
-    const uint32_t perToken = weights.layout.expertsPerToken;
     const uint32_t width = moePlan.shape().routerWidth();
     struct Miss { uint32_t expert; uint32_t slot; };
     std::vector<Miss> misses;
@@ -1948,7 +1947,7 @@ void Qwen4ExpTarget::addVerify(
         const char *value = std::getenv("SPLASH_LOOKAHEAD_EXPERTS");
         return value ? static_cast<uint32_t>(std::atoi(value)) : 10u;
       }();
-      const uint32_t guesses = std::clamp(widened, perToken, 16u);
+      const uint32_t guesses = std::clamp(widened, 1u, 16u);
       uint32_t ids[16];
       topExperts(predictedScores + uint64_t{r} * width, weights.layout.experts,
                  16, ids, nullptr);
