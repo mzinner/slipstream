@@ -1,6 +1,6 @@
 # Status — qwen4exp (Qwen3.8-Flash-Next) in Splash
 
-**Updated:** 2026-09-22 08:30 PDT by claude-code
+**Updated:** 2026-09-22 09:15 PDT by claude-code
 **Branch:** `qwen4exp-review` (not pushed; never push to upstream `incoai/splash`)
 
 ## In one line
@@ -43,9 +43,13 @@ shared-event hand-off, and shared-memory flags cannot replace it — probe in
 2. **SSD miss reads** ~17 ms/step: lookahead foresees 66% of used experts
    (top-16 would 79%). A second prediction two layers ahead was tried and
    rejected (misses 59 -> 56 at best, tok/s down: its reads compete).
-3. **GPU<->host hand-offs** ~8 ms/step (48 x ~164 us): removing them needs
-   GPU-side routing with a GPU-visible slot table.
-4. **Drafting** ~13 ms/step (two blocking GPU round trips per guess).
+3. **GPU<->host hand-offs** ~8 ms/step (48 x ~164 us): structural. Routing
+   can't move to the GPU without a mid-command-buffer host->GPU signal, and
+   Metal doesn't make host writes visible there (probe: handoff_latency.mm).
+4. **Drafting** ~13 ms/step: mostly real GPU work (~2 ms a guess, half of it
+   the 318 MB draft output layer). Merging its two round trips per guess
+   would save ~1 ms/step; shrinking the draft vocabulary would cost more in
+   acceptance than it saves.
 5. Expert quantization: group-32 and range-search simulated *worse* than the
    current format despite lower weight error - unexplained, worth a look.
 6. 27B regression check needs a 4-bit 27B package.
