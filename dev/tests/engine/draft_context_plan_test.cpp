@@ -277,7 +277,7 @@ void testInvalidInputs() {
   threw = false;
   try {
     const auto plan = activePlan(0, 4096);
-    (void)draftCaptureSpansForDispatch(plan, 0, 2049);
+    (void)draftCaptureSpansForDispatch(plan, 0, SPLASH_PREFILL_TOKEN_BUDGET + 1);
   } catch (const std::invalid_argument &) {
     threw = true;
   }

@@ -26,7 +26,6 @@ constexpr auto kExecutionGeometry = std::to_array<GeometryField>(
      {"draft_query_rows", ExecutionLimits::draftQueryRows},
      {"draft_sliding_window", ExecutionLimits::draftContextTokens},
      {"maximum_batch_width", ExecutionLimits::maximumBatchWidth},
-     {"prefill_token_budget", ExecutionLimits::prefillTokenBudget},
      {"target_kv_block_tokens", kv::kPageTokens},
      {"target_verify_rows", ExecutionLimits::targetVerifyRows}});
 
@@ -130,6 +129,18 @@ void requireEqual(std::string_view actual, std::string_view expected,
                                 std::string(actual) + ", runtime " +
                                 std::string(expected));
   }
+}
+
+// The package's prompt chunk: whole KV pages, at most the built maximum.
+uint32_t packagePrefillChunk(NSDictionary *manifest) {
+  NSDictionary *geometry =
+      requireObject(manifest, @"execution_geometry", "execution geometry");
+  const uint64_t value =
+      requireUnsigned(geometry, @"prefill_token_budget", "prefill_token_budget");
+  if (!value || value > ExecutionLimits::prefillTokenBudget || value % kv::kPageTokens)
+    throw std::invalid_argument("prefill_token_budget must be whole KV pages, at most " +
+                                std::to_string(ExecutionLimits::prefillTokenBudget));
+  return static_cast<uint32_t>(value);
 }
 
 void validateExecutionGeometry(NSDictionary *manifest) {
@@ -450,7 +461,8 @@ bool ModelDescriptor::valid() const noexcept {
   if (name.empty() || !capabilities.vocabularySize ||
       !capabilities.maximumContextTokens ||
       capabilities.maximumBatchWidth != ExecutionLimits::maximumBatchWidth ||
-      capabilities.prefillTokenBudget != ExecutionLimits::prefillTokenBudget ||
+      !capabilities.prefillTokenBudget ||
+      capabilities.prefillTokenBudget > ExecutionLimits::prefillTokenBudget ||
       capabilities.draftQueryRows != ExecutionLimits::draftQueryRows ||
       capabilities.draftProposalTokens != ExecutionLimits::draftProposalTokens ||
       capabilities.targetVerifyRows != ExecutionLimits::targetVerifyRows ||
@@ -501,6 +513,7 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
       throw std::invalid_argument("unsupported weight format: " + format);
     }
     descriptor.packageManifestSha256 = packageManifestSha256;
+    descriptor.capabilities.prefillTokenBudget = packagePrefillChunk(manifest);
     if (!descriptor.valid())
       throw std::logic_error("built-in model descriptor is inconsistent");
     return descriptor;

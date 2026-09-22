@@ -164,7 +164,7 @@ void checkPlans(uint32_t queryHeads, kv::Q8Layout layout) {
     }
   }
   rejects([&] { (void)ops::PagedAttention::prefillPlan(0, queryHeads, layout, 0); });
-  rejects([&] { (void)ops::PagedAttention::prefillPlan(2049, queryHeads, layout, 0); });
+  rejects([&] { (void)ops::PagedAttention::prefillPlan(SPLASH_PREFILL_TOKEN_BUDGET + 1, queryHeads, layout, 0); });
   rejects([&] { (void)ops::PagedAttention::prefillPlan(1, queryHeads, layout, kv::kMaximumPhysicalTokens); });
   rejects([&] { (void)ops::PagedAttention::prefillPlan(2048, queryHeads, layout, UINT32_MAX); });
   rejects([&] { (void)ops::PagedAttention::verifyPlan(0, queryHeads, layout, zeroHistory); });

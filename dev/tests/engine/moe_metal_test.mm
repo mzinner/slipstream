@@ -540,7 +540,7 @@ void planBounds() {
       }
     }
     rejects([&] { (void)MoE::prefillCandidates(shape, 0, kMoeRouteWideRows); }, "zero prefill");
-    rejects([&] { (void)MoE::prefillCandidates(shape, 2049, kMoeRouteWideRows); }, "large prefill");
+    rejects([&] { (void)MoE::prefillCandidates(shape, SPLASH_PREFILL_TOKEN_BUDGET + 1, kMoeRouteWideRows); }, "large prefill");
     rejects([&] { (void)MoE::decodeCandidates(shape, 0, kMoeRouteWideRows); }, "zero batch");
     rejects([&] { (void)MoE::decodeCandidates(shape, 5, kMoeRouteWideRows); }, "large batch");
     rejects([&] { (void)MoE::prefillPlan(shape, 1, {static_cast<MoeExpertTile>(16)}); },

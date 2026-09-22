@@ -52,6 +52,12 @@ struct SchedulerSnapshot final {
 // M8/M16/M24/M32 shapes.
 class Scheduler final {
 public:
+  // Rows per prompt command, at most ExecutionLimits::prefillTokenBudget.
+  void setPrefillBudget(uint32_t rows) {
+    if (!rows || rows > model::ExecutionLimits::prefillTokenBudget)
+      throw std::invalid_argument("prefill budget exceeds the built maximum");
+    prefillBudget_ = rows;
+  }
   void submit(RequestSpec request);
   void waitForResources(uint64_t requestId);
   void resourcesReady(uint64_t requestId, uint32_t alreadyProcessed);
@@ -112,6 +118,7 @@ private:
   double prefillMillisecondsPerToken_ = 0.0;
   std::optional<WorkKind> lastCommittedKind_;
   SchedulerSnapshot counters_;
+  uint32_t prefillBudget_ = model::ExecutionLimits::defaultPrefillChunkTokens;
 };
 
 } // namespace splash::engine

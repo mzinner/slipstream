@@ -2461,7 +2461,13 @@ void Qwen4ExpTarget::addVerify(
     // positions with the accepted tokens' real rows.
     static const bool rerun = std::getenv("SPLASH_MTP_RERUN") != nullptr;
     for (uint32_t k = 1; k < maxDrafts; ++k) {
-      if (rerun) {
+      // One new row writes an 8-row window from its own position; when that
+      // runs past the pages the request holds (a decode step reserves its
+      // verify window only), re-run from the anchor, which stays inside it.
+      const bool fits = (anchorPosition + k - 1 + kRows + kv::kPageTokens - 1) /
+                            kv::kPageTokens <= mtp.pageTable.size();
+      const bool rerunThis = rerun || !fits;
+      if (rerunThis) {
         for (uint32_t r = 0; r < k; ++r)
           std::memcpy(hIn + uint64_t{r} * width, chain.data() + uint64_t{r} * width, width * 2);
         drafts[k] = step(anchorPosition, k, drafts.data());
@@ -2475,7 +2481,7 @@ void Qwen4ExpTarget::addVerify(
         return drafts;
       drafted = k + 1;
       std::memcpy(chain.data() + uint64_t{k} * width,
-                  y + uint64_t{rerun ? k - 1 : 0} * width, width * 2);
+                  y + uint64_t{rerunThis ? k - 1 : 0} * width, width * 2);
     }
     return drafts;
   };

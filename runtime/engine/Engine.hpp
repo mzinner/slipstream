@@ -25,6 +25,8 @@ struct EngineConfig final {
       2 * model::ExecutionLimits::draftContextTokens;
   // Patches per image the model's vision scratch covers.
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
+  // Rows per prompt command: the package's chunk, at most the built maximum.
+  uint32_t prefillChunkTokens = model::ExecutionLimits::defaultPrefillChunkTokens;
   double resourceWaitTimeoutMilliseconds = 30000.0;
   // Live host pressure, supplied by the runtime governor. Queried only on
   // failed allocation, never on the successful decode path.

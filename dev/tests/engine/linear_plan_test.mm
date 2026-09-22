@@ -338,7 +338,7 @@ void planContracts() {
            LinearWorkload{{512, 256}, 8, LinearPhase::Decode, static_cast<LinearEpilogue>(255)},
            LinearWorkload{{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::UpWithGate},
            LinearWorkload{{512, 256}, 8, LinearPhase::Prefill, LinearEpilogue::GateUp},
-           LinearWorkload{{512, 256}, 2049, LinearPhase::Prefill}})
+           LinearWorkload{{512, 256}, SPLASH_PREFILL_TOKEN_BUDGET + 1, LinearPhase::Prefill}})
     rejects([&] { (void)linear.plan(invalid); });
   for (const LinearConfig invalid : {
            LinearConfig{LinearTile::N128, 0}, LinearConfig{LinearTile::N128, 5},

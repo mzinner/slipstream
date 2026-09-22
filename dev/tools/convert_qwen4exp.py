@@ -800,7 +800,7 @@ def write_manifest(root: Path) -> None:
             "draft_query_rows": 8,
             "draft_sliding_window": 2048,
             "maximum_batch_width": 4,
-            "prefill_token_budget": 2048,
+            "prefill_token_budget": 4096,  # SPLASH_PREFILL_TOKEN_BUDGET
             "target_kv_block_tokens": 32,
             "target_verify_rows": 8,
         },

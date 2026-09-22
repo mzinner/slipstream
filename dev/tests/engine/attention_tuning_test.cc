@@ -191,7 +191,7 @@ void policyTests() {
                 PagedAttention::prefillCandidates().size() == 4,
             "prefill calibration is not a fixed bounded comparison");
     for (size_t i = 0; i < probes.size(); ++i)
-      require(probes[i].choice.workload.rows == 2048 &&
+      require(probes[i].choice.workload.rows == SPLASH_PREFILL_TOKEN_BUDGET &&
                   probes[i].choice.workload.historyTokens == histories[i] &&
                   probes[i].measurements.size() == 3 && probes[i].equivalentCandidates.empty(),
               "prefill calibration changed rows, histories or distinct candidate count");
@@ -354,7 +354,7 @@ void cpuTests() {
               "maximum physical history fixture overflowed");
     }
     rejects([&] { (void)prefillAttentionTuningFixtureBytes({shape, 0, 0}); });
-    rejects([&] { (void)prefillAttentionTuningFixtureBytes({shape, 2049, 0}); });
+    rejects([&] { (void)prefillAttentionTuningFixtureBytes({shape, SPLASH_PREFILL_TOKEN_BUDGET + 1, 0}); });
     rejects([&] { (void)prefillAttentionTuningFixtureBytes({shape, 1, UINT32_MAX}); });
     rejects([&] { (void)verifyAttentionTuningFixtureBytes({shape, 0, {}}); });
     rejects([&] { (void)verifyAttentionTuningFixtureBytes({shape, 5, {}}); });

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "metal/abi/ExecutionGeometry.h"
 #include "ops/Vision.hpp"
 
 #include <array>
@@ -248,7 +249,11 @@ struct ModelCapabilities final {
 // cache-page and attention-kernel geometry live with their operators.
 struct ExecutionLimits final {
   static constexpr uint32_t maximumBatchWidth = 4;
-  static constexpr uint32_t prefillTokenBudget = 2048;
+  // The largest prompt chunk the buffers and kernels are built for. A package
+  // chooses its own chunk (manifest prefill_token_budget, at most this); one
+  // that does not say gets the default.
+  static constexpr uint32_t prefillTokenBudget = SPLASH_PREFILL_TOKEN_BUDGET;
+  static constexpr uint32_t defaultPrefillChunkTokens = 2048;
   static constexpr uint32_t draftQueryRows = 8;
   static constexpr uint32_t draftProposalTokens = 7;
   static constexpr uint32_t targetVerifyRows = 8;

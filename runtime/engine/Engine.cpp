@@ -21,6 +21,7 @@ uint32_t replayStateBoundary(uint32_t tokens) noexcept {
 Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
                EngineEventSink &events)
     : config_(config), cache_(cache), model_(model), events_(events) {
+  scheduler_.setPrefillBudget(config_.prefillChunkTokens);
   if (!config_.maxContext || !config_.vocabularySize) {
     throw std::invalid_argument("context and vocabulary sizes must be positive");
   }

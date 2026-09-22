@@ -243,7 +243,7 @@ void checkPair(ModelPackage package, bool sparse) {
   const auto empty = collectTuningWorkloads(package, {}, {});
   require(empty.linear.empty() && empty.moe.empty(), "empty probe sets created work");
   rejects([&] { (void)collectTuningWorkloads(package, std::array{0U}, decode); });
-  rejects([&] { (void)collectTuningWorkloads(package, std::array{2049U}, decode); });
+  rejects([&] { (void)collectTuningWorkloads(package, std::array{ExecutionLimits::prefillTokenBudget + 1}, decode); });
   rejects([&] { (void)collectTuningWorkloads(package, prefill, std::array{0U}); });
   rejects([&] { (void)collectTuningWorkloads(package, prefill, std::array{5U}); });
   package.draft.contextProjection.inputSize = 0;

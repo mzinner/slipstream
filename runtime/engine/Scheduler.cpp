@@ -234,7 +234,7 @@ std::optional<BatchPlan> Scheduler::nextPrefill() const {
 }
 
 uint32_t Scheduler::prefillBudget(const Request &leader) const {
-  const uint32_t maximum = model::ExecutionLimits::prefillTokenBudget;
+  const uint32_t maximum = prefillBudget_;
   if (prefillMillisecondsPerToken_ <= 0.0)
     return maximum;
   uint32_t rows = maximum;

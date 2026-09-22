@@ -61,7 +61,7 @@ void testShortestRemainingFirstUsesActualRows() {
   uint32_t rows = 0;
   for (const BatchItem &item : plan.items)
     rows += item.tokenCount;
-  require(rows == model::ExecutionLimits::prefillTokenBudget,
+  require(rows == model::ExecutionLimits::defaultPrefillChunkTokens,
           "ragged prefill did not use the exact actual-row budget");
   require(plan.items[0].requestId == 1 && plan.items[0].tokenCount == 17 &&
               plan.items[1].requestId == 2 &&
@@ -118,7 +118,7 @@ void testEqualPromptsFinishInArrivalOrder() {
   require(plan.kind == WorkKind::Prefill && plan.items.size() == 1 &&
               plan.items[0].requestId == 1 &&
               plan.items[0].tokenCount ==
-                  model::ExecutionLimits::prefillTokenBudget,
+                  model::ExecutionLimits::defaultPrefillChunkTokens,
           "equal prompts were water-filled instead of served oldest first");
 }
 
@@ -160,7 +160,7 @@ void testBoundaryCapsDispatchWithoutChangingPriority() {
   const BatchPlan next = *checkpoints.next();
   require(next.items.size() == 1 && next.items[0].requestId == 2 &&
               next.items[0].tokenCount ==
-                  model::ExecutionLimits::prefillTokenBudget,
+                  model::ExecutionLimits::defaultPrefillChunkTokens,
           "rolling checkpoints placed a long prompt before a shorter arrival");
 }
 
@@ -173,7 +173,7 @@ void testEqualLanesRunInArrivalOrderWithoutOvertaking() {
   const BatchPlan first = *scheduler.next();
   require(first.items.size() == 1 && first.items[0].requestId == 1 &&
               first.items[0].tokenCount ==
-                  model::ExecutionLimits::prefillTokenBudget,
+                  model::ExecutionLimits::defaultPrefillChunkTokens,
           "first command did not give the whole budget to the oldest lane");
   completePrefill(scheduler, first);
   // Lane 2 was left out by an older lane, which is not overtaking: lane 1
@@ -197,7 +197,7 @@ void testLaneOvertakenThreeTimesLeadsTheNextCommand() {
     scheduler.complete(plan, results);
   };
   for (uint64_t id = 2; id <= 4; ++id) {
-    scheduler.submit(request(id, model::ExecutionLimits::prefillTokenBudget));
+    scheduler.submit(request(id, model::ExecutionLimits::defaultPrefillChunkTokens));
     scheduler.resourcesReady(id, 0);
     const BatchPlan plan = *scheduler.next();
     require(plan.kind == WorkKind::Prefill && plan.items.size() == 1 &&
@@ -205,12 +205,12 @@ void testLaneOvertakenThreeTimesLeadsTheNextCommand() {
             "a short arrival did not run ahead of the long lane");
     finishShort(plan);
   }
-  scheduler.submit(request(5, model::ExecutionLimits::prefillTokenBudget));
+  scheduler.submit(request(5, model::ExecutionLimits::defaultPrefillChunkTokens));
   scheduler.resourcesReady(5, 0);
   const BatchPlan overdue = *scheduler.next();
   require(overdue.items.size() == 1 && overdue.items[0].requestId == 1 &&
               overdue.items[0].tokenCount ==
-                  model::ExecutionLimits::prefillTokenBudget,
+                  model::ExecutionLimits::defaultPrefillChunkTokens,
           "a lane overtaken three times did not lead the next command");
   completePrefill(scheduler, overdue);
   // Served once, the long lane yields to short arrivals again.
@@ -539,7 +539,7 @@ void testPrefillCommandContainsOnePriorityTier() {
   require(plan.kind == WorkKind::Prefill && plan.items.size() == 1 &&
               plan.items[0].requestId == 1 &&
               plan.items[0].tokenCount ==
-                  model::ExecutionLimits::prefillTokenBudget,
+                  model::ExecutionLimits::defaultPrefillChunkTokens,
           "ragged prefill mixed priority tiers in one command");
 }
 

@@ -281,7 +281,7 @@ OperatorChoices mixedChoices() {
 void requireMixed(const ExecutionPlans &plans) {
   require(plans.linear().plan(mixedChoices().linear[0].workload).configuration() ==
               LinearConfig{LinearTile::N256, 60}, "linear table was partially replaced");
-  require(plans.prefillAttention(2048, 24, layout(attentionShapes[0]), 2049).configuration.splitMultiplier ==
+  require(plans.prefillAttention(SPLASH_PREFILL_TOKEN_BUDGET, 24, layout(attentionShapes[0]), 2049).configuration.splitMultiplier ==
               PrefillSplitMultiplier::Two,
           "prefill table was partially replaced");
   const std::array<uint32_t, 3> histories{31, 32, 2049};
@@ -305,23 +305,23 @@ void policyKeysAndBounds() {
                                       {PrefillSplitMultiplier::Two}});
   plans.install(choices);
   requireMixed(plans);
-  require(plans.prefillAttention(2048, 24, layout(attentionShapes[0], 64), 0).sameExecutionAs(
-              plans.prefillAttention(2048, 24, layout(attentionShapes[0]), 0)),
+  require(plans.prefillAttention(SPLASH_PREFILL_TOKEN_BUDGET, 24, layout(attentionShapes[0], 64), 0).sameExecutionAs(
+              plans.prefillAttention(SPLASH_PREFILL_TOKEN_BUDGET, 24, layout(attentionShapes[0]), 0)),
           "layer count leaked into one-layer plan identity");
   for (uint32_t history : {1U, 31U, 32U, 33U, 2047U, 2048U, 2050U, 131079U})
-    require(plans.prefillAttention(2048, 24, layout(attentionShapes[0]), history).configuration.splitMultiplier ==
+    require(plans.prefillAttention(SPLASH_PREFILL_TOKEN_BUDGET, 24, layout(attentionShapes[0]), history).configuration.splitMultiplier ==
                 PrefillSplitMultiplier::Two,
             "prefill policy was restricted to sampled exact histories");
   equalWorkspace(plans.prefillAttentionWorkspace(17, 24, layout(attentionShapes[0])),
                  PagedAttention::prefillWorkspace(17, 24, layout(attentionShapes[0])),
                  attentionFields);
   for (const auto shape : attentionShapes)
-    for (uint32_t rows = 1; rows <= 2048; ++rows) {
+    for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) {
       const auto selected = plans.prefillAttention(rows, shape.queryHeads, layout(shape), 131079);
       const auto bound = plans.prefillAttentionWorkspace(rows, shape.queryHeads, layout(shape));
       covers(bound, selected.workspace, 1, attentionFields);
       const auto baseline = PagedAttention::prefillPlan(rows, shape.queryHeads, layout(shape), 131079);
-      if (rows < 2048) {
+      if (rows < SPLASH_PREFILL_TOKEN_BUDGET) {
         require(selected.configuration == PrefillAttentionConfig{} &&
                     selected.sameExecutionAs(baseline),
                 "fixed-chunk attention selection changed shorter or ragged rows");
@@ -406,7 +406,7 @@ void atomicInvalidChoices() {
   invalid([](auto &c) { c.prefillAttention[0].configuration.scalePlacement = AttentionScalePlacement(2); });
   invalid([](auto &c) { c.prefillAttention[0].workload.shape.queryHeads = 32; });
   invalid([](auto &c) { c.prefillAttention[0].workload.rows = 0; });
-  invalid([](auto &c) { c.prefillAttention[0].workload.rows = 2049; });
+  invalid([](auto &c) { c.prefillAttention[0].workload.rows = SPLASH_PREFILL_TOKEN_BUDGET + 1; });
   invalid([](auto &c) { c.verifyAttention[0].configuration.splitCount = VerifySplitCount(0); });
   invalid([](auto &c) { c.verifyAttention[0].configuration.scalePlacement = AttentionScalePlacement(2); });
   invalid([](auto &c) { c.verifyAttention[0].workload.lanes = 5; });

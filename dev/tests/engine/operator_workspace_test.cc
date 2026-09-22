@@ -29,7 +29,7 @@ void attention() {
     const kv::Q8Layout layout{1, queryHeads == 16 ? 2U : 4U, 256};
     for (const auto config : ops::PagedAttention::prefillCandidates()) {
       uint32_t maximumSlots = 0;
-      for (uint32_t rows = 1; rows <= 2048; ++rows) {
+      for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) {
         // Split counts decrease as the M8 tile count grows, so a shorter
         // request can need more scratch than the exact requested row count.
         const uint32_t tiles = (rows + 7) / 8;
@@ -49,11 +49,13 @@ void attention() {
                   "prefill workspace omitted actual rows at a valid context boundary");
         }
       }
-      const auto maximum = ops::PagedAttention::prefillWorkspace(2048, queryHeads, layout, config);
+      const auto maximum = ops::PagedAttention::prefillWorkspace(SPLASH_PREFILL_TOKEN_BUDGET, queryHeads, layout, config);
+      // Pinned at 2048 rows; the workspace grows linearly with the budget.
       const uint64_t expectedMiB = (queryHeads == 24 ? 48U : 32U) *
-                                  static_cast<uint32_t>(config.splitMultiplier);
+                                  static_cast<uint32_t>(config.splitMultiplier) *
+                                  (SPLASH_PREFILL_TOKEN_BUDGET / 2048U);
       require(maximum.partialsBytes == expectedMiB * 1024 * 1024,
-              "2048-row prefill partial workspace changed");
+              "budget-row prefill partial workspace changed");
     }
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const auto workspace =
@@ -66,7 +68,7 @@ void attention() {
               "verify statistics workspace is not sized for the maximum split count");
     }
     rejects([&] { return ops::PagedAttention::prefillWorkspace(0, queryHeads, layout); });
-    rejects([&] { return ops::PagedAttention::prefillWorkspace(2049, queryHeads, layout); });
+    rejects([&] { return ops::PagedAttention::prefillWorkspace(SPLASH_PREFILL_TOKEN_BUDGET + 1, queryHeads, layout); });
     rejects([&] { return ops::PagedAttention::verifyWorkspace(0, queryHeads, layout); });
     rejects([&] { return ops::PagedAttention::verifyWorkspace(5, queryHeads, layout); });
     rejects([&] { return ops::PagedAttention::verifyWorkspace(1, 0, layout); });
@@ -102,7 +104,7 @@ void moe() {
                                MoeShape{2048, 256, 8, 512}}) {
     const uint32_t splitWidth =
         std::max(shape.hiddenSize, shape.expertIntermediateSize);
-    for (uint32_t rows = 1; rows <= 2048; ++rows)
+    for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows)
       checkMoe(MoE::prefillPlan(shape, rows).workspace(), shape, rows, 32, splitWidth);
     const auto single = MoE::decodePlan(shape, 1).workspace();
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
@@ -114,7 +116,7 @@ void moe() {
               "packed decode workspace exceeds per-lane allocation bound");
     }
     rejects([&] { return MoE::prefillPlan(shape, 0); });
-    rejects([&] { return MoE::prefillPlan(shape, 2049); });
+    rejects([&] { return MoE::prefillPlan(shape, SPLASH_PREFILL_TOKEN_BUDGET + 1); });
     rejects([&] { return MoE::decodePlan(shape, 0); });
     rejects([&] { return MoE::decodePlan(shape, 5); });
   }

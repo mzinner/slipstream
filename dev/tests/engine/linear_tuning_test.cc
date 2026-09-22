@@ -62,7 +62,7 @@ void cpuContracts() {
        LinearWorkload{{512, 256}, 8, LinearPhase::Decode, static_cast<LinearEpilogue>(255)},
        LinearWorkload{{512, 256}, 8, LinearPhase::Decode, LinearEpilogue::UpWithGate},
        LinearWorkload{{512, 256}, 8, LinearPhase::Prefill, LinearEpilogue::GateUp},
-       LinearWorkload{{512, 256}, 2049, LinearPhase::Prefill}})
+       LinearWorkload{{512, 256}, SPLASH_PREFILL_TOKEN_BUDGET + 1, LinearPhase::Prefill}})
     rejects([&] { (void)linearTuningFixtureBytes(device, workload); });
   MeasurementOptions options;
   require(validMeasurementOptions(options), "default measurement options rejected");

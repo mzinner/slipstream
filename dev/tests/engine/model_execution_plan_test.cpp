@@ -64,9 +64,9 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
   selected.install(choices);
   const auto after = model::plannedRuntimeMemory(device, package, selected);
   const auto prefillBefore = baseline.prefillAttentionWorkspace(
-      2048, attention.queryHeads, geometry.kvLayout);
+      SPLASH_PREFILL_TOKEN_BUDGET, attention.queryHeads, geometry.kvLayout);
   const auto prefillAfter = selected.prefillAttentionWorkspace(
-      2048, attention.queryHeads, geometry.kvLayout);
+      SPLASH_PREFILL_TOKEN_BUDGET, attention.queryHeads, geometry.kvLayout);
   const uint64_t prefillGrowth =
       aligned(prefillAfter.partialsBytes) - aligned(prefillBefore.partialsBytes) +
       aligned(prefillAfter.statisticsBytes) - aligned(prefillBefore.statisticsBytes);
@@ -77,10 +77,10 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
                   before.sharedPrefillPlannedAllocatedBytes + prefillGrowth,
           "runtime prefill allocation lost the selected split workspace bound");
   const auto selectedPrefill = selected.prefillAttention(
-      2048, attention.queryHeads, geometry.kvLayout, 131072);
+      SPLASH_PREFILL_TOKEN_BUDGET, attention.queryHeads, geometry.kvLayout, 131072);
   require(selectedPrefill.configuration.splitMultiplier == ops::PrefillSplitMultiplier::Two &&
               selectedPrefill.workspace.partialsBytes ==
-                  2 * baseline.prefillAttention(2048, attention.queryHeads,
+                  2 * baseline.prefillAttention(SPLASH_PREFILL_TOKEN_BUDGET, attention.queryHeads,
                                              geometry.kvLayout, 131072)
                       .workspace.partialsBytes,
           "runtime did not install the selected prefill split plan");
