@@ -1,5 +1,16 @@
 # Journal — qwen4exp port
 
+## 2026-09-22 08:30 PDT — claude-code
+
+GPU draft pick (mtp_pick_slices) replaces the 248K-logit host scan: sampled
+decode ~35 -> ~38.5 tok/s on the code prompt, greedy unchanged, output exact.
+Expert quantization variants (group 32; error-minimizing ranges) simulated
+worse than the current format despite lower weight error - unexplained.
+Remaining decode gaps, measured: GPU ~46 ms/step (experts ~70% of bandwidth,
+8-bit linear ~58%: its tile choices are the 4-bit tuner's, never tuned for Q8);
+SSD miss reads ~17 ms; ~48 GPU<->host hand-offs ~8 ms (needs GPU-side routing
+with a slot table to remove); drafting ~13 ms.
+
 ## 2026-09-22 07:50 PDT — claude-code
 
 Prompt path: hyper-connection projections now run as 8-bit matrix products for

@@ -1,6 +1,6 @@
 # Status — qwen4exp (Qwen3.8-Flash-Next) in Splash
 
-**Updated:** 2026-09-22 07:50 PDT by claude-code
+**Updated:** 2026-09-22 08:30 PDT by claude-code
 **Branch:** `qwen4exp-review` (not pushed; never push to upstream `incoai/splash`)
 
 ## In one line
@@ -36,14 +36,18 @@ host miss reads ~18 ms; per-layer hand-offs ~7–11 ms (structural: 164 us per
 shared-event hand-off, and shared-memory flags cannot replace it — probe in
 `dev/benchmarks/qwen4exp/probes/handoff_latency.mm`); MTP draft ~9 ms.
 
-## Open work
+## Open work (measured gaps, largest first)
 
-1. Attention past 2,048 tokens: measured, kept dense (the reference's
-   sparse indexer predicts the text worse past 3K: ppl 10.3 vs 4.5).
-2. Decode: hide misses / hand-offs (needs GPU-side routing to go further);
-   MTP draft ~9 ms; mixing kernels ~100 GB/s.
-3. 27B regression check needs a 4-bit 27B package (installed one is Q8,
-   readable only by the splash2 fork).
+1. **8-bit linear decode kernels** run at ~58% of bandwidth (~16 ms/step):
+   they reuse the 4-bit tuner's tile choices; tune them for Q8.
+2. **SSD miss reads** ~17 ms/step: lookahead foresees 66% of used experts
+   (top-16 would 79%); a better predictor or bigger effective cache.
+3. **GPU<->host hand-offs** ~8 ms/step (48 x ~164 us): removing them needs
+   GPU-side routing with a GPU-visible slot table.
+4. **Drafting** ~13 ms/step (two blocking GPU round trips per guess).
+5. Expert quantization: group-32 and range-search simulated *worse* than the
+   current format despite lower weight error - unexplained, worth a look.
+6. 27B regression check needs a 4-bit 27B package.
 
 ## Tools
 
