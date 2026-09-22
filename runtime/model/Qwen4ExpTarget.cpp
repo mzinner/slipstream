@@ -1521,6 +1521,10 @@ void Qwen4ExpTarget::addVerify(
   // blocking reads of unpredicted misses, and the GPU's wait on the host
   // (event raised to event signalled, summed over stages).
   std::array<double, 3> hostParts{};
+  // Lookahead quality: for each layer, the experts predicted (issued top-k,
+  // and a wider top-16 kept only for this count).
+  std::vector<std::bitset<512>> predictedNarrow(geometry.layers + 1), predictedWide(geometry.layers + 1);
+  static std::array<uint64_t, 5> predictionCounts{};  // used, in narrow, in wide, misses, misses in wide
   const auto verifyEnter = std::chrono::steady_clock::now();
   double encodeMs = 0.0;  // CPU time building the pipelined stage graphs
   uint32_t hcRows = 0, hcStep = 1;
@@ -1842,6 +1846,16 @@ void Qwen4ExpTarget::addVerify(
 
     for (uint32_t exp : uniqueExperts)
       countExpertUse(cache, exp);
+    if (layerIndex < geometry.layers && predictedWide[layerIndex].any())
+      for (uint32_t exp : uniqueExperts) {
+        ++predictionCounts[0];
+        predictionCounts[1] += predictedNarrow[layerIndex][exp];
+        predictionCounts[2] += predictedWide[layerIndex][exp];
+        if (cache.expertToSlot[exp] < 0) {
+          ++predictionCounts[3];
+          predictionCounts[4] += predictedWide[layerIndex][exp];
+        }
+      }
     for (uint32_t exp : uniqueExperts) {
       int16_t slot = cache.expertToSlot[exp];
       if (slot != -1) {
@@ -1929,7 +1943,11 @@ void Qwen4ExpTarget::addVerify(
       const uint32_t guesses = std::clamp(widened, perToken, 16u);
       uint32_t ids[16];
       topExperts(predictedScores + uint64_t{r} * width, weights.layout.experts,
-                 guesses, ids, nullptr);
+                 16, ids, nullptr);
+      for (uint32_t k = 0; k < 16; ++k) {
+        predictedWide[layer].set(ids[k]);
+        if (k < guesses) predictedNarrow[layer].set(ids[k]);
+      }
       for (uint32_t k = 0; k < guesses; ++k) {
         const uint32_t expert = ids[k];
         if (expert >= weights.layout.experts)
@@ -2656,7 +2674,10 @@ void Qwen4ExpTarget::addVerify(
               << mtpParts[2] << ", pick " << mtpParts[3] << ")"
               << " | host: prefetch wait " << hostParts[0] << ", miss reads "
               << hostParts[1] << ", per-stage total " << hostParts[2]
-              << ", predicted " << weights.predictIssued << " | encode " << encodeMs
+              << ", predicted " << weights.predictIssued << " | prediction: used "
+              << predictionCounts[0] << " in top-10 " << predictionCounts[1] << " in top-16 "
+              << predictionCounts[2] << " misses " << predictionCounts[3]
+              << " of which in top-16 " << predictionCounts[4] << " | encode " << encodeMs
               << " | inside verify " << std::chrono::duration<double, std::milli>(
                      std::chrono::steady_clock::now() - verifyEnter).count() << "\n";
   }
