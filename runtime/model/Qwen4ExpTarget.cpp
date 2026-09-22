@@ -987,6 +987,102 @@ void Qwen4ExpTarget::addPrefill(
   encodeMlpUpdate(graph, lastL);
   encodeCapture(graph, lastL);
 
+  // MTP head: fill its attention cache for this chunk's positions. Row r
+  // pairs the trunk's final residual at r with the prompt token at r + 1, so
+  // every row but the chunk's last has its input (the last prompt row is
+  // covered by the first decode step). Only the keys and values are needed:
+  // combiner, attention mix, projection, store - no attention, experts or head.
+  if (weights.mtpLayer && weights.mtpCombiner && rows > 1 &&
+      !std::getenv("SPLASH_NO_MTP")) {
+    const auto &head = *weights.mtpLayer;
+    const auto &combiner = *weights.mtpCombiner;
+    const uint32_t kvIndex = geometry.kvLayout.attentionLayers - 1;
+    const uint32_t hidden = geometry.hiddenSize;
+    const uint32_t count = geometry.hyperConnectionCount;
+    const uint32_t m = rows - 1;
+    const metal::MetalBuffer residual = buffers.hidden[geometry.layers & 1];
+    const metal::MetalBuffer X = buffers.hidden[(geometry.layers & 1) ^ 1];
+    if (!weights.mtpPrefillOnes) {
+      weights.mtpPrefillOnes = backend.allocateBuffer(
+          uint64_t{ExecutionLimits::prefillTokenBudget} * count * 2,
+          metal::BufferStorage::Shared, "mtp-prefill-ones");
+      std::fill_n(static_cast<uint16_t *>(weights.mtpPrefillOnes.contents()),
+                  ExecutionLimits::prefillTokenBudget * count, uint16_t{0x3F80});
+    }
+    const ops::LinearMatrix square{hidden, hidden};
+    // Prefill linear kernels read and write whole 32-row tiles, so views are
+    // padded to one; the padding rows are scratch.
+    auto padded = [&](const metal::MetalBuffer &buffer, uint32_t begin,
+                      uint32_t count, uint32_t width) {
+      return u16(buffer, begin, (count + 31) / 32 * 32, width);
+    };
+    const HyperConnectionParams single{m, hidden, 1, geometry.hyperConnectionLowRank,
+                                       1e-6f, 0, 1, 0};
+    const HyperConnectionParams all{m, hidden, count, geometry.hyperConnectionLowRank,
+                                    1e-6f, 1, 1, 0};
+    // Tokens shifted by one row.
+    metal::MetalBuffer next = backend.view(buffers.ple.tokens, 4, uint64_t{m} * 4);
+    metal::MetalBuffer embedded = padded(buffers.recurrent, 0, m, hidden);
+    metal::MetalBuffer normalizedE = padded(buffers.gdnHidden, 0, m, hidden);
+    metal::MetalBuffer e = padded(buffers.attentionHidden, 0, m, hidden);
+    ops::Embedding::add(graph, next, weights.tokenEmbedding, embedded, m);
+    graph.add("hyper_connection_rms", {embedded, combiner.embeddingNorm, normalizedE},
+              single, {m, 1, 1}, {256, 1, 1});
+    operators.linear().addPrefillSums(graph, normalizedE, buffers.projectionSums, square, m);
+    operators.linear().addPrefill(graph, normalizedE, combiner.fcEmbedding, e,
+                                  buffers.projectionSums, square, m);
+    graph.add("hyper_connection_rms", {residual, combiner.hiddenNorm, buffers.normalized},
+              all, {m, count, 1}, {256, 1, 1});
+    // fc_hidden on each stream: m rows of 4 streams, in prefill-sized pieces.
+    const uint32_t streamRows = m * count;
+    for (uint32_t first = 0; first < streamRows;
+         first += ExecutionLimits::prefillTokenBudget) {
+      const uint32_t piece = std::min(ExecutionLimits::prefillTokenBudget, streamRows - first);
+      metal::MetalBuffer in = padded(buffers.normalized, first, piece, hidden);
+      metal::MetalBuffer out = padded(X, first, piece, hidden);
+      operators.linear().addPrefillSums(graph, in, buffers.projectionSums, square, piece);
+      operators.linear().addPrefill(graph, in, combiner.fcHidden, out,
+                                    buffers.projectionSums, square, piece);
+    }
+    graph.add("hyper_connection_update", {X, e, weights.mtpPrefillOnes}, all,
+              {64, 1, 1}, {256, 1, 1});
+    addHyperConnection(graph, geometry, X, head.attentionHyperConnection,
+                       buffers.normalized, buffers.hyperReduced, buffers.hyperMixed,
+                       buffers.hyperInjection, m, 1);
+    const auto &mixer = std::get<QwenAttentionWeights>(head.mixer);
+    const ops::LinearMatrix attentionInput{geometry.packedAttentionWidth, hidden};
+    operators.linear().addPrefillSums(graph, buffers.hyperMixed, buffers.projectionSums,
+                                      attentionInput, m);
+    operators.linear().addPrefill(graph, buffers.hyperMixed, mixer.inputProjection,
+                                  buffers.fullPacked, buffers.projectionSums,
+                                  attentionInput, m);
+    for (const QwenTargetPrefillSequence &sequence : sequences) {
+      if (sequence.rows < 2)
+        continue;
+      const uint32_t kept = sequence.rows - 1;
+      const uint64_t queryBytes = uint64_t{geometry.attentionQueryHeads} *
+                                  sequence.attentionStride *
+                                  geometry.attentionHeadDimension * 2;
+      const uint64_t kvBytes = uint64_t{geometry.attentionKvHeads} *
+                               sequence.attentionStride *
+                               geometry.attentionHeadDimension * 2;
+      metal::MetalBuffer queries = backend.view(buffers.fullQueries, sequence.queryOffset, queryBytes);
+      metal::MetalBuffer keys = backend.view(buffers.chunkKeys, sequence.kvOffset, kvBytes);
+      metal::MetalBuffer values = backend.view(buffers.chunkValues, sequence.kvOffset, kvBytes);
+      ops::PagedAttention::addPrefillProjection(
+          graph, u16(buffers.fullPacked, sequence.rowBegin, kept, geometry.packedAttentionWidth),
+          mixer.queryNorm, mixer.keyNorm,
+          f32(buffers.ropeCos, sequence.rowBegin, kept, geometry.rotaryPairs),
+          f32(buffers.ropeSin, sequence.rowBegin, kept, geometry.rotaryPairs),
+          queries, keys, values, kept, sequence.attentionStride,
+          sequence.attentionStride, geometry.attentionQueryHeads, geometry.kvLayout);
+      kv::Q8ChunkedPrefillParams store = sequence.q8;
+      store.chunk_tokens = kept;
+      ops::PagedAttention::addPrefillStore(graph, kvLayers[kvIndex], keys, values,
+                                           sequence.pageTable, store, geometry.kvLayout);
+    }
+  }
+
   std::cerr << "[Prefill Timing] Resident 0.." << R << ": " << residentMs << " ms | Streaming Staging: "
             << totalStageMs << " ms (misses: " << totalMisses << ") | Streaming GPU: " << totalGpuMs << " ms\n";
 

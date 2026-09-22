@@ -330,6 +330,7 @@ struct Qwen4ExpWeights final {
   // MTP draft scratch, allocated on first use.
   mutable metal::MetalBuffer mtpTokens, mtpEmbed, mtpNorm, mtpE, mtpOnes;
   mutable metal::MetalBuffer mtpCos, mtpSin, mtpHin;
+  mutable metal::MetalBuffer mtpPrefillOnes;
   mutable uint64_t predictIssued = 0;
   mutable uint64_t predictUseful = 0;
 
