@@ -1,5 +1,18 @@
 # Journal — qwen4exp port
 
+## 2026-09-22 07:50 PDT — claude-code
+
+Prompt path: hyper-connection projections now run as 8-bit matrix products for
+prompts (they were 53% of prompt GPU time in scalar kernels): mix weights moved
+to the tiled Q8 layout (MDFN0031/34/35). Prompt chunks are per-package now
+(manifest prefill_token_budget, built max 4096); qwen4exp uses 4096. Prompt
+speed: short ~180-220, code ~585, long ~670 tok/s (from 154/380/380). Decode:
+per-slot prefetch waits (+3%), guess cap 5, incremental MTP rows with a page-fit
+fallback (server hit page_table_too_short). Dense attention past 2K kept: the
+reference's sparse indexer predicts the real text worse there (ppl 10.3 vs 4.5).
+Rejected: 64-wide expert tiles (slower), pipelined expert tile (no change),
+low-rank draft head (head is not low-rank), earlier/wider prefetch.
+
 ## 2026-09-22 06:45 PDT — claude-code
 
 Quality: a fake-quantized reference run showed the long-context drift was

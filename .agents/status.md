@@ -1,21 +1,21 @@
 # Status — qwen4exp (Qwen3.8-Flash-Next) in Splash
 
-**Updated:** 2026-09-22 06:45 PDT by claude-code
+**Updated:** 2026-09-22 07:50 PDT by claude-code
 **Branch:** `qwen4exp-review` (not pushed; never push to upstream `incoai/splash`)
 
 ## In one line
 
-Quality now matches llama.cpp V3, decode is 36–52 tok/s (llama.cpp: 18, or 27
-with its draft head), and prompt reading is ~2x faster than before (154–390
-tok/s, above llama.cpp) — same 36 GiB expert budget.
+Quality matches llama.cpp V3, decode is 35–50 tok/s (llama.cpp: 18, or 27
+with its draft head), and prompts read at ~180–670 tok/s (llama.cpp ~110–367)
+— same 36 GiB expert budget.
 
 ## Numbers (one warm engine, 384 tokens, guess cap 5)
 
 | Prompt | Greedy | Sampled 0.7 | Prompt reading |
 |---|---|---|---|
-| Short, 65 tok | 52.3 | 41.3 | ~154 tok/s |
-| Code, 1,495 tok | 38.1 | 36.6 | ~380 tok/s |
-| Long, 9,129 tok | 38.2 | 38.0 | ~375–390 tok/s |
+| Short, 65 tok | 49.7 | 46.0 | ~180–220 tok/s |
+| Code, 1,495 tok | 37.7 | 35.3 | ~585 tok/s |
+| Long, 9,129 tok | 36.7 | 36.9 | ~670 tok/s (4,096-token chunks) |
 
 Quality on the code prompt (bf16 reference): 91% same top pick, KL 0.12
 (second half 90%, 0.16). llama.cpp V3: 89%, 0.18.
@@ -38,8 +38,8 @@ shared-event hand-off, and shared-memory flags cannot replace it — probe in
 
 ## Open work
 
-1. **Attention past 2,048 tokens** (sparse indexer unwired): measuring
-   whether dense attention hurts quality there (4K reference run).
+1. Attention past 2,048 tokens: measured, kept dense (the reference's
+   sparse indexer predicts the text worse past 3K: ppl 10.3 vs 4.5).
 2. Decode: hide misses / hand-offs (needs GPU-side routing to go further);
    MTP draft ~9 ms; mixing kernels ~100 GB/s.
 3. 27B regression check needs a 4-bit 27B package (installed one is Q8,
