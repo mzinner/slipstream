@@ -1,6 +1,6 @@
 # Status — qwen4exp (Qwen3.8-Flash-Next) in Splash
 
-**Updated:** 2026-09-22 09:15 PDT by claude-code
+**Updated:** 2026-09-22 (review) by claude-code
 **Branch:** `qwen4exp-review` (not pushed; never push to upstream `incoai/splash`)
 
 ## In one line
@@ -13,9 +13,12 @@ with its draft head), and prompts read at ~180–670 tok/s (llama.cpp ~110–367
 
 | Prompt | Greedy | Sampled 0.7 | Prompt reading |
 |---|---|---|---|
-| Short, 65 tok | 49.7 | 46.0 | ~180–220 tok/s |
-| Code, 1,495 tok | 37.7 | 35.3 | ~585 tok/s |
-| Long, 9,129 tok | 36.7 | 36.9 | ~670 tok/s (4,096-token chunks) |
+| Short, 65 tok | 50.0 | 46.1 | 178–217 tok/s |
+| Code, 1,495 tok | 37.9 | 35.4 | ~583 tok/s |
+| Long, 9,129 tok | 36.3 | 34.4 | 609–666 tok/s (4,096-token chunks) |
+
+Server, agent-style (4.6K-token system prompt, 5 tools): first token 8.3 s
+cold, ~1 s with the prompt cached; tool calls correct greedy and sampled.
 
 Quality on the code prompt (bf16 reference): 91% same top pick, KL 0.12
 (second half 90%, 0.16). llama.cpp V3: 89%, 0.18.
@@ -23,18 +26,22 @@ Quality on the code prompt (bf16 reference): 91% same top pick, KL 0.12
 ## Package format now (no backward compatibility)
 
 - Routed experts 4-bit (unchanged). Mixers, output head, embedding: 8-bit.
-  Hyper-connection mix weights: 8-bit, row-major, scale+bias per 64.
+  Hyper-connection mix weights: 8-bit in the matrix kernels' tiled layout
+  (down projection padded 320 -> 512 outputs), so prompts run them as matrix
+  products and decode reads them with its own kernels.
 - 4-bit copy of the output head, used only by the MTP draft.
-- Magics: layer MDFN0021, head MDFN0024, embedding MDFN0013, MTP combiner
-  MDFN0025. `convert_qwen4exp.py --requantize-mixers` / `--head-only` rewrite
-  an existing package in place in under a minute (experts copied).
+- Magics: layer MDFN0031, head MDFN0034, embedding MDFN0013, MTP combiner
+  MDFN0035. Manifest `prefill_token_budget` 4096 (built maximum 4096).
+- `convert_qwen4exp.py --requantize-mixers` rewrites the previous layer
+  version in place in under a minute (experts copied); `--head-only` rewrites
+  head.bin. A package at an older magic must be stepped through in order.
 
-## Where decode time goes (code prompt, ~84 ms a step, ~3.2 tokens a step at cap 3)
+## Where decode time goes (code prompt, ~95 ms a step, ~3.7 tokens a step at cap 5)
 
-GPU kernels ~41 ms (near bandwidth; mixing kernels the least efficient);
-host miss reads ~18 ms; per-layer hand-offs ~7–11 ms (structural: 164 us per
-shared-event hand-off, and shared-memory flags cannot replace it — probe in
-`dev/benchmarks/qwen4exp/probes/handoff_latency.mm`); MTP draft ~9 ms.
+GPU ~46 ms (8-bit matrix kernels at the bandwidth floor; expert kernels ~70%);
+SSD miss reads ~17 ms; per-layer GPU<->host hand-offs ~8 ms (structural: 164 us
+each, probe `dev/benchmarks/qwen4exp/probes/handoff_latency.mm`); MTP draft
+~13 ms (mostly real GPU work).
 
 ## Open work (measured gaps, largest first)
 
