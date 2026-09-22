@@ -188,6 +188,20 @@ struct Qwen4ExpLayout final {
   bool operator==(const Qwen4ExpLayout &) const = default;
 };
 
+// How many experts each streamed layer caches, and the bytes that pins at
+// load (caches plus the prompt staging buffer). The loader allocates exactly
+// this; startup checks it against free memory first, so a second engine
+// started beside a running one refuses instead of freezing the machine.
+// Reads SPLASH_RESIDENT_LAYERS, SPLASH_EXPERT_CACHE_GIB and
+// SPLASH_EXPERT_CACHE_CAPACITY.
+struct Qwen4ExpCachePlan final {
+  uint32_t residentLayers = 0;
+  uint32_t capacity = 0;
+  uint64_t pinnedBytes = 0;
+};
+[[nodiscard]] Qwen4ExpCachePlan planQwen4ExpExpertCache(const Qwen4ExpLayout &layout,
+                                                        bool mtpLayer);
+
 // Hyper-connections replace the usual input and post-attention norms. The
 // residual is four parallel streams carried as one row of hc*hidden, and each
 // block reads a mix of them and writes back a gated injection.
@@ -363,6 +377,9 @@ struct Qwen4ExpWeights final {
   mutable metal::MetalBuffer predictScratch;
   // Prompt expert waves: one tile count per wave, 256 bytes apart.
   mutable metal::MetalBuffer prefillRangeCounts;
+  // Decode expert waves: [first, end) of the cached tiles at byte 0 and of
+  // the tiles still being read at byte 256.
+  mutable metal::MetalBuffer decodeRanges;
   // The MTP pick's per-slice candidates and softmax mass (mtp_pick.metal).
   mutable metal::MetalBuffer mtpPickIds, mtpPickValues, mtpPickMass;
   // The split prompt kernels' gate outputs, kept apart from expertOutput.

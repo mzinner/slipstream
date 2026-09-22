@@ -5,7 +5,10 @@
 #include <algorithm>
 #include <cmath>
 #include <dispatch/dispatch.h>
+#include <mach/mach.h>
 #include <iostream>
+#include <sstream>
+#include <stdexcept>
 #include <string_view>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
@@ -16,6 +19,32 @@ namespace {
 constexpr std::string_view kNextHeadMagic = "MDFN0034";  // 8-bit logits and tiled mixer, 4-bit draft copy
 constexpr std::string_view kNextEmbeddingMagic = "MDFN0013";  // 8-bit rows
 constexpr std::string_view kNextNgramMagic = "MDFN0004";
+
+// Memory macOS could hand out now: physical minus used pages, crediting
+// file-backed and purgeable pages. Same estimate as
+// engine::queryHostAvailableMemory; repeated here because model code does
+// not link the engine.
+uint64_t hostAvailableBytes() {
+  uint64_t physical = 0;
+  size_t length = sizeof(physical);
+  if (sysctlbyname("hw.memsize", &physical, &length, nullptr, 0) != 0) return 0;
+  mach_port_t host = mach_host_self();
+  vm_size_t pageSize = 0;
+  vm_statistics64_data_t stats{};
+  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+  const bool ok = host_page_size(host, &pageSize) == KERN_SUCCESS &&
+      host_statistics64(host, HOST_VM_INFO64,
+                        reinterpret_cast<host_info64_t>(&stats), &count) == KERN_SUCCESS;
+  mach_port_deallocate(mach_task_self(), host);
+  if (!ok || !pageSize) return 0;
+  uint64_t used = uint64_t{stats.active_count} + stats.inactive_count +
+                  stats.speculative_count + stats.wire_count +
+                  stats.compressor_page_count;
+  const uint64_t credit = uint64_t{stats.external_page_count} + stats.purgeable_count;
+  used = used > credit ? used - credit : 0;
+  const uint64_t usedBytes = used * pageSize;
+  return usedBytes < physical ? physical - usedBytes : 0;
+}
 
 void requireLayout(const Qwen4ExpLayout &layout) {
   if (!layout.maximumContextTokens || !layout.layers || !layout.hiddenSize ||
@@ -226,6 +255,41 @@ ops::ExpertQ4Projection detachExpert(metal::MetalBackend &backend, const ops::Ex
 
 } // namespace
 
+Qwen4ExpCachePlan planQwen4ExpExpertCache(const Qwen4ExpLayout &layout,
+                                          bool mtpLayer) {
+  Qwen4ExpCachePlan plan;
+  if (const char *envResident = getenv("SPLASH_RESIDENT_LAYERS"))
+    plan.residentLayers = std::min<uint32_t>(layout.layers, std::max(0, std::atoi(envResident)));
+  if (plan.residentLayers >= layout.layers) return plan;
+  const uint64_t expertStride = uint64_t{layout.expertIntermediateSize} * layout.hiddenSize * 9 / 16;
+  // The expert cache gets the budget llama.cpp's --moe-stream-cache uses on
+  // this machine: everything but ~28 GiB, i.e. 36 GiB of 64. Measured on a
+  // 64 GB M5 Pro: 16 GiB (128 per layer) 10-13 tok/s, 36 GiB 14-19. Past
+  // ~38 GiB both engines swap. SPLASH_EXPERT_CACHE_GIB or _CAPACITY override.
+  uint64_t physical = 0;
+  size_t length = sizeof(physical);
+  (void)sysctlbyname("hw.memsize", &physical, &length, nullptr, 0);
+  const double physicalGiB = double(physical) / double(1ULL << 30);
+  double budgetGiB = std::max(8.0, physicalGiB - 28.0);
+  if (const char *envGiB = getenv("SPLASH_EXPERT_CACHE_GIB"))
+    budgetGiB = std::max(1.0, std::atof(envGiB));
+  // The prompt staging buffer comes out of the same budget.
+  budgetGiB -= double(kPromptStagingExperts) * 3 * double(expertStride) /
+               double(1ULL << 30);
+  const uint64_t perSlot =
+      3 * expertStride * uint64_t(layout.layers - plan.residentLayers);
+  plan.capacity = static_cast<uint32_t>(std::max(0.0, std::min<double>(
+      layout.experts, budgetGiB * double(1ULL << 30) / double(perSlot))));
+  if (const char *envCap = getenv("SPLASH_EXPERT_CACHE_CAPACITY"))
+    plan.capacity = std::max(16, std::atoi(envCap));
+  plan.capacity = std::max<uint32_t>(plan.capacity, 16);
+  const uint32_t cachedLayers =
+      layout.layers - plan.residentLayers + (mtpLayer ? 1 : 0);
+  plan.pinnedBytes = 3 * expertStride *
+      (uint64_t{kPromptStagingExperts} + uint64_t{plan.capacity} * cachedLayers);
+  return plan;
+}
+
 Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
                                     const std::filesystem::path &directory,
                                     Qwen4ExpLayout layout) {
@@ -235,11 +299,7 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
   result.layout = layout;
   result.layers.reserve(layout.layers);
 
-  uint32_t residentLayers = 0;
-  const char *envResident = getenv("SPLASH_RESIDENT_LAYERS");
-  if (envResident) {
-    residentLayers = std::min<uint32_t>(layout.layers, std::max(0, std::atoi(envResident)));
-  }
+  const uint32_t residentLayers = planQwen4ExpExpertCache(layout, false).residentLayers;
   result.residentLayers = residentLayers;
   std::cerr << "[Qwen4Exp] resident layers: " << residentLayers << " / " << layout.layers << "\n";
 
@@ -464,33 +524,35 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
   result.lastSelectedExperts.resize(layout.layers);
   if (residentLayers < layout.layers) {
     const uint64_t expertStride = uint64_t{layout.expertIntermediateSize} * layout.hiddenSize * 9 / 16;
-    // The expert cache gets the budget llama.cpp's --moe-stream-cache uses on
-    // this machine: everything but ~28 GiB, i.e. 36 GiB of 64. Measured on a
-    // 64 GB M5 Pro: 16 GiB (128 per layer) 10-13 tok/s, 36 GiB 14-19. Past
-    // ~38 GiB both engines swap. SPLASH_EXPERT_CACHE_GIB or _CAPACITY override.
-    uint32_t cacheCapacity = 0;
+    const Qwen4ExpCachePlan cachePlan =
+        planQwen4ExpExpertCache(layout, static_cast<bool>(result.mtpLayer));
+    const uint32_t cacheCapacity = cachePlan.capacity;
+    // The cache is pinned: macOS cannot page it out. If it does not fit in
+    // free memory, the machine freezes until its watchdog restarts it (twice
+    // on 2026-09-22: two engines at once, then one asked for 60 GiB). The
+    // margin is small on purpose: the default 34 GiB cache normally leaves
+    // ~4 GiB, and the runtime governor guards what follows; a second engine
+    // finds ~4 GiB against 35 needed and stops here.
     {
       uint64_t physical = 0;
       size_t length = sizeof(physical);
       (void)sysctlbyname("hw.memsize", &physical, &length, nullptr, 0);
-      const double physicalGiB = double(physical) / double(1ULL << 30);
-      double budgetGiB = std::max(8.0, physicalGiB - 28.0);
-      if (const char *envGiB = getenv("SPLASH_EXPERT_CACHE_GIB"))
-        budgetGiB = std::max(1.0, std::atof(envGiB));
-      // The prompt staging buffer comes out of the same budget.
-      budgetGiB -= double(kPromptStagingExperts) * 3 * double(expertStride) /
-                   double(1ULL << 30);
-      const uint64_t perSlot =
-          3 * expertStride * uint64_t(layout.layers - residentLayers);
-      cacheCapacity = static_cast<uint32_t>(std::min<double>(
-          layout.experts, budgetGiB * double(1ULL << 30) / double(perSlot)));
+      const uint64_t reserve = physical / 32;
+      const uint64_t available = hostAvailableBytes();
+      constexpr double kGiB = double(1ULL << 30);
+      std::cerr << "[Qwen4Exp] expert cache: " << cacheCapacity
+                << " experts per layer, pins " << double(cachePlan.pinnedBytes) / kGiB
+                << " GiB; free now " << double(available) / kGiB << " GiB\n";
+      if (available < cachePlan.pinnedBytes + reserve) {
+        std::ostringstream message;
+        message << "expert cache needs " << double(cachePlan.pinnedBytes) / kGiB
+                << " GiB plus " << double(reserve) / kGiB
+                << " GiB kept free for macOS, but only " << double(available) / kGiB
+                << " GiB is free. Is another model running? Otherwise lower "
+                   "SPLASH_EXPERT_CACHE_GIB.";
+        throw std::runtime_error(message.str());
+      }
     }
-    if (const char *envCap = getenv("SPLASH_EXPERT_CACHE_CAPACITY")) {
-      cacheCapacity = std::max(16, std::atoi(envCap));
-    }
-    cacheCapacity = std::max<uint32_t>(cacheCapacity, 16);
-    std::cerr << "[Qwen4Exp] expert cache: " << cacheCapacity
-              << " experts per layer\n";
     const uint64_t cacheBytes = uint64_t{cacheCapacity} * expertStride;
     {
       auto &staging = result.promptStaging;
