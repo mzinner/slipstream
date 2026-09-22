@@ -11,6 +11,7 @@
 #include "ops/PagedAttention.hpp"
 
 #include <algorithm>
+#include <bitset>
 #include <random>
 #include <cmath>
 #include <map>
@@ -811,21 +812,25 @@ void Qwen4ExpTarget::addPrefill(
 
   uint32_t totalMisses = 0;
 
-  auto stageActiveExperts = [&](uint32_t layerIndex) -> bool {
+  // Loads the experts rows [begin, end) route to into the layer's cache and
+  // points those rows' routes at their slots. The range's experts must fit.
+  auto stageActiveExperts = [&](uint32_t layerIndex, uint32_t begin,
+                                uint32_t end) {
     auto &cache = weights.layers[layerIndex].expertCache;
     auto *selPtr = static_cast<uint32_t *>(buffers.selectedExperts.contents());
     const uint32_t routesPerRow = moePlan.shape().routesPerToken();
     const uint32_t expertsPerToken = weights.layout.expertsPerToken;
     const uint32_t totalExperts = weights.layout.experts;
     constexpr uint32_t kMaxExperts = 512;
-    logRoutes('P', layerIndex, selPtr, rows, routesPerRow, expertsPerToken,
-              rows, rows);
+    if (begin == 0)
+      logRoutes('P', layerIndex, selPtr, rows, routesPerRow, expertsPerToken,
+                rows, rows);
     int16_t stepExpertSeen[kMaxExperts];
     std::fill_n(stepExpertSeen, kMaxExperts, -1);
     std::vector<uint32_t> uniqueExperts;
     uniqueExperts.reserve(32);
 
-    for (uint32_t r = 0; r < rows; ++r) {
+    for (uint32_t r = begin; r < end; ++r) {
       for (uint32_t k = 0; k < expertsPerToken; ++k) {
         uint32_t exp = selPtr[r * routesPerRow + k];
         if (exp < totalExperts && stepExpertSeen[exp] == -1) {
@@ -839,11 +844,8 @@ void Qwen4ExpTarget::addPrefill(
       weights.lastSelectedExperts[layerIndex] = uniqueExperts;
     }
 
-    if (uniqueExperts.size() > cache.capacity) {
-      // Prompt requires more unique experts than cache capacity in this layer;
-      // fall back to monolithic layer.ffn
-      return false;
-    }
+    if (uniqueExperts.size() > cache.capacity)
+      throw std::logic_error("prefill slice needs more experts than the cache holds");
 
     struct Miss {
       uint32_t expert;
@@ -909,7 +911,7 @@ void Qwen4ExpTarget::addPrefill(
                         stride, cg, cu, cd);
     }
 
-    for (uint32_t r = 0; r < rows; ++r) {
+    for (uint32_t r = begin; r < end; ++r) {
       for (uint32_t k = 0; k < expertsPerToken; ++k) {
         uint32_t exp = selPtr[r * routesPerRow + k];
         if (exp < totalExperts) {
@@ -919,7 +921,60 @@ void Qwen4ExpTarget::addPrefill(
       selPtr[r * routesPerRow + expertsPerToken] = 512;
     }
 
-    return true;
+  };
+
+  // Row ranges whose experts fit in the layer's cache together. A prompt
+  // chunk can route to more distinct experts than a layer caches; reading
+  // those from the mapped file instead stalled the GPU for seconds on page
+  // faults, so the chunk's expert step runs one range at a time.
+  auto planSlices = [&](uint32_t layerIndex) {
+    const auto &cache = weights.layers[layerIndex].expertCache;
+    const auto *selPtr = static_cast<const uint32_t *>(buffers.selectedExperts.contents());
+    const uint32_t routesPerRow = moePlan.shape().routesPerToken();
+    const uint32_t expertsPerToken = weights.layout.expertsPerToken;
+    std::vector<uint32_t> ends;
+    std::bitset<512> seen;
+    // Rows go in pairs so every range starts on an even row: the routing
+    // weights are 2-byte values, 11 to a row, and a view's offset must stay
+    // 4-byte aligned.
+    for (uint32_t r = 0; r < rows; r += 2) {
+      std::bitset<512> pair;
+      for (uint32_t k = 0; k < 2 * expertsPerToken; ++k) {
+        const uint32_t pairRow = r + k / expertsPerToken;
+        if (pairRow >= rows)
+          break;
+        const uint32_t exp = selPtr[pairRow * routesPerRow + k % expertsPerToken];
+        if (exp < 512)
+          pair[exp] = true;
+      }
+      if ((seen | pair).count() > cache.capacity) {
+        ends.push_back(r);
+        seen.reset();
+      }
+      seen |= pair;
+    }
+    ends.push_back(rows);
+    return ends;
+  };
+
+  auto encodeMoESlice = [&](metal::CommandGraph &g, const ops::MoeWeights &weightsToUse,
+                            uint32_t begin, uint32_t count) {
+    const uint32_t routesPerRow = moePlan.shape().routesPerToken();
+    auto rowsOf = [&](const metal::MetalBuffer &buffer, uint64_t bytesPerRow) {
+      return backend.view(buffer, begin * bytesPerRow, count * bytesPerRow);
+    };
+    const uint64_t hiddenBytes = uint64_t{geometry.hiddenSize} * 2;
+    const metal::MetalBuffer input = rowsOf(buffers.hyperMixed, hiddenBytes);
+    ops::MoE::addExecute(
+        g,
+        {input, input, rowsOf(buffers.gdnOutput, hiddenBytes),
+         rowsOf(buffers.selectedExperts, routesPerRow * 4ull),
+         rowsOf(buffers.routingWeights, routesPerRow * 2ull),
+         buffers.tileDescriptors, buffers.tileCount, buffers.groupedRoutes,
+         buffers.routeRows, buffers.groupedInput, buffers.expertIntermediate,
+         buffers.expertOutput},
+        weightsToUse, operators.moePrefill(geometry.moe, count),
+        /*addResidual=*/false);
   };
 
   auto makeCacheWeights = [&](uint32_t layerIndex) -> ops::MoeWeights {
@@ -980,16 +1035,39 @@ void Qwen4ExpTarget::addPrefill(
   double totalGpuMs = 0.0;
 
   // Loop through streaming layers R .. geometry.layers - 2
-  for (uint32_t L = R; L < geometry.layers - 1; ++L) {
+  // Every range but the last runs now, each after its experts are loaded
+  // (and after the range before it finished with the slots it may evict).
+  // The last range goes into `g`, ahead of the rest of the layer.
+  uint32_t totalSlices = 0;
+  auto encodeLayerExperts = [&](metal::CommandGraph &g, uint32_t L) {
+    const std::vector<uint32_t> ends = planSlices(L);
+    totalSlices += static_cast<uint32_t>(ends.size());
+    uint32_t begin = 0;
+    for (size_t i = 0; i + 1 < ends.size(); ++i) {
+      auto ts0 = std::chrono::steady_clock::now();
+      stageActiveExperts(L, begin, ends[i]);
+      auto ts1 = std::chrono::steady_clock::now();
+      totalStageMs += std::chrono::duration<double, std::milli>(ts1 - ts0).count();
+      metal::CommandGraph slice;
+      encodeMoESlice(slice, makeCacheWeights(L), begin, ends[i] - begin);
+      (void)backend.submitCommandAsync(slice.dispatches()).wait();
+      totalGpuMs += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - ts1).count();
+      begin = ends[i];
+    }
     auto ts0 = std::chrono::steady_clock::now();
-    bool staged = stageActiveExperts(L);
-    auto ts1 = std::chrono::steady_clock::now();
-    totalStageMs += std::chrono::duration<double, std::milli>(ts1 - ts0).count();
+    stageActiveExperts(L, begin, rows);
+    totalStageMs += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - ts0).count();
+    if (begin == 0)
+      encodeMoEExecute(g, makeCacheWeights(L));
+    else
+      encodeMoESlice(g, makeCacheWeights(L), begin, rows - begin);
+  };
 
-    ops::MoeWeights moeW = staged ? makeCacheWeights(L) : weights.layers[L].ffn;
-
+  for (uint32_t L = R; L < geometry.layers - 1; ++L) {
     metal::CommandGraph stepGraph;
-    encodeMoEExecute(stepGraph, moeW);
+    encodeLayerExperts(stepGraph, L);
     encodeMlpUpdate(stepGraph, L);
     encodeCapture(stepGraph, L);
 
@@ -1007,20 +1085,13 @@ void Qwen4ExpTarget::addPrefill(
   }
 
   const uint32_t lastL = geometry.layers - 1;
-  auto ts0 = std::chrono::steady_clock::now();
-  bool stagedLast = stageActiveExperts(lastL);
-  auto ts1 = std::chrono::steady_clock::now();
-  totalStageMs += std::chrono::duration<double, std::milli>(ts1 - ts0).count();
-
-  ops::MoeWeights moeWLast = stagedLast ? makeCacheWeights(lastL) : weights.layers[lastL].ffn;
-
   if (gdnIndex != geometry.stateLayout.layers ||
       attentionIndex + geometry.extraKvLayers != kvLayers.size()) {
     throw std::logic_error("Qwen target layer partition mismatch");
   }
 
   // Encode final layer's MoE, MLP update, and capture into caller's graph
-  encodeMoEExecute(graph, moeWLast);
+  encodeLayerExperts(graph, lastL);
   encodeMlpUpdate(graph, lastL);
   encodeCapture(graph, lastL);
 
@@ -1121,7 +1192,8 @@ void Qwen4ExpTarget::addPrefill(
   }
 
   std::cerr << "[Prefill Timing] Resident 0.." << R << ": " << residentMs << " ms | Streaming Staging: "
-            << totalStageMs << " ms (misses: " << totalMisses << ") | Streaming GPU: " << totalGpuMs << " ms\n";
+            << totalStageMs << " ms (misses: " << totalMisses << ", expert passes: "
+            << totalSlices << ") | Streaming GPU: " << totalGpuMs << " ms\n";
 
   if (gdnIndex != geometry.stateLayout.layers ||
       attentionIndex + geometry.extraKvLayers != kvLayers.size()) {
@@ -2000,7 +2072,10 @@ void Qwen4ExpTarget::addVerify(
   };
 
   double mtpMs = 0.0;
-  if (buffers.mtpEnabled && weights.mtpLayer && lanes == 1 && buffers.mtp[0].rows) {
+  if (buffers.mtpDrafted) {
+    buffers.liveRowsPerLane = 1 + *buffers.mtpProposedOut;
+    setLiveRows();
+  } else if (buffers.mtpEnabled && weights.mtpLayer && lanes == 1 && buffers.mtp[0].rows) {
     const auto mtpStart = std::chrono::steady_clock::now();
     const auto drafts = runMtpDraft();
     mtpMs = std::chrono::duration<double, std::milli>(
@@ -2050,6 +2125,9 @@ void Qwen4ExpTarget::addVerify(
                 << "  guess 2: " << hits[1] << "/" << total[1]
                 << "  guess 3: " << hits[2] << "/" << total[2] << "\n";
   }
+
+  if (buffers.mtpDraftOnly)
+    return;
 
   metal::CommandGraph residentGraph = std::move(graph);
   for (uint32_t layerIndex = 0; layerIndex < R; ++layerIndex) {

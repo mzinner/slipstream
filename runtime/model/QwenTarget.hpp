@@ -322,6 +322,12 @@ struct QwenTargetVerifyBuffers final {
   // Out: proposals the MTP head actually made for lane 0 (it stops when
   // unsure), so the runtime can cap the rows the verifier keeps.
   uint32_t *mtpProposedOut = nullptr;
+  // A constrained request needs the proposals before the step, to build its
+  // grammar masks. `mtpDraftOnly` runs just the head and returns; the step
+  // then runs with `mtpDrafted`, reusing those proposals (and
+  // *mtpProposedOut) instead of drafting again.
+  bool mtpDraftOnly = false;
+  bool mtpDrafted = false;
   // The draft's distribution per proposal as the acceptance reads it: 16
   // candidate ids and their probabilities.
   metal::MetalBuffer proposalCandidates;

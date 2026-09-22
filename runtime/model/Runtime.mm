@@ -1225,10 +1225,15 @@ struct Runtime::Impl {
         kDraftProposalTokens);
   }
 
-  void encodeTargetVerifyBatchForward(CommandGraph &graph,
-                                      std::span<Request *const> entries,
-                                      std::span<const ModelBatchItem> items,
-                                      ops::Q4DispatchStats &stats) {
+  // How a verify step treats the MTP head: draft then verify (the usual
+  // step), draft only (a constrained request needs the proposals first, for
+  // its grammar masks), or verify proposals an earlier draft-only call made.
+  enum class MtpPhase { DraftAndVerify, DraftOnly, AlreadyDrafted };
+
+  void encodeTargetVerifyBatchForward(
+      CommandGraph &graph, std::span<Request *const> entries,
+      std::span<const ModelBatchItem> items, ops::Q4DispatchStats &stats,
+      MtpPhase mtpPhase = MtpPhase::DraftAndVerify) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid target verify batch");
@@ -1293,8 +1298,11 @@ struct Runtime::Impl {
     buffers.hyperInjection = d(DecodeTensor::HyperInjection);
     buffers.hyperMixed = d(DecodeTensor::HyperMixed);
     buffers.liveRowsPerLane = package.descriptor.draftPlaceholder ? 1u : kDecodeRows;
-    mtpProposed = kMtpProposals;
+    if (mtpPhase != MtpPhase::AlreadyDrafted)
+      mtpProposed = kMtpProposals;
     buffers.mtpProposedOut = &mtpProposed;
+    buffers.mtpDraftOnly = mtpPhase == MtpPhase::DraftOnly;
+    buffers.mtpDrafted = mtpPhase == MtpPhase::AlreadyDrafted;
     buffers.mtpEnabled = mtpDrafting();
     buffers.mtpShadow = !(lanes == 1 && mtpProposing(laneEntry(entries, 0)));
     if (!buffers.mtpShadow)
@@ -1644,6 +1652,17 @@ struct Runtime::Impl {
       if (stage_ == Stage::Draft && command_.ready()) {
         addTiming(command_.wait());
         std::array<Request *, kLaneCount> entries{};
+        // With the MTP head proposing, its guesses are what the grammar must
+        // simulate, so draft them now; the target step below reuses them.
+        const bool mtpProposes = lanes_.size() == 1 &&
+                                 impl_.mtpProposing(*lanes_[0].request);
+        if (mtpProposes) {
+          entries[0] = lanes_[0].request;
+          CommandGraph unused;
+          impl_.encodeTargetVerifyBatchForward(
+              unused, {entries.data(), 1}, items_, stats_,
+              MtpPhase::DraftOnly);
+        }
         for (uint32_t lane = 0; lane < lanes_.size(); ++lane) {
           DecodeLaneResult &laneResult = lanes_[lane];
           Request &entry = *laneResult.request;
@@ -1656,6 +1675,10 @@ struct Runtime::Impl {
           const uint32_t remaining = entry.maxNewTokens - entry.generatedTokens;
           laneResult.currentAnchor = *entry.pendingToken;
           laneResult.maximumRetained = impl_.retainedRowLimit(remaining, &entry);
+          // The head may have stopped early; keep no row it did not propose.
+          if (mtpProposes)
+            laneResult.maximumRetained = std::min(laneResult.maximumRetained,
+                                                  1 + impl_.mtpProposed);
           laneResult.verify = true;
           entries[lane] = &entry;
 
@@ -1677,7 +1700,9 @@ struct Runtime::Impl {
         impl_.encodeBatchEmbedding(target, DecodeTensor::InputTokens,
                                    DecodeTensor::Hidden0, width);
         impl_.encodeTargetVerifyBatchForward(
-            target, {entries.data(), lanes_.size()}, items_, stats_);
+            target, {entries.data(), lanes_.size()}, items_, stats_,
+            mtpProposes ? MtpPhase::AlreadyDrafted : MtpPhase::DraftAndVerify);
+        mtpProposes_ = mtpProposes;
         submit(target);
         stage_ = Stage::TargetForward;
       }
@@ -1721,8 +1746,10 @@ struct Runtime::Impl {
           impl_.encodeBatchAcceptance(commit, {entries.data(), lanes_.size()},
                                       {maximumRetained.data(), lanes_.size()});
           impl_.encodeBatchGdnCommit(commit, {entries.data(), lanes_.size()});
-          impl_.encodeDraftStateCommitBatch(
-              commit, {entries.data(), lanes_.size()}, items_, stats_);
+          // Nothing reads the placeholder draft's context when the head drafts.
+          if (!mtpProposes_)
+            impl_.encodeDraftStateCommitBatch(
+                commit, {entries.data(), lanes_.size()}, items_, stats_);
           submit(commit);
           stage_ = Stage::Commit;
         }
@@ -1809,6 +1836,7 @@ struct Runtime::Impl {
     CommandTicket command_;
     CommandTiming timing_;
     std::array<bool, kLaneCount> abandoned_{};
+    bool mtpProposes_ = false;
     double targetForwardGpuSeconds_ = 0.0;
     double maskWaitSeconds_ = 0.0;
     std::optional<std::chrono::steady_clock::time_point> maskWaitStarted_;
@@ -2801,7 +2829,12 @@ ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,
   const RuntimeGeometry geometry = RuntimeGeometry::from(package);
   return {package.stateLayout().activeCellBytes(),
           plannedPrefillBytes(geometry, operators),
-          plannedDecodeBytes(geometry, operators), kPipelineReserveBytes,
+          plannedDecodeBytes(geometry, operators),
+          // A target that streams its experts submits every layer's stage at
+          // once and keeps each stage's graph (and its argument buffers)
+          // alive until the step ends, so it needs twice the pipeline room.
+          package.streamableWeightBytes() ? 2 * kPipelineReserveBytes
+                                          : kPipelineReserveBytes,
           kRuntimeOverheadReserveBytes};
 }
 
