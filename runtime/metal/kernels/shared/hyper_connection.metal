@@ -23,6 +23,10 @@ constant constexpr uint kThreads = 256;
 constant constexpr uint kSimdWidth = 32;
 constant constexpr uint kSimdgroups = kThreads / kSimdWidth;
 
+inline ulong hc_row(constant HyperConnectionParams &params, uint row) {
+  return ulong(row) * (params.row_step ? params.row_step : 1);
+}
+
 // Per-stream RMS, then the low-rank reduction. One threadgroup per row.
 kernel void hyper_connection_normalize(
     device const bfloat *input [[buffer(0)]],
@@ -187,11 +191,12 @@ kernel void hyper_connection_update(
   const uint width = params.count * hidden;
   const uint total = params.rows * width;
   for (uint element = index; element < total; element += grid_size) {
-    const uint row = element / width;
+    const ulong row = hc_row(params, element / width);
     const uint offset = element % width;
     const float gate = float(injection[row * params.count + offset / hidden]);
     const float value = float(block[row * hidden + offset % hidden]);
-    residual[element] = bfloat(float(residual[element]) + gate * value);
+    const ulong at = row * width + offset;
+    residual[at] = bfloat(float(residual[at]) + gate * value);
   }
 }
 
@@ -207,11 +212,12 @@ kernel void hyper_connection_update_out(
   const uint width = params.count * hidden;
   const uint total = params.rows * width;
   for (uint element = index; element < total; element += grid_size) {
-    const uint row = element / width;
+    const ulong row = hc_row(params, element / width);
     const uint offset = element % width;
     const float gate = float(injection[row * params.count + offset / hidden]);
     const float value = float(block[row * hidden + offset % hidden]);
-    residual_out[element] = bfloat(float(residual_in[element]) + gate * value);
+    const ulong at = row * width + offset;
+    residual_out[at] = bfloat(float(residual_in[at]) + gate * value);
   }
 }
 
@@ -301,6 +307,7 @@ kernel void hyper_connection_accumulate(
 
 constant constexpr uint kRowBlock = 8;
 
+
 // 1. xn = rms_per_stream(x) * (1 + gain). One threadgroup per (row, stream).
 kernel void hyper_connection_rms(
     device const bfloat *input [[buffer(0)]],
@@ -315,7 +322,7 @@ kernel void hyper_connection_rms(
   if (row >= params.rows || stream >= params.count)
     return;
   const uint hidden = params.hidden, width = params.count * hidden;
-  const ulong base = ulong(row) * width + stream * hidden;
+  const ulong base = hc_row(params, row) * width + stream * hidden;
   device const bfloat4 *x4 = reinterpret_cast<device const bfloat4 *>(input + base);
   float sum = 0.0f;
   for (uint i = thread_index; i < hidden / 4; i += kThreads) {
@@ -373,7 +380,7 @@ kernel void hyper_connection_down(
         const uint r = e / (kDownSlice / 4), c = e % (kDownSlice / 4);
         staged[r][c] = r < count
             ? float4(reinterpret_cast<device const bfloat4 *>(
-                  normalized + ulong(first + r) * width + slice)[c])
+                  normalized + hc_row(params, first + r) * width + slice)[c])
             : float4(0);
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -391,10 +398,10 @@ kernel void hyper_connection_down(
       if (active && simd_lane == 0 && r < count) {
         const float v = total / float(params.count);
         if (is_inject)
-          injection[ulong(first + r) * params.count + (output - params.low_rank)] =
+          injection[hc_row(params, first + r) * params.count + (output - params.low_rank)] =
               bfloat(2.0f / (1.0f + exp(-v)));
         else
-          reduced[ulong(first + r) * params.low_rank + output] =
+          reduced[hc_row(params, first + r) * params.low_rank + output] =
               bfloat(v / (1.0f + exp(-v)));
       }
     }
@@ -438,7 +445,7 @@ kernel void hyper_connection_up_mix(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint e = thread_index; e < kRowBlock * kLowRank; e += kThreads) {
       const uint r = e / kLowRank, c = e % kLowRank;
-      staged[r][c] = r < count ? float(reduced[ulong(first + r) * kLowRank + c]) : 0.0f;
+      staged[r][c] = r < count ? float(reduced[hc_row(params, first + r) * kLowRank + c]) : 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint r = 0; r < count; ++r) {
@@ -450,10 +457,10 @@ kernel void hyper_connection_up_mix(
           sum += w[k][j] * v[j];
         sum = simd_sum(sum);
         const float gate = 1.0f / (1.0f + exp(-sum));
-        mean += gate * float(normalized[ulong(first + r) * width + k * hidden + position]);
+        mean += gate * float(normalized[hc_row(params, first + r) * width + k * hidden + position]);
       }
       if (simd_lane == 0)
-        mixed[ulong(first + r) * hidden + position] = bfloat(mean / float(params.count));
+        mixed[hc_row(params, first + r) * hidden + position] = bfloat(mean / float(params.count));
     }
   }
 }

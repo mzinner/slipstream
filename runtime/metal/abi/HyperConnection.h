@@ -16,7 +16,11 @@ struct HyperConnectionParams {
   // hyper_connection_down also computes the injection gates. Zero for the
   // final mixer, which has none.
   uint32_t with_inject;
+  // Logical row r is physical row r * row_step (0 means 1). Decode with one
+  // live row per 8-row lane processes only rows 0, 8, 16, ...
+  uint32_t row_step;
+  uint32_t reserved;
 };
 
-static_assert(sizeof(HyperConnectionParams) == 24,
-              "HyperConnectionParams must be 24 bytes on both sides");
+static_assert(sizeof(HyperConnectionParams) == 32,
+              "HyperConnectionParams must be 32 bytes on both sides");

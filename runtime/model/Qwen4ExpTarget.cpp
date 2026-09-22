@@ -227,11 +227,12 @@ void addHyperConnection(metal::CommandGraph &graph,
                         const Qwen4ExpHyperConnection &weights,
                         metal::MetalBuffer normalized,
                         metal::MetalBuffer reduced, metal::MetalBuffer mixed,
-                        metal::MetalBuffer injection, uint32_t rows) {
+                        metal::MetalBuffer injection, uint32_t rows,
+                        uint32_t rowStep = 1) {
   const bool withInject = weights.blockInject.has_value();
   const HyperConnectionParams params{
       rows, geometry.hiddenSize, geometry.hyperConnectionCount,
-      geometry.hyperConnectionLowRank, 1e-6f, withInject ? 1u : 0u};
+      geometry.hyperConnectionLowRank, 1e-6f, withInject ? 1u : 0u, rowStep, 0};
   graph.add("hyper_connection_rms", {std::move(input), weights.norm, normalized},
             params, {rows, geometry.hyperConnectionCount, 1}, {256, 1, 1});
   const uint32_t outputs = geometry.hyperConnectionLowRank +
@@ -410,7 +411,7 @@ void Qwen4ExpTarget::addEmbedding(
   // 2. Broadcast across hyperConnectionCount streams
   const HyperConnectionParams params{
       rows, geometry.hiddenSize, geometry.hyperConnectionCount,
-      geometry.hyperConnectionLowRank, 1e-6f, 1};
+      geometry.hyperConnectionLowRank, 1e-6f, 1, 1, 0};
   const uint32_t total = rows * geometry.residualWidth();
   const uint32_t groups = (total + 255) / 256;
   graph.add("hyper_connection_broadcast",
@@ -491,7 +492,7 @@ void Qwen4ExpTarget::addPrefill(
 
   const HyperConnectionParams hcParams{
       rows, geometry.hiddenSize, geometry.hyperConnectionCount,
-      geometry.hyperConnectionLowRank, 1e-6f, 1};
+      geometry.hyperConnectionLowRank, 1e-6f, 1, 1, 0};
 
   uint32_t gdnIndex = 0;
   uint32_t attentionIndex = 0;
@@ -1031,9 +1032,14 @@ void Qwen4ExpTarget::addVerify(
                                       geometry.attentionWidth};
   const ops::MoePlan moePlan = operators.moeDecode(geometry.moe, lanes);
 
+  // With one live row per lane, hyper-connections run on those rows only:
+  // lane rows 0, 8, 16, ... The other rows' results are never kept.
+  const bool liveOnly = buffers.liveRowsPerLane == 1;
+  const uint32_t hcRows = liveOnly ? lanes : rows;
+  const uint32_t hcStep = liveOnly ? ExecutionLimits::targetVerifyRows : 1;
   const HyperConnectionParams hcParams{
-      rows, geometry.hiddenSize, geometry.hyperConnectionCount,
-      geometry.hyperConnectionLowRank, 1e-6f, 1};
+      hcRows, geometry.hiddenSize, geometry.hyperConnectionCount,
+      geometry.hyperConnectionLowRank, 1e-6f, 1, hcStep, 0};
 
   uint32_t gdnIndex = 0;
   uint32_t attentionIndex = 0;
@@ -1084,7 +1090,8 @@ void Qwen4ExpTarget::addVerify(
     metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
     addHyperConnection(g, geometry, input, layer.attentionHyperConnection,
                        buffers.normalized, buffers.hyperReduced,
-                       buffers.hyperMixed, buffers.hyperInjection, rows);
+                       buffers.hyperMixed, buffers.hyperInjection, hcRows,
+                       hcStep);
   };
 
   auto encodeMixer = [&](metal::CommandGraph &g, uint32_t layerIndex,
@@ -1160,7 +1167,8 @@ void Qwen4ExpTarget::addVerify(
     metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
     addHyperConnection(g, geometry, input, layer.mlpHyperConnection,
                        buffers.normalized, buffers.hyperReduced,
-                       buffers.hyperMixed, buffers.hyperInjection, rows);
+                       buffers.hyperMixed, buffers.hyperInjection, hcRows,
+                       hcStep);
   };
 
   auto encodeMoERoute = [&](metal::CommandGraph &g, uint32_t layerIndex) {
@@ -1235,7 +1243,8 @@ void Qwen4ExpTarget::addVerify(
   auto encodeHead = [&](metal::CommandGraph &g) {
     addHyperConnection(g, geometry, buffers.hidden[geometry.layers & 1],
                        weights.hyperConnectionMixer, buffers.normalized,
-                       buffers.hyperReduced, buffers.finalHidden, {}, rows);
+                       buffers.hyperReduced, buffers.finalHidden, {}, hcRows,
+                       hcStep);
     const ops::LinearMatrix head{geometry.vocabularySize, geometry.hiddenSize};
     operators.linear().addDecodeBatch(g, buffers.finalHidden,
                                       weights.logitsProjection, buffers.logits,

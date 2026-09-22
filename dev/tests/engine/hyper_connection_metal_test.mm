@@ -40,6 +40,8 @@ struct Params {
   uint32_t lowRank;
   float epsilon;
   uint32_t withInject;
+  uint32_t rowStep;
+  uint32_t reserved;
 };
 
 uint16_t toBf16(float value) {
@@ -166,7 +168,7 @@ double worstRelative(const uint16_t *got, const std::vector<float> &want,
 
 void runCase(MetalBackend &backend, uint32_t rows) {
     // Production geometry: four streams of 2560, low rank 320.
-    const Params params{rows, 2560, 4, 320, 1e-6f, 1};
+    const Params params{rows, 2560, 4, 320, 1e-6f, 1, 1, 0};
     const uint32_t width = params.count * params.hidden;
 
     std::mt19937 engine(20260919);
