@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <map>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -150,6 +151,11 @@ int main(int argc, char **argv) {
           executorPlan.runtimeOverheadReserveBytes};
       model::Runtime executor(context);
 
+      const uint32_t profileSteps = [] {
+        const char *value = std::getenv("SPLASH_PROFILE_STEPS");
+        return value ? static_cast<uint32_t>(std::atoi(value)) : 0u;
+      }();
+      std::map<std::string, std::pair<double, uint64_t>> profile;
       for (uint32_t promptIndex = 0; promptIndex < prompts.size(); ++promptIndex) {
         const std::vector<uint32_t> &prompt = prompts[promptIndex];
         const uint64_t laneId = 1 + promptIndex;
@@ -175,8 +181,28 @@ int main(int argc, char **argv) {
           ModelBatchItem item{laneId, slot, offset, offset, count, lanePages};
           item.inputTokens =
               std::span<const uint32_t>(prompt).subspan(offset, count);
+          // SPLASH_PROFILE_PREFILL=1 attributes the prefill's GPU time per kernel.
+          const bool profilePrefill = std::getenv("SPLASH_PROFILE_PREFILL") != nullptr;
+          if (profilePrefill)
+            backend.setDispatchProfiling(true);
           auto results =
               executor.prefill(plan, std::span<const ModelBatchItem>(&item, 1));
+          if (profilePrefill) {
+            backend.setDispatchProfiling(false);
+            std::map<std::string, std::pair<double, uint64_t>> rows;
+            for (const auto &timing : backend.takeDispatchProfile()) {
+              rows[timing.pipelineName].first += timing.gpuSeconds;
+              rows[timing.pipelineName].second += 1;
+            }
+            std::vector<std::pair<std::string, std::pair<double, uint64_t>>> sorted(rows.begin(), rows.end());
+            std::sort(sorted.begin(), sorted.end(), [](const auto &a, const auto &b) {
+              return a.second.first > b.second.first;
+            });
+            for (const auto &row : sorted)
+              std::cerr << "[prefill-profile] " << row.second.first * 1000 << " ms  x"
+                        << row.second.second << "  " << row.first << "\n";
+          }
+
           if (results.size() != 1 || results[0].consumedPromptTokens != count)
             throw std::runtime_error("prefill consumed wrong row count");
           // Scoring runs ask for the logits of every prompt position.
@@ -207,9 +233,24 @@ int main(int argc, char **argv) {
                          {{laneId, 0, 0}}, DecodeStage::Regular};
           ModelBatchItem item{laneId, slot, position, 0, 0, lanePages};
 
+          // SPLASH_PROFILE_STEPS=N times every GPU dispatch of N decode steps,
+          // after the first eight, one dispatch per command so each is
+          // attributed to its kernel. Profiled steps run slower than real ones.
+          const bool profiling = profileSteps && decodeStepMs.size() >= 8 &&
+                                 decodeStepMs.size() < 8 + profileSteps;
+          if (profiling)
+            backend.setDispatchProfiling(true);
           const auto stepStart = std::chrono::steady_clock::now();
           auto results =
               executor.decode(plan, std::span<const ModelBatchItem>(&item, 1));
+          if (profiling) {
+            backend.setDispatchProfiling(false);
+            for (const auto &timing : backend.takeDispatchProfile()) {
+              auto &entry = profile[timing.pipelineName];
+              entry.first += timing.gpuSeconds;
+              entry.second += 1;
+            }
+          }
           const auto stepFinish = std::chrono::steady_clock::now();
           const double stepMs = std::chrono::duration<double, std::milli>(
                                     stepFinish - stepStart)
@@ -251,6 +292,23 @@ int main(int argc, char **argv) {
         std::cout << "]}" << std::endl;
       }
 
+      if (profileSteps && !profile.empty()) {
+        std::vector<std::pair<std::string, std::pair<double, uint64_t>>> rows(
+            profile.begin(), profile.end());
+        std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) {
+          return a.second.first > b.second.first;
+        });
+        double total = 0;
+        for (const auto &row : rows)
+          total += row.second.first;
+        std::cerr << "[profile] per decode step, GPU ms summed per kernel:\n";
+        for (const auto &row : rows)
+          std::cerr << "[profile] " << row.second.first * 1000 / profileSteps
+                    << " ms  x" << row.second.second / profileSteps << "  "
+                    << row.first << "\n";
+        std::cerr << "[profile] total " << total * 1000 / profileSteps
+                  << " ms per step\n";
+      }
       return 0;
     } catch (const std::exception &error) {
       std::cerr << "generate-sample error: " << error.what() << '\n';

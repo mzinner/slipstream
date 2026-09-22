@@ -10,6 +10,7 @@
 #include "ops/PagedAttention.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <bit>
 #include <cstdlib>
@@ -187,6 +188,28 @@ void prefetchExpertRange(const char *base, uint32_t expert, uint64_t stride) {
   const uintptr_t aligned = start & ~(kPage - 1);
   (void)madvise(reinterpret_cast<void *>(aligned), start + stride - aligned,
                 MADV_WILLNEED);
+}
+
+// SPLASH_ROUTE_LOG=path appends every routed expert choice, one line per
+// (phase, layer, row): "P|D layer e0 e1 ... e9". Measurement only; it lets
+// cache sizes and policies be replayed offline against real routing.
+void logRoutes(char phase, uint32_t layer, const uint32_t *selected,
+               uint32_t rows, uint32_t routesPerRow, uint32_t perToken,
+               uint32_t liveRows, uint32_t groupRows) {
+  static FILE *file = [] {
+    const char *path = std::getenv("SPLASH_ROUTE_LOG");
+    return path ? std::fopen(path, "a") : nullptr;
+  }();
+  if (!file)
+    return;
+  for (uint32_t row = 0; row < rows; ++row) {
+    if (row % groupRows >= liveRows)
+      continue;
+    std::fprintf(file, "%c %u", phase, layer);
+    for (uint32_t k = 0; k < perToken; ++k)
+      std::fprintf(file, " %u", selected[row * routesPerRow + k]);
+    std::fputc('\n', file);
+  }
 }
 
 // One sequence's gate, convolution and residual update. `normalized` holds
@@ -667,6 +690,8 @@ void Qwen4ExpTarget::addPrefill(
     const uint32_t expertsPerToken = weights.layout.expertsPerToken;
     const uint32_t totalExperts = weights.layout.experts;
     constexpr uint32_t kMaxExperts = 512;
+    logRoutes('P', layerIndex, selPtr, rows, routesPerRow, expertsPerToken,
+              rows, rows);
     int16_t stepExpertSeen[kMaxExperts];
     std::fill_n(stepExpertSeen, kMaxExperts, -1);
     std::vector<uint32_t> uniqueExperts;
@@ -1185,6 +1210,8 @@ void Qwen4ExpTarget::addVerify(
     const uint32_t expertsPerToken = weights.layout.expertsPerToken;
     const uint32_t totalExperts = weights.layout.experts;
     constexpr uint32_t kMaxExperts = 512;
+    logRoutes('D', layerIndex, selPtr, rows, routesPerRow, expertsPerToken,
+              buffers.liveRowsPerLane, ExecutionLimits::targetVerifyRows);
     int16_t stepExpertSeen[kMaxExperts];
     std::fill_n(stepExpertSeen, kMaxExperts, -1);
     std::vector<uint32_t> uniqueExperts;
