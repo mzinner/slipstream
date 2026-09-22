@@ -54,6 +54,12 @@ shared-event hand-off, and shared-memory flags cannot replace it — probe in
    current format despite lower weight error - unexplained, worth a look.
 6. 27B regression check needs a 4-bit 27B package.
 
+## Handoff
+
+Next-session prompt: `.agents/next-session.md`. Reference logits (bf16 ground
+truth) and passages: `~/models/qwen38-flash-next-reference/` (README there).
+Agent-style server check: `dev/benchmarks/qwen4exp/agent_turn.py`.
+
 ## Tools
 
 - `dev/benchmarks/qwen4exp/profile_steps.py`: per-step decode profile
