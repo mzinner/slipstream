@@ -37,6 +37,8 @@ kernel void hyper_connection_normalize(
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   const uint hidden = params.hidden;
   const uint width = params.count * hidden;
+  const uint hidden4 = hidden / 4;
+  const uint width4 = width / 4;
   device const bfloat *x = input + ulong(row) * width;
   device bfloat *xn = normalized + ulong(row) * width;
 
@@ -45,10 +47,13 @@ kernel void hyper_connection_normalize(
 
   // One stream at a time: each is an independent RMS group.
   for (uint stream = 0; stream < params.count; ++stream) {
+    device const bfloat4 *xs4 =
+        reinterpret_cast<device const bfloat4 *>(x + stream * hidden);
     float sum = 0.0f;
-    for (uint i = thread_index; i < hidden; i += kThreads) {
-      const float value = float(x[stream * hidden + i]);
-      sum += value * value;
+    for (uint i = thread_index; i < hidden4; i += kThreads) {
+      const bfloat4 val = xs4[i];
+      sum += float(val.x) * float(val.x) + float(val.y) * float(val.y) +
+             float(val.z) * float(val.z) + float(val.w) * float(val.w);
     }
     sum = simd_sum(sum);
     if (simd_lane == 0) partial[simd_group] = sum;
@@ -61,20 +66,34 @@ kernel void hyper_connection_normalize(
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
-  for (uint i = thread_index; i < width; i += kThreads)
-    // The stored gain is an offset from one, and is zero-initialized
-    // upstream, so the neutral norm is a zero weight rather than a one.
-    xn[i] = bfloat(float(x[i]) * scales[i / hidden] *
-                   (1.0f + float(gain[i])));
+  device const bfloat4 *x4_in = reinterpret_cast<device const bfloat4 *>(x);
+  device const bfloat4 *gain4 = reinterpret_cast<device const bfloat4 *>(gain);
+  device bfloat4 *xn4 = reinterpret_cast<device bfloat4 *>(xn);
+  for (uint i = thread_index; i < width4; i += kThreads) {
+    const bfloat4 val = x4_in[i];
+    const bfloat4 g = gain4[i];
+    const float scale = scales[i / hidden4];
+    xn4[i] = bfloat4(
+        bfloat(float(val.x) * scale * (1.0f + float(g.x))),
+        bfloat(float(val.y) * scale * (1.0f + float(g.y))),
+        bfloat(float(val.z) * scale * (1.0f + float(g.z))),
+        bfloat(float(val.w) * scale * (1.0f + float(g.w))));
+  }
   threadgroup_barrier(mem_flags::mem_device);
 
   // down is [low_rank, width]; one simdgroup per output, lanes stride the row.
   device bfloat *out = reduced + ulong(row) * params.low_rank;
+  device const bfloat4 *x4 = reinterpret_cast<device const bfloat4 *>(xn);
   for (uint o = simd_group; o < params.low_rank; o += kSimdgroups) {
-    device const bfloat *weights = down + ulong(o) * width;
+    device const bfloat4 *w4 =
+        reinterpret_cast<device const bfloat4 *>(down + ulong(o) * width);
     float sum = 0.0f;
-    for (uint i = simd_lane; i < width; i += kSimdWidth)
-      sum += float(weights[i]) * float(xn[i]);
+    for (uint i = simd_lane; i < width4; i += kSimdWidth) {
+      const bfloat4 w = w4[i];
+      const bfloat4 vx = x4[i];
+      sum += float(w.x) * float(vx.x) + float(w.y) * float(vx.y) +
+             float(w.z) * float(vx.z) + float(w.w) * float(vx.w);
+    }
     sum = simd_sum(sum);
     if (simd_lane == 0) {
       // silu(v) = v * sigmoid(v)
@@ -100,11 +119,13 @@ kernel void hyper_connection_mix(
   const uint hidden = params.hidden;
   const uint width = params.count * hidden;
   const uint low_rank = params.low_rank;
+  const uint low_rank4 = low_rank / 4;
+  const uint width4 = width / 4;
   device const bfloat *xn = normalized + ulong(row) * width;
   device const bfloat *low = reduced + ulong(row) * low_rank;
 
-  threadgroup float staged[64];
-  for (uint r = thread_index; r < low_rank && r < 64; r += kThreads)
+  threadgroup float staged[320];
+  for (uint r = thread_index; r < low_rank && r < 320; r += kThreads)
     staged[r] = float(low[r]);
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -116,11 +137,15 @@ kernel void hyper_connection_mix(
     float accumulated = 0.0f;
     for (uint stream = 0; stream < params.count; ++stream) {
       const uint index = stream * hidden + dimension;
-      device const bfloat *weights = up + ulong(index) * low_rank;
+      device const bfloat4 *up4 =
+          reinterpret_cast<device const bfloat4 *>(up + ulong(index) * low_rank);
       float sum = 0.0f;
-      for (uint r = 0; r < low_rank; ++r) {
-        const float value = r < 64 ? staged[r] : float(low[r]);
-        sum += float(weights[r]) * value;
+      for (uint r = 0; r < low_rank4; ++r) {
+        const bfloat4 w = up4[r];
+        sum += float(w.x) * staged[r * 4 + 0] +
+               float(w.y) * staged[r * 4 + 1] +
+               float(w.z) * staged[r * 4 + 2] +
+               float(w.w) * staged[r * 4 + 3];
       }
       const float gate = 1.0f / (1.0f + exp(-sum));
       accumulated += gate * float(xn[index]);
@@ -130,12 +155,18 @@ kernel void hyper_connection_mix(
 
   // inject is [count, width]; one simdgroup per stream.
   device bfloat *gates = injection + ulong(row) * params.count;
+  device const bfloat4 *xn4 = reinterpret_cast<device const bfloat4 *>(xn);
   for (uint stream = simd_group; stream < params.count;
        stream += kSimdgroups) {
-    device const bfloat *weights = inject + ulong(stream) * width;
+    device const bfloat4 *weights4 =
+        reinterpret_cast<device const bfloat4 *>(inject + ulong(stream) * width);
     float sum = 0.0f;
-    for (uint i = simd_lane; i < width; i += kSimdWidth)
-      sum += float(weights[i]) * float(xn[i]);
+    for (uint i = simd_lane; i < width4; i += kSimdWidth) {
+      const bfloat4 w = weights4[i];
+      const bfloat4 vx = xn4[i];
+      sum += float(w.x) * float(vx.x) + float(w.y) * float(vx.y) +
+             float(w.z) * float(vx.z) + float(w.w) * float(vx.w);
+    }
     sum = simd_sum(sum);
     if (simd_lane == 0) {
       const float v = sum / float(params.count);

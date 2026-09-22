@@ -102,3 +102,44 @@ all 48 layers (96.61 GiB) in a single command buffer triggers
 now chunks dispatches into batches bounded by `recommendedMaxWorkingSetBytes / 2`.
 All chunks commit in order to the serial command queue, enabling models larger
 than physical RAM to stream on demand without exhausting GPU driver residency limits.
+
+## GDN Output Gate Activation is Sigmoid, Not SiLU
+
+Upstream `transformers` (`modeling_qwen4_exp.py`) uses `Qwen4ExpTextRMSNormGated` with `output_gate_type: "sigmoid"`, computing `rms_norm(x) * sigmoid(gate)`. Splash's `gdn_primitives.h` had originally implemented `gate * sigmoid(gate)` (SiLU), which inflated GDN hidden states by ~2.8x. Changing `gdn_gate_phase` to use `1.0f / (1.0f + fast::exp2(-1.44269504089f * gate))` matched PyTorch output to bf16 precision and resolved text generation quality. Synthetic unit tests `gdn_metal_test.mm` and `gdn_decode_metal_test.mm` were updated to use `sigmoid` accordingly.
+
+## Vectorized Hyper-Connection Kernels (4.7x GPU Speedup)
+
+Dispatch profiling of the full 48-layer model revealed that `hyper_connection_normalize` (641.7 ms) and `hyper_connection_mix` (200.0 ms) accounted for 94% (841.8 ms out of 893 ms) of total GPU time due to unvectorized 16-bit scalar loads and low threadgroup occupancy. Vectorizing both kernels to 64-bit `bfloat4` aligned loads and caching the full 320-element low-rank vector in threadgroup SRAM reduced per-dispatch time by >3.15x and total GPU decode time from 504 ms to 190 ms across all 48 layers.
+
+## Cyclic LRU Paging Thrashing & Expert Working Set Isolation
+
+On a 64 GB Mac, model files total 96.6 GiB (68.2 GiB in 48 layer files, 26.8 GiB n-gram, 1.6 GiB head/embed). Because `WeightFile` creates a zero-copy `MTLBuffer` for the entire 1.42 GiB layer file, the macOS IOGPU driver enforces residency on the full file on commit, even though a token only touches 10 experts (26 MiB) in that layer. This causes cyclic LRU thrashing: by layer 48, layers 0..15 are evicted, forcing every token to re-read ~45–60 GiB from SSD (~7.4 s/tok).
+- Usable RAM allows 37 layers to remain 100% resident in physical RAM.
+- Calling `madvise(MADV_DONTNEED)` on the expert weights of the remaining streaming layers (37..47) at the end of each decode step ensures the OS reclaims streaming pages first, preventing eviction of resident layers.
+- For true sub-second decode (~200-250 ms), streaming layers must bind and stage only the 10 active experts (26 MiB/layer = 286 MiB total) via an in-memory expert cache rather than binding the full 1.42 GiB file.
+
+## Sub-Buffer Residency Isolation (`detachStreamingLayer`)
+
+Binding even a single 5 KB norm from a 1.42 GiB `WeightFile` forces Apple's IOGPU driver to enforce GPU residency on the entire 1.42 GiB buffer on commit. `detachStreamingLayer()` detaches all non-expert tensors (attention projections/norms, GDN weights/norms, indexer, MLP hyper-connection, router, shared expert) into standalone, dedicated `MTLBuffer`s (~35 MB per layer). The 1.42 GiB file buffer is NEVER bound to Metal during decode, keeping the active GPU working set under 12 GiB for all 48 layers combined.
+
+## Persistent Per-Layer Expert Cache with LRU Slot Tracking
+
+To eliminate copying 20+ active experts on every token step, each layer maintains an in-memory `Qwen4ExpLayerExpertCache` with dedicated `cacheGate`, `cacheUp`, and `cacheDown` `MTLBuffer`s of configurable capacity (default 64 experts per layer = 9.4 GiB across all 48 layers). 
+- Active experts are mapped to persistent cache slots using `expertToSlot` and `slotToExpert` arrays.
+- Cache hits touch `lruTime[slot]` with zero copy overhead (0 ns).
+- Cache misses allocate the next free slot or evict the least-recently-used slot not used in the current step.
+- Misses are staged concurrently via GCD `dispatch_apply` across CPU performance cores.
+- Hit rates exceed 92% in steady state (reducing misses to ~1.7 per layer), dropping staging latency from 6,162 ms to ~300 ms across all 48 layers.
+
+## CommandGraph Move Invariant in Multi-Command Execution
+
+In Splash's pipeline, `Runtime.mm` encodes `encodeBatchVerifyInput` and `encodeBatchEmbedding` into `graph` before invoking `targetModel.addVerify(graph, ...)`. Any engine path that internally splits the execution graph into multiple command buffers must begin with `metal::CommandGraph residentGraph = std::move(graph);` rather than constructing a default-initialized `CommandGraph`. Otherwise, layer 0 dispatches execute on GPU before input token embeddings are written to `buffers.hidden[0]`, corrupting the first layer's activations.
+
+## Prefill Staged Streaming Expert Cache Integration
+
+Prefill previously bound all 48 layer files (68.2 GiB) into a single monolithic command graph, causing Apple's IOGPU driver to demand-page gigabytes of weight files from SSD on cold start (~11.1 seconds for 5 prompt tokens) and dispatch 512-expert MoE kernels.
+- `Qwen4ExpTarget::addPrefill` is now integrated with the per-layer staged expert cache: only the ~20-30 active experts per layer selected by the router across the prompt tokens are staged into `layer[L].expertCache`.
+- MoE execute dispatches against the 64-expert cache buffer rather than the monolithic 512-expert file.
+- Prefill latency dropped from 11.1s down to **549 ms (19x speedup)**.
+- **Warm Decode Cache Hand-off:** Prefill leaves the prompt's active domain experts warm in `layer[L].expertCache`, eliminating the cold-cache penalty on decode token 1 (staging time dropped from 6,162 ms to **159 ms**).
+- **Graceful Monolithic Fallback:** If an exceptionally long prompt activates more unique experts in a single layer than `cache.capacity` (64), `stageActiveExperts` returns `false` and automatically falls back to `weights.layers[L].ffn` for that layer, guaranteeing zero numerical regression or memory overflow regardless of sequence length.

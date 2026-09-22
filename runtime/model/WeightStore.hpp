@@ -46,6 +46,14 @@ struct WeightFileRecord final {
   uint64_t declaredBytes = 0;
 };
 
+enum class MemoryAdvice {
+  Normal,
+  Random,
+  Sequential,
+  WillNeed,
+  DontNeed,
+};
+
 // A read-only mmap with one no-copy Metal base buffer.  Sections are checked,
 // aligned views that retain the mapping; no model loader owns raw mmap state.
 class WeightFile final {
@@ -62,6 +70,10 @@ public:
                                             std::string_view label = {});
   void finish();
   [[nodiscard]] const WeightFileRecord &record() const noexcept;
+  [[nodiscard]] uint64_t bytes() const noexcept;
+  void advise(MemoryAdvice advice) const noexcept;
+  void adviseRange(uint64_t offset, uint64_t bytes, MemoryAdvice advice) const noexcept;
+  void prefetch(bool touch = false) const noexcept;
 
 private:
   struct Impl;

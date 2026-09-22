@@ -32,6 +32,7 @@ struct ActualMemoryReport {
     uint64_t sharedPrefillBytes = 0;
     uint64_t sharedDecodeBytes = 0;
     uint64_t kvResidentBytes = 0;
+    uint64_t streamCacheBytes = 0;
 
     uint64_t backendAllocatedBytes = 0;
     uint64_t deviceCurrentAllocatedBytes = 0;

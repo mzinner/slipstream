@@ -180,6 +180,9 @@ public:
   [[nodiscard]] const EngineMemoryBreakdown &breakdown() const noexcept {
     return breakdown_;
   }
+  [[nodiscard]] const ModelMemoryProfile &model() const noexcept {
+    return model_;
+  }
   // Stable per-request ceiling advertised by the runtime. The physical KV
   // pool is shared dynamically, but one admitted request is never promised
   // more than either the model supports or the complete pool can hold.

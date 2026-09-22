@@ -107,10 +107,12 @@ public:
   };
 
   MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
-                 uint64_t hostReserveBytes);
+                 uint64_t hostReserveBytes,
+                 uint64_t streamableWeightsBytes = 0);
   MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
                  uint64_t hostReserveBytes,
-                 HostAvailableMemoryProvider hostAvailableMemory);
+                 HostAvailableMemoryProvider hostAvailableMemory,
+                 uint64_t streamableWeightsBytes = 0);
 
   [[nodiscard]] std::optional<Reservation> tryReserve(
       uint64_t bytes, metal::AllocationFailure *failure = nullptr);
@@ -136,6 +138,7 @@ private:
   metal::MetalBackend &backend_;
   uint64_t limitBytes_ = 0;
   uint64_t hostReserveBytes_ = 0;
+  uint64_t streamableWeightsBytes_ = 0;
   HostAvailableMemoryProvider hostAvailableMemory_;
   mutable std::mutex mutex_;
   uint64_t reservedBytes_ = 0;

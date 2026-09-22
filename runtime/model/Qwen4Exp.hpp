@@ -221,6 +221,18 @@ struct Qwen4ExpIndexer final {
   metal::MetalBuffer keyNorm;            // indexerHeadDimension
 };
 
+struct Qwen4ExpLayerExpertCache final {
+  metal::MetalBuffer cacheGate;
+  metal::MetalBuffer cacheUp;
+  metal::MetalBuffer cacheDown;
+  uint32_t capacity = 0;
+  uint32_t numCached = 0;
+  uint32_t clock = 0;
+  std::vector<int16_t> expertToSlot;
+  std::vector<int16_t> slotToExpert;
+  std::vector<uint32_t> lruTime;
+};
+
 // Section order per layer file, which the packer must follow exactly:
 //
 //   attention hyper-connection   norm, inject, mix down, mix up
@@ -234,6 +246,7 @@ struct Qwen4ExpLayerWeights final {
   std::optional<Qwen4ExpIndexer> indexer;
   Qwen4ExpHyperConnection mlpHyperConnection;
   ops::MoeWeights ffn;
+  mutable Qwen4ExpLayerExpertCache expertCache;
 };
 
 struct Qwen4ExpWeights final {
@@ -249,6 +262,25 @@ struct Qwen4ExpWeights final {
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
   std::string manifestFingerprintSha256;
+  uint32_t residentLayers = 0;
+  metal::MetalBuffer streamingCacheGate;
+  metal::MetalBuffer streamingCacheUp;
+  metal::MetalBuffer streamingCacheDown;
+  uint32_t streamingCacheCapacity = 0;
+  mutable std::vector<std::vector<uint32_t>> lastSelectedExperts;
+
+  void prefetchStreamingExperts() const noexcept;
+  void evictStreamingExperts() const noexcept;
+
+  [[nodiscard]] uint64_t expertCacheActualAllocatedBytes() const noexcept {
+    uint64_t total = 0;
+    for (const auto &layer : layers) {
+      total += layer.expertCache.cacheGate.sizeBytes();
+      total += layer.expertCache.cacheUp.sizeBytes();
+      total += layer.expertCache.cacheDown.sizeBytes();
+    }
+    return total;
+  }
 };
 
 // Defined in QwenTarget.cpp beside the other two, so all three share

@@ -477,7 +477,7 @@ void checkDecode(const Fixture &fixture, uint32_t layer, uint32_t lane) {
         const double normalized = roundBfloat(
             fromBfloat(recurrent[dim]) * inverse * fromBfloat(norm[dim]));
         const double gate = fromBfloat(packed[zOffset + head * kHeadDim + dim]);
-        require(closeBfloat(hidden[dim], normalized * gate * sigmoid(gate), 2.0,
+        require(closeBfloat(hidden[dim], normalized * sigmoid(gate), 2.0,
                             1e-6),
                 where + ": hidden mismatch");
       }

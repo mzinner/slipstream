@@ -1,6 +1,11 @@
 #include "Qwen4Exp.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <dispatch/dispatch.h>
+#include <iostream>
 #include <string_view>
+#include <sys/mman.h>
 
 namespace splash::model {
 namespace {
@@ -128,6 +133,92 @@ void readExperts(WeightFile &file, metal::MetalBackend &backend,
       "shared-expert-scalar-gate");
 }
 
+metal::MetalBuffer detachBuffer(metal::MetalBackend &backend, const metal::MetalBuffer &view, const char *label) {
+  if (!view) return {};
+  metal::MetalBuffer copy = backend.allocateBuffer(view.sizeBytes(), metal::BufferStorage::Shared, label);
+  std::memcpy(copy.contents(), view.contents(), view.sizeBytes());
+  return copy;
+}
+
+ops::Q4Projection detachQ4(metal::MetalBackend &backend, const ops::Q4Projection &p, const char *label) {
+  return ops::Q4Projection{
+      .weights = detachBuffer(backend, p.weights, (std::string(label) + "-w").c_str()),
+      .scales = detachBuffer(backend, p.scales, (std::string(label) + "-s").c_str()),
+      .biases = detachBuffer(backend, p.biases, (std::string(label) + "-b").c_str()),
+      .outputSize = p.outputSize,
+      .inputSize = p.inputSize,
+  };
+}
+
+ops::Q8Projection detachQ8(metal::MetalBackend &backend, const ops::Q8Projection &p, const char *label) {
+  return ops::Q8Projection{
+      .weights = detachBuffer(backend, p.weights, (std::string(label) + "-w").c_str()),
+      .scales = detachBuffer(backend, p.scales, (std::string(label) + "-s").c_str()),
+      .biases = detachBuffer(backend, p.biases, (std::string(label) + "-b").c_str()),
+      .outputSize = p.outputSize,
+      .inputSize = p.inputSize,
+  };
+}
+
+ops::ExpertQ4Projection detachExpert(metal::MetalBackend &backend, const ops::ExpertQ4Projection &p, const char *label) {
+  return ops::ExpertQ4Projection{
+      .packed = detachBuffer(backend, p.packed, label),
+      .experts = p.experts,
+      .outputSize = p.outputSize,
+      .inputSize = p.inputSize,
+      .expertStrideBytes = p.expertStrideBytes,
+  };
+}
+
+[[maybe_unused]] void detachStreamingLayer(metal::MetalBackend &backend, Qwen4ExpLayerWeights &layer) {
+  // 1. Attention Hyper-connection
+  layer.attentionHyperConnection.norm = detachBuffer(backend, layer.attentionHyperConnection.norm, "att-norm");
+  layer.attentionHyperConnection.mixDown = detachBuffer(backend, layer.attentionHyperConnection.mixDown, "att-down");
+  layer.attentionHyperConnection.mixUp = detachBuffer(backend, layer.attentionHyperConnection.mixUp, "att-up");
+  if (layer.attentionHyperConnection.blockInject) {
+    layer.attentionHyperConnection.blockInject = detachBuffer(backend, *layer.attentionHyperConnection.blockInject, "att-inject");
+  }
+
+  // 2. Mixer
+  if (std::holds_alternative<QwenGdnWeights>(layer.mixer)) {
+    auto &gdn = std::get<QwenGdnWeights>(layer.mixer);
+    gdn.inputProjection = detachQ4(backend, gdn.inputProjection, "gdn-in");
+    gdn.convolutionWeights = detachBuffer(backend, gdn.convolutionWeights, "gdn-conv");
+    gdn.decay = detachBuffer(backend, gdn.decay, "gdn-decay");
+    gdn.timeBias = detachBuffer(backend, gdn.timeBias, "gdn-bias");
+    gdn.mixerNorm = detachBuffer(backend, gdn.mixerNorm, "gdn-norm");
+    gdn.outputProjection = detachQ4(backend, gdn.outputProjection, "gdn-out");
+  } else {
+    auto &attn = std::get<QwenAttentionWeights>(layer.mixer);
+    attn.inputProjection = detachQ4(backend, attn.inputProjection, "attn-in");
+    attn.queryNorm = detachBuffer(backend, attn.queryNorm, "attn-qnorm");
+    attn.keyNorm = detachBuffer(backend, attn.keyNorm, "attn-knorm");
+    attn.outputProjection = detachQ4(backend, attn.outputProjection, "attn-out");
+  }
+
+  // 3. Indexer
+  if (layer.indexer) {
+    layer.indexer->queryKeyProjection = detachQ4(backend, layer.indexer->queryKeyProjection, "idx-qk");
+    layer.indexer->queryNorm = detachBuffer(backend, layer.indexer->queryNorm, "idx-qnorm");
+    layer.indexer->keyNorm = detachBuffer(backend, layer.indexer->keyNorm, "idx-knorm");
+  }
+
+  // 4. MLP Hyper-connection
+  layer.mlpHyperConnection.norm = detachBuffer(backend, layer.mlpHyperConnection.norm, "mlp-norm");
+  layer.mlpHyperConnection.mixDown = detachBuffer(backend, layer.mlpHyperConnection.mixDown, "mlp-down");
+  layer.mlpHyperConnection.mixUp = detachBuffer(backend, layer.mlpHyperConnection.mixUp, "mlp-up");
+  if (layer.mlpHyperConnection.blockInject) {
+    layer.mlpHyperConnection.blockInject = detachBuffer(backend, *layer.mlpHyperConnection.blockInject, "mlp-inject");
+  }
+
+  // 5. Router and Shared Experts
+  layer.ffn.router = detachQ8(backend, layer.ffn.router, "router");
+  layer.ffn.sharedGate = detachExpert(backend, layer.ffn.sharedGate, "shared-gate");
+  layer.ffn.sharedUp = detachExpert(backend, layer.ffn.sharedUp, "shared-up");
+  layer.ffn.sharedDown = detachExpert(backend, layer.ffn.sharedDown, "shared-down");
+  layer.ffn.sharedExpertGate = detachQ8(backend, layer.ffn.sharedExpertGate, "shared-scalar");
+}
+
 } // namespace
 
 Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
@@ -139,6 +230,14 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
   result.layout = layout;
   result.layers.reserve(layout.layers);
 
+  uint32_t residentLayers = 0;
+  const char *envResident = getenv("SPLASH_RESIDENT_LAYERS");
+  if (envResident) {
+    residentLayers = std::min<uint32_t>(layout.layers, std::max(0, std::atoi(envResident)));
+  }
+  result.residentLayers = residentLayers;
+  std::cerr << "[Qwen4Exp] resident layers: " << residentLayers << " / " << layout.layers << "\n";
+
   for (uint32_t layerIndex = 0; layerIndex < layout.layers; ++layerIndex) {
     const bool fullAttention = layout.isFullAttentionLayer(layerIndex);
     const std::string filename =
@@ -146,6 +245,17 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     WeightFile file(backend, directory / filename, "target/" + filename,
                     Qwen4ExpLayout::layerMagic, layerIndex,
                     fullAttention ? 1U : 0U);
+    if (layerIndex < residentLayers) {
+      file.advise(MemoryAdvice::WillNeed);
+      file.prefetch(true);
+    } else {
+      constexpr uint64_t kNonExpertHeaderBytes = 80ULL * 1024 * 1024;
+      file.adviseRange(0, kNonExpertHeaderBytes, MemoryAdvice::WillNeed);
+      if (file.bytes() > kNonExpertHeaderBytes) {
+        file.adviseRange(kNonExpertHeaderBytes, file.bytes() - kNonExpertHeaderBytes,
+                         MemoryAdvice::Random);
+      }
+    }
     auto &layer = result.layers.emplace_back();
     layer.attentionHyperConnection =
         readHyperConnection(file, layout, "attention-hyper", true);
@@ -155,12 +265,17 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     layer.mlpHyperConnection = readHyperConnection(file, layout, "mlp-hyper", true);
     readExperts(file, backend, layout, layer.ffn);
     file.finish();
+    if (layerIndex >= residentLayers) {
+      detachStreamingLayer(backend, layer);
+    }
     result.files.push_back(file.record());
   }
 
   {
     WeightFile file(backend, directory / "head.bin", "target/head.bin",
                     kNextHeadMagic, layout.layers, 2);
+    file.advise(MemoryAdvice::WillNeed);
+    file.prefetch(false);
     result.hyperConnectionMixer =
         readHyperConnection(file, layout, "hyper-mixer", false);
     result.finalNorm = file.section(
@@ -176,6 +291,8 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     WeightFile file(backend, directory / "embedding.bin",
                     "target/embedding.bin", kNextEmbeddingMagic,
                     layout.vocabularySize, layout.hiddenSize);
+    file.advise(MemoryAdvice::WillNeed);
+    file.prefetch(false);
     result.tokenEmbedding = readQ4ProjectionComponents(
         file, layout.vocabularySize, layout.hiddenSize, "embedding");
     file.finish();
@@ -188,6 +305,13 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     WeightFile file(backend, directory / "ngram.bin", "target/ngram.bin",
                     kNextNgramMagic, layout.ngramShards,
                     layout.ngramHeadDimension());
+    const uint64_t tableBytes = q4PackedBytes(
+        layout.ngramVocabularySize, layout.ngramHeadDimension(),
+        kQ4FineGroupElements);
+    file.adviseRange(0, tableBytes, MemoryAdvice::Random);
+    if (file.bytes() > tableBytes) {
+      file.adviseRange(tableBytes, file.bytes() - tableBytes, MemoryAdvice::WillNeed);
+    }
     auto &ple = result.perLayerEmbedding;
     // One row per hashed n-gram per head, a head wide, in finer groups.
     ple.table = readQ4ProjectionComponents(
@@ -225,7 +349,100 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
   result.manifestFingerprintSha256 = weightManifestFingerprint(result.files);
   result.actualAllocatedBytes = metal::allocationDelta(
       allocationBaseline, backend.memoryStats().allocatedBytes);
+
+  result.lastSelectedExperts.resize(layout.layers);
+  if (residentLayers < layout.layers) {
+    uint32_t cacheCapacity = 128;
+    if (const char *envCap = getenv("SPLASH_EXPERT_CACHE_CAPACITY")) {
+      cacheCapacity = std::max(16, std::atoi(envCap));
+    }
+    const uint64_t expertStride = uint64_t{layout.expertIntermediateSize} * layout.hiddenSize * 9 / 16;
+    const uint64_t cacheBytes = uint64_t{cacheCapacity} * expertStride;
+    for (uint32_t l = residentLayers; l < layout.layers; ++l) {
+      auto &cache = result.layers[l].expertCache;
+      cache.capacity = cacheCapacity;
+      cache.cacheGate = backend.allocateBuffer(cacheBytes, metal::BufferStorage::Shared, "layer-expert-gate");
+      cache.cacheUp = backend.allocateBuffer(cacheBytes, metal::BufferStorage::Shared, "layer-expert-up");
+      cache.cacheDown = backend.allocateBuffer(cacheBytes, metal::BufferStorage::Shared, "layer-expert-down");
+      cache.expertToSlot.assign(layout.experts, -1);
+      cache.slotToExpert.assign(cacheCapacity, -1);
+      cache.lruTime.assign(cacheCapacity, 0);
+      cache.numCached = 0;
+      cache.clock = 0;
+    }
+    const uint32_t streamingLayersCount = layout.layers - residentLayers;
+    uint32_t prewarmCount = cacheCapacity;
+    if (const char *envPre = getenv("SPLASH_PREWARM_EXPERTS")) {
+      prewarmCount = std::atoi(envPre);
+    }
+    const uint32_t prewarm = std::min(cacheCapacity, prewarmCount);
+    dispatch_apply(streamingLayersCount, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t idx) {
+      const uint32_t l = residentLayers + static_cast<uint32_t>(idx);
+      auto &cache = result.layers[l].expertCache;
+      const auto &layer = result.layers[l];
+      char *cg = static_cast<char *>(cache.cacheGate.contents());
+      char *cu = static_cast<char *>(cache.cacheUp.contents());
+      char *cd = static_cast<char *>(cache.cacheDown.contents());
+      const char *fg = static_cast<const char *>(layer.ffn.expertGate.packed.contents());
+      const char *fu = static_cast<const char *>(layer.ffn.expertUp.packed.contents());
+      const char *fd = static_cast<const char *>(layer.ffn.expertDown.packed.contents());
+      // Pre-fault all pages across the cache buffers to eliminate GPU first-dispatch MMU faulting
+      for (uint64_t off = 0; off < cacheBytes; off += 16384) {
+        cg[off] = 0;
+        cu[off] = 0;
+        cd[off] = 0;
+      }
+      for (uint32_t s = 0; s < prewarm; ++s) {
+        cache.slotToExpert[s] = s;
+        cache.expertToSlot[s] = s;
+        cache.lruTime[s] = 1;
+        std::memcpy(cg + uint64_t{s} * expertStride, fg + uint64_t{s} * expertStride, expertStride);
+        std::memcpy(cu + uint64_t{s} * expertStride, fu + uint64_t{s} * expertStride, expertStride);
+        std::memcpy(cd + uint64_t{s} * expertStride, fd + uint64_t{s} * expertStride, expertStride);
+      }
+      cache.numCached = prewarm;
+      cache.clock = 1;
+    });
+    result.streamingCacheCapacity = cacheCapacity;
+    result.streamingCacheGate = result.layers[residentLayers].expertCache.cacheGate;
+    result.streamingCacheUp = result.layers[residentLayers].expertCache.cacheUp;
+    result.streamingCacheDown = result.layers[residentLayers].expertCache.cacheDown;
+  }
+
   return result;
+}
+
+void Qwen4ExpWeights::prefetchStreamingExperts() const noexcept {
+  for (uint32_t l = residentLayers; l < layers.size(); ++l) {
+    if (l >= lastSelectedExperts.size() || lastSelectedExperts[l].empty())
+      continue;
+    const auto &ffn = layers[l].ffn;
+    const uint64_t stride = ffn.expertGate.expertStrideBytes;
+    if (!stride) continue;
+    char *gBase = static_cast<char *>(ffn.expertGate.packed.contents());
+    char *uBase = static_cast<char *>(ffn.expertUp.packed.contents());
+    char *dBase = static_cast<char *>(ffn.expertDown.packed.contents());
+    for (uint32_t exp : lastSelectedExperts[l]) {
+      if (gBase) (void)madvise(gBase + uint64_t{exp} * stride, stride, MADV_WILLNEED);
+      if (uBase) (void)madvise(uBase + uint64_t{exp} * stride, stride, MADV_WILLNEED);
+      if (dBase) (void)madvise(dBase + uint64_t{exp} * stride, stride, MADV_WILLNEED);
+    }
+  }
+}
+
+void Qwen4ExpWeights::evictStreamingExperts() const noexcept {
+  for (uint32_t l = residentLayers; l < layers.size(); ++l) {
+    const auto &ffn = layers[l].ffn;
+    if (void *ptr = ffn.expertGate.packed.contents()) {
+      madvise(ptr, ffn.expertGate.packed.sizeBytes(), MADV_DONTNEED);
+    }
+    if (void *ptr = ffn.expertUp.packed.contents()) {
+      madvise(ptr, ffn.expertUp.packed.sizeBytes(), MADV_DONTNEED);
+    }
+    if (void *ptr = ffn.expertDown.packed.contents()) {
+      madvise(ptr, ffn.expertDown.packed.sizeBytes(), MADV_DONTNEED);
+    }
+  }
 }
 
 } // namespace splash::model

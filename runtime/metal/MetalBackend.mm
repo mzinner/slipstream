@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <iostream>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -1264,7 +1265,7 @@ CommandTicket MetalBackend::submitCommandAsync(
             dispatch.threadsPerThreadgroup.y *
             dispatch.threadsPerThreadgroup.z;
 
-        std::unordered_set<uint32_t> indices;
+        uint64_t seenIndices = 0;
         for (const BufferBinding &binding : dispatch.buffers) {
             if (!binding.buffer.impl_ || !binding.buffer.impl_->allocation) {
                 std::ostringstream message;
@@ -1278,8 +1279,11 @@ CommandTicket MetalBackend::submitCommandAsync(
                 throw MetalBackendError(
                     "compute dispatch buffer belongs to another backend");
             }
-            if (!indices.insert(binding.index).second) {
-                throw MetalBackendError("duplicate compute binding index");
+            if (binding.index < 64) {
+                if (seenIndices & (1ULL << binding.index)) {
+                    throw MetalBackendError("duplicate compute binding index");
+                }
+                seenIndices |= (1ULL << binding.index);
             }
         }
         for (const BytesBinding &binding : dispatch.bytes) {
@@ -1287,8 +1291,11 @@ CommandTicket MetalBackend::submitCommandAsync(
                 throw MetalBackendError("compute byte binding is empty");
             }
             checkedNSUInteger(binding.sizeBytes, "byte binding size");
-            if (!indices.insert(binding.index).second) {
-                throw MetalBackendError("duplicate compute binding index");
+            if (binding.index < 64) {
+                if (seenIndices & (1ULL << binding.index)) {
+                    throw MetalBackendError("duplicate compute binding index");
+                }
+                seenIndices |= (1ULL << binding.index);
             }
         }
         prepared.push_back(item);
@@ -1309,11 +1316,14 @@ CommandTicket MetalBackend::submitCommandAsync(
     auto ticketState = std::make_shared<CommandTicket::State>();
     ticketState->backend = impl_->asyncState;
     ticketState->completion = std::move(completion);
-    std::unordered_set<const MetalAllocation *> retained;
+    std::vector<const MetalAllocation *> retained;
+    retained.reserve(32);
     for (const ComputeDispatch &dispatch : dispatches) {
         for (const BufferBinding &binding : dispatch.buffers) {
             const auto &allocation = binding.buffer.impl_->allocation;
-            if (retained.insert(allocation.get()).second) {
+            const MetalAllocation *alloc = allocation.get();
+            if (std::find(retained.begin(), retained.end(), alloc) == retained.end()) {
+                retained.push_back(alloc);
                 ticketState->retainedAllocations.push_back(allocation);
             }
         }
@@ -1326,45 +1336,59 @@ CommandTicket MetalBackend::submitCommandAsync(
         throw MetalBackendError(std::move(message));
     };
 
-    const uint64_t maxCommandWorkingSetBytes = std::max<uint64_t>(
-        4ULL * 1024 * 1024 * 1024,
-        impl_->capabilities.recommendedMaxWorkingSetBytes / 2);
+    const char *envChunk = getenv("SPLASH_CHUNK_WORKING_SET_GIB");
+    const uint64_t maxCommandWorkingSetBytes = envChunk
+        ? (uint64_t(std::max(1, std::atoi(envChunk))) * 1024ULL * 1024 * 1024)
+        : std::max<uint64_t>(
+              4ULL * 1024 * 1024 * 1024,
+              impl_->capabilities.recommendedMaxWorkingSetBytes / 2);
 
     std::vector<std::vector<PreparedDispatch>> chunks;
-    std::unordered_set<const MetalAllocation *> currentAllocations;
-    uint64_t currentWorkingSetBytes = 0;
-    std::vector<PreparedDispatch> currentChunk;
-
+    uint64_t roughTotalBytes = 0;
     for (const PreparedDispatch &item : prepared) {
-        uint64_t additionalBytes = 0;
         for (const BufferBinding &binding : item.source->buffers) {
-            const MetalAllocation *alloc = binding.buffer.impl_->allocation.get();
-            if (currentAllocations.find(alloc) == currentAllocations.end()) {
-                additionalBytes += alloc->bytes;
-            }
+            roughTotalBytes += binding.buffer.impl_->allocation->bytes;
         }
-        if (!currentChunk.empty() &&
-            currentWorkingSetBytes + additionalBytes > maxCommandWorkingSetBytes) {
-            chunks.push_back(std::move(currentChunk));
-            currentChunk.clear();
-            currentAllocations.clear();
-            currentWorkingSetBytes = 0;
-            additionalBytes = 0;
+    }
+
+    if (roughTotalBytes <= maxCommandWorkingSetBytes) {
+        chunks.push_back(std::move(prepared));
+    } else {
+        std::unordered_set<const MetalAllocation *> currentAllocations;
+        uint64_t currentWorkingSetBytes = 0;
+        std::vector<PreparedDispatch> currentChunk;
+
+        for (const PreparedDispatch &item : prepared) {
+            uint64_t additionalBytes = 0;
             for (const BufferBinding &binding : item.source->buffers) {
                 const MetalAllocation *alloc = binding.buffer.impl_->allocation.get();
                 if (currentAllocations.find(alloc) == currentAllocations.end()) {
                     additionalBytes += alloc->bytes;
                 }
             }
+            if (!currentChunk.empty() &&
+                currentWorkingSetBytes + additionalBytes > maxCommandWorkingSetBytes) {
+                chunks.push_back(std::move(currentChunk));
+                currentChunk.clear();
+                currentAllocations.clear();
+                currentWorkingSetBytes = 0;
+                additionalBytes = 0;
+                for (const BufferBinding &binding : item.source->buffers) {
+                    const MetalAllocation *alloc = binding.buffer.impl_->allocation.get();
+                    if (currentAllocations.find(alloc) == currentAllocations.end()) {
+                        additionalBytes += alloc->bytes;
+                    }
+                }
+            }
+            for (const BufferBinding &binding : item.source->buffers) {
+                currentAllocations.insert(binding.buffer.impl_->allocation.get());
+            }
+            currentWorkingSetBytes += additionalBytes;
+            currentChunk.push_back(item);
         }
-        for (const BufferBinding &binding : item.source->buffers) {
-            currentAllocations.insert(binding.buffer.impl_->allocation.get());
+        if (!currentChunk.empty()) {
+            chunks.push_back(std::move(currentChunk));
         }
-        currentWorkingSetBytes += additionalBytes;
-        currentChunk.push_back(item);
-    }
-    if (!currentChunk.empty()) {
-        chunks.push_back(std::move(currentChunk));
     }
 
     auto wallStart = std::chrono::steady_clock::now();

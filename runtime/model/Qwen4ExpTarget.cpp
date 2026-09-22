@@ -8,6 +8,8 @@
 #include "ops/PagedAttention.hpp"
 
 #include <algorithm>
+#include <dispatch/dispatch.h>
+#include <iostream>
 #include <stdexcept>
 
 namespace splash::model {
@@ -127,40 +129,39 @@ void Qwen4ExpTarget::addPrefill(
   uint32_t gdnIndex = 0;
   uint32_t attentionIndex = 0;
 
-  for (uint32_t layerIndex = 0; layerIndex < geometry.layers; ++layerIndex) {
+  auto encodeAttentionHC = [&](metal::CommandGraph &g, uint32_t layerIndex) {
     const auto &layer = weights.layers[layerIndex];
     metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
-    metal::MetalBuffer output = buffers.hidden[(layerIndex & 1) ^ 1];
+    g.add("hyper_connection_normalize",
+          {input, layer.attentionHyperConnection.norm,
+           layer.attentionHyperConnection.mixDown, buffers.normalized,
+           buffers.hyperReduced},
+          hcParams, {rows, 1, 1}, {256, 1, 1});
+    g.add("hyper_connection_mix",
+          {buffers.normalized, buffers.hyperReduced,
+           layer.attentionHyperConnection.mixUp,
+           *layer.attentionHyperConnection.blockInject,
+           buffers.hyperMixed, buffers.hyperInjection},
+          hcParams, {rows, 1, 1}, {256, 1, 1});
+  };
 
-    // 1. Attention Hyper-connection
-    graph.add("hyper_connection_normalize",
-              {input, layer.attentionHyperConnection.norm,
-               layer.attentionHyperConnection.mixDown, buffers.normalized,
-               buffers.hyperReduced},
-              hcParams, {rows, 1, 1}, {256, 1, 1});
-    graph.add("hyper_connection_mix",
-              {buffers.normalized, buffers.hyperReduced,
-               layer.attentionHyperConnection.mixUp,
-               *layer.attentionHyperConnection.blockInject,
-               buffers.hyperMixed, buffers.hyperInjection},
-              hcParams, {rows, 1, 1}, {256, 1, 1});
-
-    // 2. Mixer block (GDN or Full Attention)
-    metal::MetalBuffer mixerOutBuffer;
+  auto encodeMixer = [&](metal::CommandGraph &g, uint32_t layerIndex,
+                         uint32_t &gdnIdx, uint32_t &attnIdx) -> metal::MetalBuffer {
+    const auto &layer = weights.layers[layerIndex];
     if (std::holds_alternative<QwenGdnWeights>(layer.mixer)) {
       const auto &mixer = std::get<QwenGdnWeights>(layer.mixer);
-      operators.linear().addPrefillSums(graph, buffers.hyperMixed,
+      operators.linear().addPrefillSums(g, buffers.hyperMixed,
                                         buffers.projectionSums, gdnInput, rows);
-      operators.linear().addPrefill(graph, buffers.hyperMixed,
+      operators.linear().addPrefill(g, buffers.hyperMixed,
                                     mixer.inputProjection, buffers.gdnPacked,
                                     buffers.projectionSums, gdnInput, rows);
       for (const QwenTargetPrefillSequence &sequence : sequences) {
         ops::GDN::addPrefill(
-            graph,
+            g,
             {u16(buffers.gdnPacked, sequence.rowBegin, sequence.rows,
                  geometry.packedGdnWidth),
-             mixer.convolutionWeights, sequence.convolutionIn[gdnIndex],
-             sequence.convolutionOut[gdnIndex],
+             mixer.convolutionWeights, sequence.convolutionIn[gdnIdx],
+             sequence.convolutionOut[gdnIdx],
              u16(buffers.gdnQueries, sequence.rowBegin, sequence.rows,
                  geometry.gdnKeyWidth()),
              u16(buffers.gdnKeys, sequence.rowBegin, sequence.rows,
@@ -172,8 +173,8 @@ void Qwen4ExpTarget::addPrefill(
                  geometry.gdnValueHeads),
              u16(buffers.gdnBeta, sequence.rowBegin, sequence.rows,
                  geometry.gdnValueHeads),
-             sequence.recurrentIn[gdnIndex],
-             sequence.recurrentOut[gdnIndex],
+             sequence.recurrentIn[gdnIdx],
+             sequence.recurrentOut[gdnIdx],
              u16(buffers.recurrent, sequence.rowBegin, sequence.rows,
                  geometry.attentionWidth),
              mixer.mixerNorm,
@@ -181,20 +182,20 @@ void Qwen4ExpTarget::addPrefill(
                  geometry.attentionWidth)},
             geometry.gdnShape(), sequence.rows);
       }
-      operators.linear().addPrefillSums(graph, buffers.gdnHidden,
+      operators.linear().addPrefillSums(g, buffers.gdnHidden,
                                         buffers.projectionSums, mixerOutput,
                                         rows);
-      operators.linear().addPrefill(graph, buffers.gdnHidden,
+      operators.linear().addPrefill(g, buffers.gdnHidden,
                                     mixer.outputProjection, buffers.gdnOutput,
                                     buffers.projectionSums, mixerOutput, rows);
-      mixerOutBuffer = buffers.gdnOutput;
-      ++gdnIndex;
+      ++gdnIdx;
+      return buffers.gdnOutput;
     } else {
       const auto &mixer = std::get<QwenAttentionWeights>(layer.mixer);
-      operators.linear().addPrefillSums(graph, buffers.hyperMixed,
+      operators.linear().addPrefillSums(g, buffers.hyperMixed,
                                         buffers.projectionSums, attentionInput,
                                         rows);
-      operators.linear().addPrefill(graph, buffers.hyperMixed,
+      operators.linear().addPrefill(g, buffers.hyperMixed,
                                     mixer.inputProjection, buffers.fullPacked,
                                     buffers.projectionSums, attentionInput,
                                     rows);
@@ -216,7 +217,7 @@ void Qwen4ExpTarget::addPrefill(
         metal::MetalBuffer values = backend.view(
             buffers.chunkValues, sequence.kvOffset, kvBytes);
         ops::PagedAttention::addPrefillProjection(
-            graph,
+            g,
             u16(buffers.fullPacked, sequence.rowBegin, sequence.rows,
                 geometry.packedAttentionWidth),
             mixer.queryNorm, mixer.keyNorm,
@@ -228,17 +229,17 @@ void Qwen4ExpTarget::addPrefill(
             sequence.attentionStride, sequence.attentionStride,
             geometry.attentionQueryHeads, geometry.kvLayout);
         ops::PagedAttention::addPrefillStore(
-            graph, kvLayers[attentionIndex], keys, values,
+            g, kvLayers[attnIdx], keys, values,
             sequence.pageTable, sequence.q8, geometry.kvLayout);
         ops::PagedAttention::addPrefill(
-            graph, kvLayers[attentionIndex], queries, attentionRows,
+            g, kvLayers[attnIdx], queries, attentionRows,
             buffers.attentionPartials, buffers.attentionStatistics,
             sequence.pageTable, sequence.q8,
             operators.prefillAttention(
                 sequence.rows, geometry.attentionQueryHeads,
                 geometry.kvLayout, sequence.q8.committed_tokens));
         ops::PagedAttention::addPrefillGate(
-            graph,
+            g,
             u16(buffers.fullPacked, sequence.rowBegin, sequence.rows,
                 geometry.packedAttentionWidth),
             attentionRows,
@@ -247,51 +248,74 @@ void Qwen4ExpTarget::addPrefill(
             sequence.rows, sequence.attentionStride, sequence.attentionStride,
             geometry.attentionQueryHeads, geometry.kvLayout);
       }
-      operators.linear().addPrefillSums(graph, buffers.attentionHidden,
+      operators.linear().addPrefillSums(g, buffers.attentionHidden,
                                         buffers.projectionSums, mixerOutput,
                                         rows);
-      operators.linear().addPrefill(graph, buffers.attentionHidden,
+      operators.linear().addPrefill(g, buffers.attentionHidden,
                                     mixer.outputProjection,
                                     buffers.attentionOutput,
                                     buffers.projectionSums, mixerOutput, rows);
-      mixerOutBuffer = buffers.attentionOutput;
-      ++attentionIndex;
+      ++attnIdx;
+      return buffers.attentionOutput;
     }
+  };
 
-    // 3. Residual update after mixer: input += injection * mixerOutBuffer
-    graph.add("hyper_connection_update",
-              {input, mixerOutBuffer, buffers.hyperInjection}, hcParams,
-              {64, 1, 1}, {256, 1, 1});
+  auto encodeMixerUpdate = [&](metal::CommandGraph &g, uint32_t layerIndex,
+                               metal::MetalBuffer mixerOutBuffer) {
+    metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
+    g.add("hyper_connection_update",
+          {input, mixerOutBuffer, buffers.hyperInjection}, hcParams,
+          {64, 1, 1}, {256, 1, 1});
+  };
 
-    // 4. MLP Hyper-connection
-    graph.add("hyper_connection_normalize",
-              {input, layer.mlpHyperConnection.norm,
-               layer.mlpHyperConnection.mixDown, buffers.normalized,
-               buffers.hyperReduced},
-              hcParams, {rows, 1, 1}, {256, 1, 1});
-    graph.add("hyper_connection_mix",
-              {buffers.normalized, buffers.hyperReduced,
-               layer.mlpHyperConnection.mixUp,
-               *layer.mlpHyperConnection.blockInject,
-               buffers.hyperMixed, buffers.hyperInjection},
-              hcParams, {rows, 1, 1}, {256, 1, 1});
+  auto encodeMlpHC = [&](metal::CommandGraph &g, uint32_t layerIndex) {
+    const auto &layer = weights.layers[layerIndex];
+    metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
+    g.add("hyper_connection_normalize",
+          {input, layer.mlpHyperConnection.norm,
+           layer.mlpHyperConnection.mixDown, buffers.normalized,
+           buffers.hyperReduced},
+          hcParams, {rows, 1, 1}, {256, 1, 1});
+    g.add("hyper_connection_mix",
+          {buffers.normalized, buffers.hyperReduced,
+           layer.mlpHyperConnection.mixUp,
+           *layer.mlpHyperConnection.blockInject,
+           buffers.hyperMixed, buffers.hyperInjection},
+          hcParams, {rows, 1, 1}, {256, 1, 1});
+  };
 
-    // 5. MoE block: input is buffers.hyperMixed, output is buffers.gdnOutput, addResidual=false
-    ops::MoE::add(
-        graph,
+  auto encodeMoERoute = [&](metal::CommandGraph &g, uint32_t layerIndex) {
+    const auto &layer = weights.layers[layerIndex];
+    ops::MoE::addRoute(
+        g,
         {buffers.hyperMixed, buffers.hyperMixed, buffers.gdnOutput,
          buffers.selectedExperts, buffers.routingWeights,
          buffers.tileDescriptors, buffers.tileCount, buffers.groupedRoutes,
          buffers.routeRows, buffers.groupedInput, buffers.expertIntermediate,
          buffers.expertOutput},
-        layer.ffn, moePlan, /*addResidual=*/false);
+        layer.ffn, moePlan);
+  };
 
-    // 6. Residual update after MLP: output = input + injection * moeOutput
-    graph.add("hyper_connection_update_out",
-              {input, output, buffers.gdnOutput, buffers.hyperInjection},
-              hcParams, {64, 1, 1}, {256, 1, 1});
+  auto encodeMoEExecute = [&](metal::CommandGraph &g, const ops::MoeWeights &weightsToUse) {
+    ops::MoE::addExecute(
+        g,
+        {buffers.hyperMixed, buffers.hyperMixed, buffers.gdnOutput,
+         buffers.selectedExperts, buffers.routingWeights,
+         buffers.tileDescriptors, buffers.tileCount, buffers.groupedRoutes,
+         buffers.routeRows, buffers.groupedInput, buffers.expertIntermediate,
+         buffers.expertOutput},
+        weightsToUse, moePlan, /*addResidual=*/false);
+  };
 
-    // 7. Target hidden capture (for draft, if configured)
+  auto encodeMlpUpdate = [&](metal::CommandGraph &g, uint32_t layerIndex) {
+    metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
+    metal::MetalBuffer output = buffers.hidden[(layerIndex & 1) ^ 1];
+    g.add("hyper_connection_update_out",
+          {input, output, buffers.gdnOutput, buffers.hyperInjection},
+          hcParams, {64, 1, 1}, {256, 1, 1});
+  };
+
+  auto encodeCapture = [&](metal::CommandGraph &g, uint32_t layerIndex) {
     const auto captureLayers = geometry.captureLayers();
     const auto captured =
         std::find(captureLayers.begin(), captureLayers.end(), layerIndex);
@@ -302,13 +326,272 @@ void Qwen4ExpTarget::addPrefill(
         for (uint32_t index = 0; index < sequence.captureCount; ++index) {
           const QwenTargetPrefillCapture &capture = sequence.captures[index];
           ops::DraftAttention::captureTargetHidden(
-              graph, buffers.gdnOutput, buffers.captured, capture.rows, slot,
+              g, buffers.gdnOutput, buffers.captured, capture.rows, slot,
               capture.sourceStart, capture.destinationStart,
               geometry.hiddenSize, geometry.capturedHiddenSize());
         }
       }
     }
+  };
+
+  const uint32_t R = std::min(weights.residentLayers, geometry.layers);
+  const bool useStreamingCache = (R < geometry.layers && weights.streamingCacheGate);
+
+  if (!useStreamingCache) {
+    for (uint32_t layerIndex = 0; layerIndex < geometry.layers; ++layerIndex) {
+      encodeAttentionHC(graph, layerIndex);
+      metal::MetalBuffer mixerOut = encodeMixer(graph, layerIndex, gdnIndex, attentionIndex);
+      encodeMixerUpdate(graph, layerIndex, mixerOut);
+      encodeMlpHC(graph, layerIndex);
+      ops::MoE::add(
+          graph,
+          {buffers.hyperMixed, buffers.hyperMixed, buffers.gdnOutput,
+           buffers.selectedExperts, buffers.routingWeights,
+           buffers.tileDescriptors, buffers.tileCount, buffers.groupedRoutes,
+           buffers.routeRows, buffers.groupedInput, buffers.expertIntermediate,
+           buffers.expertOutput},
+          weights.layers[layerIndex].ffn, moePlan, /*addResidual=*/false);
+      encodeMlpUpdate(graph, layerIndex);
+      encodeCapture(graph, layerIndex);
+    }
+    if (gdnIndex != geometry.stateLayout.layers ||
+        attentionIndex != kvLayers.size()) {
+      throw std::logic_error("Qwen target layer partition mismatch");
+    }
+    return;
   }
+
+  // =========================================================================
+  // Staged Streaming Execution Path with Active Expert Caching for Prefill
+  // =========================================================================
+
+  uint32_t totalMisses = 0;
+
+  auto stageActiveExperts = [&](uint32_t layerIndex) -> bool {
+    auto &cache = weights.layers[layerIndex].expertCache;
+    auto *selPtr = static_cast<uint32_t *>(buffers.selectedExperts.contents());
+    const uint32_t routesPerRow = moePlan.shape().routesPerToken();
+    const uint32_t expertsPerToken = weights.layout.expertsPerToken;
+    const uint32_t totalExperts = weights.layout.experts;
+    constexpr uint32_t kMaxExperts = 512;
+    int16_t stepExpertSeen[kMaxExperts];
+    std::fill_n(stepExpertSeen, kMaxExperts, -1);
+    std::vector<uint32_t> uniqueExperts;
+    uniqueExperts.reserve(32);
+
+    for (uint32_t r = 0; r < rows; ++r) {
+      for (uint32_t k = 0; k < expertsPerToken; ++k) {
+        uint32_t exp = selPtr[r * routesPerRow + k];
+        if (exp < totalExperts && stepExpertSeen[exp] == -1) {
+          stepExpertSeen[exp] = 1;
+          uniqueExperts.push_back(exp);
+        }
+      }
+    }
+
+    if (layerIndex < weights.lastSelectedExperts.size()) {
+      weights.lastSelectedExperts[layerIndex] = uniqueExperts;
+    }
+
+    if (uniqueExperts.size() > cache.capacity) {
+      // Prompt requires more unique experts than cache capacity in this layer;
+      // fall back to monolithic layer.ffn
+      return false;
+    }
+
+    struct Miss {
+      uint32_t expert;
+      uint32_t slot;
+    };
+    std::vector<Miss> misses;
+    misses.reserve(uniqueExperts.size());
+    ++cache.clock;
+
+    int16_t expertToAssignedSlot[kMaxExperts];
+    std::fill_n(expertToAssignedSlot, kMaxExperts, -1);
+
+    for (uint32_t exp : uniqueExperts) {
+      int16_t slot = cache.expertToSlot[exp];
+      if (slot != -1) {
+        // Cache hit: refresh LRU timestamp
+        cache.lruTime[slot] = cache.clock;
+        expertToAssignedSlot[exp] = slot;
+      } else {
+        // Cache miss: find a slot
+        uint32_t assignSlot = 0;
+        if (cache.numCached < cache.capacity) {
+          assignSlot = cache.numCached++;
+        } else {
+          // Evict LRU slot not in active step
+          uint32_t oldest = UINT32_MAX;
+          uint32_t best = 0;
+          for (uint32_t s = 0; s < cache.capacity; ++s) {
+            if (cache.lruTime[s] == cache.clock) continue;
+            if (cache.lruTime[s] < oldest) {
+              oldest = cache.lruTime[s];
+              best = s;
+            }
+          }
+          assignSlot = best;
+          int16_t evicted = cache.slotToExpert[assignSlot];
+          if (evicted != -1) {
+            cache.expertToSlot[evicted] = -1;
+          }
+        }
+        cache.slotToExpert[assignSlot] = exp;
+        cache.expertToSlot[exp] = assignSlot;
+        cache.lruTime[assignSlot] = cache.clock;
+        expertToAssignedSlot[exp] = assignSlot;
+        misses.push_back({exp, assignSlot});
+      }
+    }
+
+    totalMisses += static_cast<uint32_t>(misses.size());
+
+    if (!misses.empty()) {
+      const auto &layer = weights.layers[layerIndex];
+      const uint64_t stride = layer.ffn.expertGate.expertStrideBytes;
+      char *cg = static_cast<char *>(cache.cacheGate.contents());
+      char *cu = static_cast<char *>(cache.cacheUp.contents());
+      char *cd = static_cast<char *>(cache.cacheDown.contents());
+      const char *fg = static_cast<const char *>(layer.ffn.expertGate.packed.contents());
+      const char *fu = static_cast<const char *>(layer.ffn.expertUp.packed.contents());
+      const char *fd = static_cast<const char *>(layer.ffn.expertDown.packed.contents());
+
+      if (misses.size() <= 2) {
+        for (const auto &m : misses) {
+          uint32_t exp = m.expert;
+          uint32_t slot = m.slot;
+          std::memcpy(cg + uint64_t{slot} * stride, fg + uint64_t{exp} * stride, stride);
+          std::memcpy(cu + uint64_t{slot} * stride, fu + uint64_t{exp} * stride, stride);
+          std::memcpy(cd + uint64_t{slot} * stride, fd + uint64_t{exp} * stride, stride);
+        }
+      } else {
+        dispatch_apply(misses.size(), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t i) {
+          uint32_t exp = misses[i].expert;
+          uint32_t slot = misses[i].slot;
+          std::memcpy(cg + uint64_t{slot} * stride, fg + uint64_t{exp} * stride, stride);
+          std::memcpy(cu + uint64_t{slot} * stride, fu + uint64_t{exp} * stride, stride);
+          std::memcpy(cd + uint64_t{slot} * stride, fd + uint64_t{exp} * stride, stride);
+        });
+      }
+    }
+
+    for (uint32_t r = 0; r < rows; ++r) {
+      for (uint32_t k = 0; k < expertsPerToken; ++k) {
+        uint32_t exp = selPtr[r * routesPerRow + k];
+        if (exp < totalExperts) {
+          selPtr[r * routesPerRow + k] = expertToAssignedSlot[exp];
+        }
+      }
+      selPtr[r * routesPerRow + expertsPerToken] = 512;
+    }
+
+    return true;
+  };
+
+  auto makeCacheWeights = [&](uint32_t layerIndex) -> ops::MoeWeights {
+    const auto &layer = weights.layers[layerIndex];
+    const auto &cache = layer.expertCache;
+    const uint64_t stride = layer.ffn.expertGate.expertStrideBytes;
+    return ops::MoeWeights{
+        .router = layer.ffn.router,
+        .expertGate = {cache.cacheGate, cache.capacity,
+                       weights.layout.expertIntermediateSize, weights.layout.hiddenSize, stride},
+        .expertUp = {cache.cacheUp, cache.capacity,
+                     weights.layout.expertIntermediateSize, weights.layout.hiddenSize, stride},
+        .expertDown = {cache.cacheDown, cache.capacity,
+                       weights.layout.hiddenSize, weights.layout.expertIntermediateSize, stride},
+        .sharedGate = layer.ffn.sharedGate,
+        .sharedUp = layer.ffn.sharedUp,
+        .sharedDown = layer.ffn.sharedDown,
+        .sharedExpertGate = layer.ffn.sharedExpertGate,
+    };
+  };
+
+  metal::CommandGraph residentGraph = std::move(graph);
+  for (uint32_t layerIndex = 0; layerIndex < R; ++layerIndex) {
+    encodeAttentionHC(residentGraph, layerIndex);
+    metal::MetalBuffer mixerOut = encodeMixer(residentGraph, layerIndex, gdnIndex, attentionIndex);
+    encodeMixerUpdate(residentGraph, layerIndex, mixerOut);
+    encodeMlpHC(residentGraph, layerIndex);
+    ops::MoE::add(
+        residentGraph,
+        {buffers.hyperMixed, buffers.hyperMixed, buffers.gdnOutput,
+         buffers.selectedExperts, buffers.routingWeights,
+         buffers.tileDescriptors, buffers.tileCount, buffers.groupedRoutes,
+         buffers.routeRows, buffers.groupedInput, buffers.expertIntermediate,
+         buffers.expertOutput},
+        weights.layers[layerIndex].ffn, moePlan, /*addResidual=*/false);
+    encodeMlpUpdate(residentGraph, layerIndex);
+    encodeCapture(residentGraph, layerIndex);
+  }
+
+  // Layer R base up to router
+  encodeAttentionHC(residentGraph, R);
+  metal::MetalBuffer mixerOutR = encodeMixer(residentGraph, R, gdnIndex, attentionIndex);
+  encodeMixerUpdate(residentGraph, R, mixerOutR);
+  encodeMlpHC(residentGraph, R);
+  encodeMoERoute(residentGraph, R);
+
+  // Submit residentGraph and prefetch streaming experts in background
+  auto t0 = std::chrono::steady_clock::now();
+  metal::CommandTicket residentTicket = backend.submitCommandAsync(residentGraph.dispatches());
+  weights.prefetchStreamingExperts();
+  (void)residentTicket.wait();
+  auto t1 = std::chrono::steady_clock::now();
+  double residentMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+  double totalStageMs = 0.0;
+  double totalGpuMs = 0.0;
+
+  // Loop through streaming layers R .. geometry.layers - 2
+  for (uint32_t L = R; L < geometry.layers - 1; ++L) {
+    auto ts0 = std::chrono::steady_clock::now();
+    bool staged = stageActiveExperts(L);
+    auto ts1 = std::chrono::steady_clock::now();
+    totalStageMs += std::chrono::duration<double, std::milli>(ts1 - ts0).count();
+
+    ops::MoeWeights moeW = staged ? makeCacheWeights(L) : weights.layers[L].ffn;
+
+    metal::CommandGraph stepGraph;
+    encodeMoEExecute(stepGraph, moeW);
+    encodeMlpUpdate(stepGraph, L);
+    encodeCapture(stepGraph, L);
+
+    // Layer L + 1 base up to router
+    encodeAttentionHC(stepGraph, L + 1);
+    metal::MetalBuffer mixerOutNext = encodeMixer(stepGraph, L + 1, gdnIndex, attentionIndex);
+    encodeMixerUpdate(stepGraph, L + 1, mixerOutNext);
+    encodeMlpHC(stepGraph, L + 1);
+    encodeMoERoute(stepGraph, L + 1);
+
+    auto tg0 = std::chrono::steady_clock::now();
+    (void)backend.submitCommandAsync(stepGraph.dispatches()).wait();
+    auto tg1 = std::chrono::steady_clock::now();
+    totalGpuMs += std::chrono::duration<double, std::milli>(tg1 - tg0).count();
+  }
+
+  const uint32_t lastL = geometry.layers - 1;
+  auto ts0 = std::chrono::steady_clock::now();
+  bool stagedLast = stageActiveExperts(lastL);
+  auto ts1 = std::chrono::steady_clock::now();
+  totalStageMs += std::chrono::duration<double, std::milli>(ts1 - ts0).count();
+
+  ops::MoeWeights moeWLast = stagedLast ? makeCacheWeights(lastL) : weights.layers[lastL].ffn;
+
+  if (gdnIndex != geometry.stateLayout.layers ||
+      attentionIndex != kvLayers.size()) {
+    throw std::logic_error("Qwen target layer partition mismatch");
+  }
+
+  // Encode final layer's MoE, MLP update, and capture into caller's graph
+  encodeMoEExecute(graph, moeWLast);
+  encodeMlpUpdate(graph, lastL);
+  encodeCapture(graph, lastL);
+
+  std::cerr << "[Prefill Timing] Resident 0.." << R << ": " << residentMs << " ms | Streaming Staging: "
+            << totalStageMs << " ms (misses: " << totalMisses << ") | Streaming GPU: " << totalGpuMs << " ms\n";
 
   if (gdnIndex != geometry.stateLayout.layers ||
       attentionIndex != kvLayers.size()) {
@@ -362,148 +645,428 @@ void Qwen4ExpTarget::addVerify(
   uint32_t gdnIndex = 0;
   uint32_t attentionIndex = 0;
 
-  for (uint32_t layerIndex = 0; layerIndex < geometry.layers; ++layerIndex) {
+  auto encodeAttentionHC = [&](metal::CommandGraph &g, uint32_t layerIndex) {
     const auto &layer = weights.layers[layerIndex];
     metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
-    metal::MetalBuffer output = buffers.hidden[(layerIndex & 1) ^ 1];
+    g.add("hyper_connection_normalize",
+          {input, layer.attentionHyperConnection.norm,
+           layer.attentionHyperConnection.mixDown, buffers.normalized,
+           buffers.hyperReduced},
+          hcParams, {rows, 1, 1}, {256, 1, 1});
+    g.add("hyper_connection_mix",
+          {buffers.normalized, buffers.hyperReduced,
+           layer.attentionHyperConnection.mixUp,
+           *layer.attentionHyperConnection.blockInject,
+           buffers.hyperMixed, buffers.hyperInjection},
+          hcParams, {rows, 1, 1}, {256, 1, 1});
+  };
 
-    // 1. Attention Hyper-connection
-    graph.add("hyper_connection_normalize",
-              {input, layer.attentionHyperConnection.norm,
-               layer.attentionHyperConnection.mixDown, buffers.normalized,
-               buffers.hyperReduced},
-              hcParams, {rows, 1, 1}, {256, 1, 1});
-    graph.add("hyper_connection_mix",
-              {buffers.normalized, buffers.hyperReduced,
-               layer.attentionHyperConnection.mixUp,
-               *layer.attentionHyperConnection.blockInject,
-               buffers.hyperMixed, buffers.hyperInjection},
-              hcParams, {rows, 1, 1}, {256, 1, 1});
-
-    // 2. Mixer
+  auto encodeMixer = [&](metal::CommandGraph &g, uint32_t layerIndex,
+                         uint32_t &gdnIdx, uint32_t &attnIdx) -> metal::MetalBuffer {
+    const auto &layer = weights.layers[layerIndex];
     metal::MetalBuffer mixerOutBuffer;
     if (std::holds_alternative<QwenGdnWeights>(layer.mixer)) {
       const auto &mixer = std::get<QwenGdnWeights>(layer.mixer);
       operators.linear().addDecodeBatch(
-          graph, buffers.hyperMixed, mixer.inputProjection,
-          buffers.gdnPacked[gdnIndex], gdnInput, lanes, stats);
+          g, buffers.hyperMixed, mixer.inputProjection,
+          buffers.gdnPacked[gdnIdx], gdnInput, lanes, stats);
       ops::GDN::addDecode(
-          graph,
-          {buffers.gdnPacked[gdnIndex], mixer.convolutionWeights,
+          g,
+          {buffers.gdnPacked[gdnIdx], mixer.convolutionWeights,
            buffers.currentGdnStates, buffers.nextGdnStates,
-           buffers.gdnMixed[gdnIndex], mixer.decay, mixer.timeBias,
-           buffers.gdnDecay[gdnIndex], buffers.gdnBeta[gdnIndex],
+           buffers.gdnMixed[gdnIdx], mixer.decay, mixer.timeBias,
+           buffers.gdnDecay[gdnIdx], buffers.gdnBeta[gdnIdx],
            buffers.recurrent, mixer.mixerNorm, buffers.gdnHidden,
            buffers.arrived, buffers.generation},
-          geometry.gdnShape(), lanes, gdnIndex,
+          geometry.gdnShape(), lanes, gdnIdx,
           {geometry.stateLayout.convolutionLayerBytes(),
            geometry.stateLayout.recurrentLayerBytes(),
            geometry.stateLayout.convolutionBytes()});
-      operators.linear().addDecodeBatch(graph, buffers.gdnHidden,
+      operators.linear().addDecodeBatch(g, buffers.gdnHidden,
                                         mixer.outputProjection,
                                         buffers.gdnOutput, mixerOutput, lanes,
                                         stats);
       mixerOutBuffer = buffers.gdnOutput;
-      ++gdnIndex;
+      ++gdnIdx;
     } else {
       const auto &mixer = std::get<QwenAttentionWeights>(layer.mixer);
       const uint32_t tileRows = kv::kPageTokens;
       operators.linear().addDecodeBatch(
-          graph, buffers.hyperMixed, mixer.inputProjection, buffers.fullPacked,
+          g, buffers.hyperMixed, mixer.inputProjection, buffers.fullPacked,
           attentionInput, lanes, stats);
       ops::PagedAttention::addVerifyProjection(
-          graph, buffers.fullPacked, mixer.queryNorm, mixer.keyNorm,
+          g, buffers.fullPacked, mixer.queryNorm, mixer.keyNorm,
           buffers.ropeCos, buffers.ropeSin, buffers.fullQueries,
-          buffers.chunkKeys[attentionIndex],
-          buffers.chunkValues[attentionIndex],
+          buffers.chunkKeys[attnIdx], buffers.chunkValues[attnIdx],
           ExecutionLimits::targetVerifyRows, tileRows, tileRows,
           geometry.attentionQueryHeads, geometry.kvLayout, lanes);
       ops::PagedAttention::addVerify(
-          graph, kvLayers[attentionIndex],
-          {buffers.chunkKeys[attentionIndex],
-           buffers.chunkValues[attentionIndex], buffers.fullQueries,
-           buffers.attentionPartials, buffers.attentionStatistics,
-           buffers.fullAttention, buffers.pageTables},
+          g, kvLayers[attnIdx],
+          {buffers.chunkKeys[attnIdx], buffers.chunkValues[attnIdx],
+           buffers.fullQueries, buffers.attentionPartials,
+           buffers.attentionStatistics, buffers.fullAttention,
+           buffers.pageTables},
           q8, verify, attentionPlan);
       ops::PagedAttention::addVerifyGate(
-          graph, buffers.fullPacked, buffers.fullAttention,
+          g, buffers.fullPacked, buffers.fullAttention,
           buffers.attentionHidden, ExecutionLimits::targetVerifyRows, tileRows,
           tileRows, geometry.attentionQueryHeads, geometry.kvLayout, lanes);
-      operators.linear().addDecodeBatch(graph, buffers.attentionHidden,
+      operators.linear().addDecodeBatch(g, buffers.attentionHidden,
                                         mixer.outputProjection,
                                         buffers.attentionOutput, mixerOutput,
                                         lanes, stats);
       mixerOutBuffer = buffers.attentionOutput;
-      ++attentionIndex;
+      ++attnIdx;
     }
+    return mixerOutBuffer;
+  };
 
-    // 3. Residual update after mixer: input += injection * mixerOutBuffer
-    graph.add("hyper_connection_update",
-              {input, mixerOutBuffer, buffers.hyperInjection}, hcParams,
-              {64, 1, 1}, {256, 1, 1});
+  auto encodeMixerUpdate = [&](metal::CommandGraph &g, uint32_t layerIndex,
+                               metal::MetalBuffer mixerOutBuffer) {
+    metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
+    g.add("hyper_connection_update",
+          {input, mixerOutBuffer, buffers.hyperInjection}, hcParams,
+          {64, 1, 1}, {256, 1, 1});
+  };
 
-    // 4. MLP Hyper-connection
-    graph.add("hyper_connection_normalize",
-              {input, layer.mlpHyperConnection.norm,
-               layer.mlpHyperConnection.mixDown, buffers.normalized,
-               buffers.hyperReduced},
-              hcParams, {rows, 1, 1}, {256, 1, 1});
-    graph.add("hyper_connection_mix",
-              {buffers.normalized, buffers.hyperReduced,
-               layer.mlpHyperConnection.mixUp,
-               *layer.mlpHyperConnection.blockInject,
-               buffers.hyperMixed, buffers.hyperInjection},
-              hcParams, {rows, 1, 1}, {256, 1, 1});
+  auto encodeMlpHC = [&](metal::CommandGraph &g, uint32_t layerIndex) {
+    const auto &layer = weights.layers[layerIndex];
+    metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
+    g.add("hyper_connection_normalize",
+          {input, layer.mlpHyperConnection.norm,
+           layer.mlpHyperConnection.mixDown, buffers.normalized,
+           buffers.hyperReduced},
+          hcParams, {rows, 1, 1}, {256, 1, 1});
+    g.add("hyper_connection_mix",
+          {buffers.normalized, buffers.hyperReduced,
+           layer.mlpHyperConnection.mixUp,
+           *layer.mlpHyperConnection.blockInject,
+           buffers.hyperMixed, buffers.hyperInjection},
+          hcParams, {rows, 1, 1}, {256, 1, 1});
+  };
 
-    // 5. MoE block: input is buffers.hyperMixed, output is buffers.gdnOutput, addResidual=false
-    ops::MoE::add(
-        graph,
+  auto encodeMoERoute = [&](metal::CommandGraph &g, uint32_t layerIndex) {
+    const auto &layer = weights.layers[layerIndex];
+    ops::MoE::addRoute(
+        g,
         {buffers.hyperMixed, buffers.hyperMixed, buffers.gdnOutput,
          buffers.selectedExperts, buffers.routingWeights,
          buffers.tileDescriptors, buffers.tileCount, buffers.groupedRoutes,
          buffers.routeRows, buffers.groupedInput, buffers.expertIntermediate,
          buffers.expertOutput},
-        layer.ffn, moePlan, /*addResidual=*/false);
+        layer.ffn, moePlan);
+  };
 
-    // 6. Residual update after MLP: output = input + injection * moeOutput
-    graph.add("hyper_connection_update_out",
-              {input, output, buffers.gdnOutput, buffers.hyperInjection},
-              hcParams, {64, 1, 1}, {256, 1, 1});
+  auto encodeMoEExecute = [&](metal::CommandGraph &g, const ops::MoeWeights &weightsToUse) {
+    ops::MoE::addExecute(
+        g,
+        {buffers.hyperMixed, buffers.hyperMixed, buffers.gdnOutput,
+         buffers.selectedExperts, buffers.routingWeights,
+         buffers.tileDescriptors, buffers.tileCount, buffers.groupedRoutes,
+         buffers.routeRows, buffers.groupedInput, buffers.expertIntermediate,
+         buffers.expertOutput},
+        weightsToUse, moePlan, /*addResidual=*/false);
+  };
 
-    // 7. Target hidden capture
+  auto encodeMlpUpdate = [&](metal::CommandGraph &g, uint32_t layerIndex) {
+    metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
+    metal::MetalBuffer output = buffers.hidden[(layerIndex & 1) ^ 1];
+    g.add("hyper_connection_update_out",
+          {input, output, buffers.gdnOutput, buffers.hyperInjection},
+          hcParams, {64, 1, 1}, {256, 1, 1});
+  };
+
+  auto encodeCapture = [&](metal::CommandGraph &g, uint32_t layerIndex) {
     const auto captureLayers = geometry.captureLayers();
     const auto captured =
         std::find(captureLayers.begin(), captureLayers.end(), layerIndex);
     if (captured != captureLayers.end()) {
       ops::DraftAttention::captureTargetHidden(
-          graph, buffers.gdnOutput, buffers.capturedTargetHidden, rows,
+          g, buffers.gdnOutput, buffers.capturedTargetHidden, rows,
           static_cast<uint32_t>(captured - captureLayers.begin()), 0, 0,
           geometry.hiddenSize, geometry.capturedHiddenSize());
     }
+  };
+
+  auto encodeHead = [&](metal::CommandGraph &g) {
+    g.add("hyper_connection_normalize",
+          {buffers.hidden[geometry.layers & 1],
+           weights.hyperConnectionMixer.norm,
+           weights.hyperConnectionMixer.mixDown, buffers.normalized,
+           buffers.hyperReduced},
+          hcParams, {rows, 1, 1}, {256, 1, 1});
+    g.add("hyper_connection_mix_no_inject",
+          {buffers.normalized, buffers.hyperReduced,
+           weights.hyperConnectionMixer.mixUp, buffers.finalHidden},
+          hcParams, {rows, 1, 1}, {256, 1, 1});
+    const ops::LinearMatrix head{geometry.vocabularySize, geometry.hiddenSize};
+    operators.linear().addDecodeBatch(g, buffers.finalHidden,
+                                      weights.logitsProjection, buffers.logits,
+                                      head, lanes, stats);
+  };
+
+  const uint32_t R = std::min(weights.residentLayers, geometry.layers);
+  const bool useStreamingCache = (R < geometry.layers && weights.streamingCacheGate);
+
+  if (!useStreamingCache) {
+    for (uint32_t layerIndex = 0; layerIndex < geometry.layers; ++layerIndex) {
+      encodeAttentionHC(graph, layerIndex);
+      metal::MetalBuffer mixerOut = encodeMixer(graph, layerIndex, gdnIndex, attentionIndex);
+      encodeMixerUpdate(graph, layerIndex, mixerOut);
+      encodeMlpHC(graph, layerIndex);
+      ops::MoE::add(
+          graph,
+          {buffers.hyperMixed, buffers.hyperMixed, buffers.gdnOutput,
+           buffers.selectedExperts, buffers.routingWeights,
+           buffers.tileDescriptors, buffers.tileCount, buffers.groupedRoutes,
+           buffers.routeRows, buffers.groupedInput, buffers.expertIntermediate,
+           buffers.expertOutput},
+          weights.layers[layerIndex].ffn, moePlan, /*addResidual=*/false);
+      encodeMlpUpdate(graph, layerIndex);
+      encodeCapture(graph, layerIndex);
+    }
+    if (gdnIndex != geometry.stateLayout.layers ||
+        attentionIndex != kvLayers.size()) {
+      throw std::logic_error("Qwen target layer partition mismatch");
+    }
+    encodeHead(graph);
+    return;
   }
+
+  // =========================================================================
+  // Staged Streaming Execution Path with Active Expert Caching & Speculation
+  // =========================================================================
+
+  uint32_t totalMisses = 0;
+
+  auto stageActiveExperts = [&](uint32_t layerIndex) -> bool {
+    auto &cache = weights.layers[layerIndex].expertCache;
+    auto *selPtr = static_cast<uint32_t *>(buffers.selectedExperts.contents());
+    const uint32_t routesPerRow = moePlan.shape().routesPerToken();
+    const uint32_t expertsPerToken = weights.layout.expertsPerToken;
+    const uint32_t totalExperts = weights.layout.experts;
+    constexpr uint32_t kMaxExperts = 512;
+    int16_t stepExpertSeen[kMaxExperts];
+    std::fill_n(stepExpertSeen, kMaxExperts, -1);
+    std::vector<uint32_t> uniqueExperts;
+    uniqueExperts.reserve(32);
+
+    for (uint32_t r = 0; r < rows; ++r) {
+      for (uint32_t k = 0; k < expertsPerToken; ++k) {
+        uint32_t exp = selPtr[r * routesPerRow + k];
+        if (exp < totalExperts && stepExpertSeen[exp] == -1) {
+          stepExpertSeen[exp] = 1;
+          uniqueExperts.push_back(exp);
+        }
+      }
+    }
+
+    if (layerIndex < weights.lastSelectedExperts.size()) {
+      weights.lastSelectedExperts[layerIndex] = uniqueExperts;
+    }
+
+    if (uniqueExperts.size() > cache.capacity) {
+      return false;
+    }
+
+    struct Miss {
+      uint32_t expert;
+      uint32_t slot;
+    };
+    std::vector<Miss> misses;
+    misses.reserve(uniqueExperts.size());
+    ++cache.clock;
+
+    int16_t expertToAssignedSlot[kMaxExperts];
+    std::fill_n(expertToAssignedSlot, kMaxExperts, -1);
+
+    for (uint32_t exp : uniqueExperts) {
+      int16_t slot = cache.expertToSlot[exp];
+      if (slot != -1) {
+        // Cache hit: refresh LRU timestamp
+        cache.lruTime[slot] = cache.clock;
+        expertToAssignedSlot[exp] = slot;
+      } else {
+        // Cache miss: find a slot
+        uint32_t assignSlot = 0;
+        if (cache.numCached < cache.capacity) {
+          assignSlot = cache.numCached++;
+        } else {
+          // Evict LRU slot not in active step
+          uint32_t oldest = UINT32_MAX;
+          uint32_t best = 0;
+          for (uint32_t s = 0; s < cache.capacity; ++s) {
+            if (cache.lruTime[s] == cache.clock) continue;
+            if (cache.lruTime[s] < oldest) {
+              oldest = cache.lruTime[s];
+              best = s;
+            }
+          }
+          assignSlot = best;
+          int16_t evicted = cache.slotToExpert[assignSlot];
+          if (evicted != -1) {
+            cache.expertToSlot[evicted] = -1;
+          }
+        }
+        cache.slotToExpert[assignSlot] = exp;
+        cache.expertToSlot[exp] = assignSlot;
+        cache.lruTime[assignSlot] = cache.clock;
+        expertToAssignedSlot[exp] = assignSlot;
+        misses.push_back({exp, assignSlot});
+      }
+    }
+
+    totalMisses += static_cast<uint32_t>(misses.size());
+
+    if (!misses.empty()) {
+      const auto &layer = weights.layers[layerIndex];
+      const uint64_t stride = layer.ffn.expertGate.expertStrideBytes;
+      char *cg = static_cast<char *>(cache.cacheGate.contents());
+      char *cu = static_cast<char *>(cache.cacheUp.contents());
+      char *cd = static_cast<char *>(cache.cacheDown.contents());
+      const char *fg = static_cast<const char *>(layer.ffn.expertGate.packed.contents());
+      const char *fu = static_cast<const char *>(layer.ffn.expertUp.packed.contents());
+      const char *fd = static_cast<const char *>(layer.ffn.expertDown.packed.contents());
+
+      if (misses.size() <= 2) {
+        for (const auto &m : misses) {
+          uint32_t exp = m.expert;
+          uint32_t slot = m.slot;
+          std::memcpy(cg + uint64_t{slot} * stride, fg + uint64_t{exp} * stride, stride);
+          std::memcpy(cu + uint64_t{slot} * stride, fu + uint64_t{exp} * stride, stride);
+          std::memcpy(cd + uint64_t{slot} * stride, fd + uint64_t{exp} * stride, stride);
+        }
+      } else {
+        dispatch_apply(misses.size(), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t i) {
+          uint32_t exp = misses[i].expert;
+          uint32_t slot = misses[i].slot;
+          std::memcpy(cg + uint64_t{slot} * stride, fg + uint64_t{exp} * stride, stride);
+          std::memcpy(cu + uint64_t{slot} * stride, fu + uint64_t{exp} * stride, stride);
+          std::memcpy(cd + uint64_t{slot} * stride, fd + uint64_t{exp} * stride, stride);
+        });
+      }
+    }
+
+    for (uint32_t r = 0; r < rows; ++r) {
+      for (uint32_t k = 0; k < expertsPerToken; ++k) {
+        uint32_t exp = selPtr[r * routesPerRow + k];
+        if (exp < totalExperts) {
+          selPtr[r * routesPerRow + k] = expertToAssignedSlot[exp];
+        }
+      }
+      selPtr[r * routesPerRow + expertsPerToken] = 512;
+    }
+    return true;
+  };
+
+  auto makeCacheWeights = [&](uint32_t layerIndex) -> ops::MoeWeights {
+    const auto &layer = weights.layers[layerIndex];
+    const auto &cache = layer.expertCache;
+    const uint64_t stride = layer.ffn.expertGate.expertStrideBytes;
+    return ops::MoeWeights{
+        .router = layer.ffn.router,
+        .expertGate = {cache.cacheGate, cache.capacity,
+                       weights.layout.expertIntermediateSize, weights.layout.hiddenSize, stride},
+        .expertUp = {cache.cacheUp, cache.capacity,
+                     weights.layout.expertIntermediateSize, weights.layout.hiddenSize, stride},
+        .expertDown = {cache.cacheDown, cache.capacity,
+                       weights.layout.hiddenSize, weights.layout.expertIntermediateSize, stride},
+        .sharedGate = layer.ffn.sharedGate,
+        .sharedUp = layer.ffn.sharedUp,
+        .sharedDown = layer.ffn.sharedDown,
+        .sharedExpertGate = layer.ffn.sharedExpertGate,
+    };
+  };
+
+  metal::CommandGraph residentGraph = std::move(graph);
+  for (uint32_t layerIndex = 0; layerIndex < R; ++layerIndex) {
+    encodeAttentionHC(residentGraph, layerIndex);
+    metal::MetalBuffer mixerOut = encodeMixer(residentGraph, layerIndex, gdnIndex, attentionIndex);
+    encodeMixerUpdate(residentGraph, layerIndex, mixerOut);
+    encodeMlpHC(residentGraph, layerIndex);
+    ops::MoE::add(
+        residentGraph,
+        {buffers.hyperMixed, buffers.hyperMixed, buffers.gdnOutput,
+         buffers.selectedExperts, buffers.routingWeights,
+         buffers.tileDescriptors, buffers.tileCount, buffers.groupedRoutes,
+         buffers.routeRows, buffers.groupedInput, buffers.expertIntermediate,
+         buffers.expertOutput},
+        weights.layers[layerIndex].ffn, moePlan, /*addResidual=*/false);
+    encodeMlpUpdate(residentGraph, layerIndex);
+    encodeCapture(residentGraph, layerIndex);
+  }
+
+  // Layer R base up to router
+  encodeAttentionHC(residentGraph, R);
+  metal::MetalBuffer mixerOutR = encodeMixer(residentGraph, R, gdnIndex, attentionIndex);
+  encodeMixerUpdate(residentGraph, R, mixerOutR);
+  encodeMlpHC(residentGraph, R);
+  encodeMoERoute(residentGraph, R);
+
+  // Submit residentGraph and prefetch streaming experts in background
+  auto t0 = std::chrono::steady_clock::now();
+  metal::CommandTicket residentTicket = backend.submitCommandAsync(residentGraph.dispatches());
+  weights.prefetchStreamingExperts();
+  (void)residentTicket.wait();
+  auto t1 = std::chrono::steady_clock::now();
+  double residentMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+  double totalStageMs = 0.0;
+  double totalGpuMs = 0.0;
+  double totalPureGpuMs = 0.0;
+
+  // Loop through streaming layers R .. geometry.layers - 2
+  for (uint32_t L = R; L < geometry.layers - 1; ++L) {
+    auto ts0 = std::chrono::steady_clock::now();
+    bool staged = stageActiveExperts(L);
+    auto ts1 = std::chrono::steady_clock::now();
+    totalStageMs += std::chrono::duration<double, std::milli>(ts1 - ts0).count();
+
+    ops::MoeWeights cacheW = staged ? makeCacheWeights(L) : weights.layers[L].ffn;
+
+    metal::CommandGraph stepGraph;
+    encodeMoEExecute(stepGraph, cacheW);
+    encodeMlpUpdate(stepGraph, L);
+    encodeCapture(stepGraph, L);
+
+    // Layer L + 1 base up to router
+    encodeAttentionHC(stepGraph, L + 1);
+    metal::MetalBuffer mixerOutNext = encodeMixer(stepGraph, L + 1, gdnIndex, attentionIndex);
+    encodeMixerUpdate(stepGraph, L + 1, mixerOutNext);
+    encodeMlpHC(stepGraph, L + 1);
+    encodeMoERoute(stepGraph, L + 1);
+
+    auto tg0 = std::chrono::steady_clock::now();
+    metal::CommandTiming timing = backend.submitCommandAsync(stepGraph.dispatches()).wait();
+    auto tg1 = std::chrono::steady_clock::now();
+    totalGpuMs += std::chrono::duration<double, std::milli>(tg1 - tg0).count();
+    totalPureGpuMs += timing.gpuSeconds * 1000.0;
+  }
+
+  const uint32_t lastL = geometry.layers - 1;
+  auto ts0 = std::chrono::steady_clock::now();
+  bool stagedLast = stageActiveExperts(lastL);
+  auto ts1 = std::chrono::steady_clock::now();
+  totalStageMs += std::chrono::duration<double, std::milli>(ts1 - ts0).count();
+
+  ops::MoeWeights cacheWLast = stagedLast ? makeCacheWeights(lastL) : weights.layers[lastL].ffn;
 
   if (gdnIndex != geometry.stateLayout.layers ||
       attentionIndex != kvLayers.size()) {
     throw std::logic_error("Qwen target layer partition mismatch");
   }
 
-  // Head at the end of verify
-  // buffers.hidden[geometry.layers & 1] holds the final 10240 residual!
-  graph.add("hyper_connection_normalize",
-            {buffers.hidden[geometry.layers & 1],
-             weights.hyperConnectionMixer.norm,
-             weights.hyperConnectionMixer.mixDown, buffers.normalized,
-             buffers.hyperReduced},
-            hcParams, {rows, 1, 1}, {256, 1, 1});
-  graph.add("hyper_connection_mix_no_inject",
-            {buffers.normalized, buffers.hyperReduced,
-             weights.hyperConnectionMixer.mixUp, buffers.finalHidden},
-            hcParams, {rows, 1, 1}, {256, 1, 1});
+  // Encode final layer's MoE, MLP update, capture, and head into the caller's graph
+  encodeMoEExecute(graph, cacheWLast);
+  encodeMlpUpdate(graph, lastL);
+  encodeCapture(graph, lastL);
+  encodeHead(graph);
 
-  const ops::LinearMatrix head{geometry.vocabularySize, geometry.hiddenSize};
-  operators.linear().addDecodeBatch(graph, buffers.finalHidden,
-                                    weights.logitsProjection, buffers.logits,
-                                    head, lanes, stats);
+  static uint32_t verifyStepCount = 0;
+  if (++verifyStepCount <= 10) {
+    std::cerr << "[Verify Timing] Resident 0.." << R << ": " << residentMs << " ms | Staging: "
+              << totalStageMs << " ms (misses: " << totalMisses << ") | GPU Wall: " << totalGpuMs << " ms (pure GPU: " << totalPureGpuMs << " ms)\n";
+  }
 }
 
 } // namespace splash::model

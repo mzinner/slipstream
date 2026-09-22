@@ -106,16 +106,19 @@ void MemoryGovernor::Reservation::release() noexcept {
 
 MemoryGovernor::MemoryGovernor(metal::MetalBackend &backend,
                                uint64_t limitBytes,
-                               uint64_t hostReserveBytes)
+                               uint64_t hostReserveBytes,
+                               uint64_t streamableWeightsBytes)
     : MemoryGovernor(backend, limitBytes, hostReserveBytes,
-                     queryHostAvailableMemory) {}
+                     queryHostAvailableMemory, streamableWeightsBytes) {}
 
 MemoryGovernor::MemoryGovernor(
     metal::MetalBackend &backend, uint64_t limitBytes,
     uint64_t hostReserveBytes,
-    HostAvailableMemoryProvider hostAvailableMemory)
+    HostAvailableMemoryProvider hostAvailableMemory,
+    uint64_t streamableWeightsBytes)
     : backend_(backend), limitBytes_(limitBytes),
       hostReserveBytes_(hostReserveBytes),
+      streamableWeightsBytes_(streamableWeightsBytes),
       hostAvailableMemory_(std::move(hostAvailableMemory)) {
   if (!limitBytes_) {
     throw std::invalid_argument("memory governor limit must be positive");
@@ -152,7 +155,11 @@ MemoryGovernor::observedResidentBytes(bool refreshDevice) const noexcept {
   } else {
     accounted = std::numeric_limits<uint64_t>::max();
   }
-  return std::max(accounted, memory.deviceCurrentAllocatedBytes);
+  uint64_t resident = std::max(accounted, memory.deviceCurrentAllocatedBytes);
+  if (streamableWeightsBytes_ && resident > streamableWeightsBytes_) {
+    resident -= streamableWeightsBytes_;
+  }
+  return resident;
 }
 
 std::optional<uint64_t> MemoryGovernor::sampleHostAvailable() const noexcept {

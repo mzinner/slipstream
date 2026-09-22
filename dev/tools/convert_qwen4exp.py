@@ -46,7 +46,7 @@ from tools.package_format import (  # noqa: E402
     q4_bytes,
     tile_q4,
 )
-from tools.quantize import from_bf16, quantize_affine  # noqa: E402
+from tools.quantize import from_bf16, quantize_affine, to_bf16  # noqa: E402
 
 
 class Checkpoint:
@@ -305,8 +305,12 @@ def write_attention(packed, source: Checkpoint, prefix: str) -> None:
         source.tensor(prefix + ".v_proj.weight"),
     ]
     packed.section(quantized_tile(np.vstack(parts), pad_to=LAYOUT["packed_full"]))
-    packed.section(source.raw(prefix + ".q_norm.weight"))
-    packed.section(source.raw(prefix + ".k_norm.weight"))
+    # Upstream Qwen4ExpTextRMSNorm uses (1.0 + weight) on zero-initialized weights,
+    # whereas the shared Metal attention kernels expect standard RMSNorm weights.
+    q_norm = source.tensor(prefix + ".q_norm.weight") + 1.0
+    k_norm = source.tensor(prefix + ".k_norm.weight") + 1.0
+    packed.section(to_bf16(q_norm).tobytes())
+    packed.section(to_bf16(k_norm).tobytes())
     packed.section(quantized_tile(source.tensor(prefix + ".o_proj.weight")))
     # The indexer tiles 128 wide: its projection is 640 out, not a multiple
     # of 256.
@@ -384,12 +388,12 @@ def quantized_q8(values) -> bytes:
     safe = np.where(stored_scale == 0, 1.0, stored_scale)
     codes = np.clip(np.rint((blocks - stored_bias) / safe), 0, 255).astype(np.uint8)
 
-    # [quant group][row] for the parameters, as the router kernel indexes them.
+    # [quant group][row] for codes and parameters, as the router kernel indexes them.
     def parameters(values_):
         return values_.T.reshape(-1).tobytes()
 
     return (
-        codes.reshape(out, inp).tobytes()
+        codes.transpose(1, 0, 2).reshape(-1).tobytes()
         + parameters(scale_bits)
         + parameters(bias_bits)
     )
@@ -759,6 +763,11 @@ def main() -> int:
     parser.add_argument("--source", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
+        "--layers",
+        default="all",
+        help="comma-separated layer indices to convert, or 'all'",
+    )
+    parser.add_argument(
         "--release-source",
         action="store_true",
         help="delete each shard once no remaining layer reads it; needed when "
@@ -802,8 +811,16 @@ def main() -> int:
 
     target = arguments.destination / "target"
     target.mkdir(parents=True, exist_ok=True)
+    if arguments.layers == "all":
+        indices = list(range(LAYOUT["layers"]))
+    elif "-" in arguments.layers and "," not in arguments.layers:
+        start, end = map(int, arguments.layers.split("-"))
+        indices = list(range(start, end + 1))
+    else:
+        indices = [int(value) for value in arguments.layers.split(",")]
+
     total = 0
-    for index in range(LAYOUT["layers"]):
+    for index in indices:
         try:
             written = write_layer(source, index, target)
         except KeyError as missing:
@@ -827,18 +844,22 @@ def main() -> int:
             if freed:
                 note = f"  (released {freed / 2**30:.1f} GiB of source)"
         print(f"  layer-{index}.bin {written / 2**30:.2f} GiB{note}")
-    total += write_head(source, target)
-    print("  head.bin")
-    total += write_embedding(source, target)
-    print("  embedding.bin")
-    total += write_per_layer_embedding(source, target)
-    print("  ngram.bin")
-    draft = write_placeholder_draft(arguments.destination / "draft")
-    write_placeholder_vision(arguments.destination / "vision")
-    write_manifest(arguments.destination)
-    print(f"\ntarget weights  {total / 2**30:.2f} GiB")
-    print(f"draft           {draft / 2**30:.2f} GiB of zeros - this model has")
-    print("                no DFlash 2 draft, only an MTP head")
+    if arguments.layers == "all":
+        total += write_head(source, target)
+        print("  head.bin")
+        total += write_embedding(source, target)
+        print("  embedding.bin")
+        total += write_per_layer_embedding(source, target)
+        print("  ngram.bin")
+        draft = write_placeholder_draft(arguments.destination / "draft")
+        write_placeholder_vision(arguments.destination / "vision")
+        write_manifest(arguments.destination)
+        print(f"\ntarget weights  {total / 2**30:.2f} GiB")
+        print(f"draft           {draft / 2**30:.2f} GiB of zeros - this model has")
+        print("                no DFlash 2 draft, only an MTP head")
+    else:
+        write_manifest(arguments.destination)
+        print(f"\nconverted {len(indices)} layers ({total / 2**30:.2f} GiB)")
     return 0
 
 

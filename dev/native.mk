@@ -82,6 +82,7 @@ TEST_QWEN4EXP_PACKAGE_TEST := $(ENGINE_TEST_BUILD)/qwen4exp-package
 TEST_HYPER_CONNECTION_TEST := $(ENGINE_TEST_BUILD)/hyper-connection
 TEST_QSA_INDEXER_TEST := $(ENGINE_TEST_BUILD)/qsa-indexer
 TEST_MOE_ROUTE_512_TEST := $(ENGINE_TEST_BUILD)/moe-route-512
+TEST_MOE_STAGED_CACHE_TEST := $(ENGINE_TEST_BUILD)/moe-staged-cache
 TEST_NGRAM_EMBEDDING_TEST := $(ENGINE_TEST_BUILD)/ngram-embedding
 TEST_PER_LAYER_EMBEDDING_TEST := $(ENGINE_TEST_BUILD)/per-layer-embedding
 TEST_QSA_SELECT_TEST := $(ENGINE_TEST_BUILD)/qsa-select
@@ -117,6 +118,7 @@ TEST_Q4_PREFILL_PROFILE := $(ENGINE_TEST_BUILD)/q4-prefill-profile
 TEST_Q4_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/q4-decode-profile
 TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
 TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
+TEST_GENERATE_SAMPLE := $(ENGINE_TEST_BUILD)/generate-sample
 TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
 TEST_MODEL_RUNTIME_ORACLE := $(ENGINE_TEST_BUILD)/model-runtime-oracle
 TEST_VISION_ENCODER_TEST := $(ENGINE_TEST_BUILD)/vision-encoder
@@ -174,6 +176,7 @@ TEST_METAL_TARGETS := $(TEST_TUNING_WORKLOADS) \
 	$(TEST_HYPER_CONNECTION_TEST) \
 	$(TEST_QSA_INDEXER_TEST) \
 	$(TEST_MOE_ROUTE_512_TEST) \
+	$(TEST_MOE_STAGED_CACHE_TEST) \
 	$(TEST_NGRAM_EMBEDDING_TEST) \
 	$(TEST_PER_LAYER_EMBEDDING_TEST) \
 	$(TEST_QSA_SELECT_TEST) \
@@ -198,7 +201,7 @@ TEST_UNIT_TEST_TARGETS := $(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))
 # benchmarks, real-model tests and intermediate test AIRs/metallibs.
 TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(TEST_UNIT_TEST_TARGETS)) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) \
-	$(TEST_DECODE_PROFILE) $(TEST_ATTENTION_SWEEP) \
+	$(TEST_DECODE_PROFILE) $(TEST_GENERATE_SAMPLE) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_METAL_BACKEND_AIR)
 PRODUCTION_CONFIG_TARGETS += $(TEST_Q4_PREFILL_PROFILE) \
 	$(TEST_Q4_DECODE_PROFILE) $(TEST_BACKEND_BENCHMARK) $(TUNE_KERNELS)
@@ -330,6 +333,14 @@ $(TEST_NGRAM_EMBEDDING_TEST): runtime/metal/DeviceCapabilities.cpp \
 $(TEST_MOE_ROUTE_512_TEST): runtime/metal/DeviceCapabilities.cpp \
 		runtime/metal/MetalBackend.mm \
 		dev/tests/engine/moe_route_512_metal_test.mm | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
+		$(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_MOE_STAGED_CACHE_TEST): runtime/metal/DeviceCapabilities.cpp \
+		runtime/metal/MetalBackend.mm \
+		runtime/ops/Linear.cpp \
+		runtime/ops/MoE.cpp \
+		dev/tests/engine/moe_staged_cache_test.mm | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
 
@@ -585,6 +596,12 @@ $(TEST_MODEL_RUNTIME_ORACLE): dev/tests/engine/model_runtime_oracle_test.mm \
 
 
 $(TEST_DECODE_PROFILE): dev/benchmarks/decode_profile.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) \
+		$(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_GENERATE_SAMPLE): dev/benchmarks/generate_sample.mm \
 		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
 		$(ENGINE_LIBRARY) \

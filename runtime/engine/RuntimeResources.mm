@@ -206,8 +206,8 @@ void requireLoadedModel(const model::ModelPackage &package) {
 // mappings against live host availability.
 uint64_t
 remainingFixedRuntimeBytesAfterModelLoad(const EngineMemoryBreakdown &budget) {
-  return budget.fixedRuntimeBytes - budget.targetWeightsBytes -
-         budget.draftWeightsBytes - budget.visionWeightsBytes;
+  return budget.sharedPrefillBytes + budget.sharedDecodeBytes +
+         budget.pipelineReserveBytes + budget.runtimeOverheadReserveBytes;
 }
 
 } // namespace
@@ -318,19 +318,27 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
       EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes);
   try {
     const uint64_t modelBytes = packedModelFileBytes(config.modelRoot);
+    uint64_t streamableBytes = 0;
+    std::visit([&](const auto &layout) {
+      if constexpr (requires { layout.streamableWeightBytes(); }) {
+        streamableBytes = layout.streamableWeightBytes();
+      }
+    }, config.model.target);
+    const uint64_t requiredWeightBytes =
+        modelBytes > streamableBytes ? modelBytes - streamableBytes : modelBytes;
     const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
         device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
     // Reject an impossible weight budget before registering model buffers.
     // The full plan below still uses measured allocations and runtime costs.
-    if (modelBytes > hardBudgetBytes) {
+    if (requiredWeightBytes > hardBudgetBytes) {
       throw RuntimeResourcesError(
           RuntimeResourceStage::MemoryPlanning,
-          "model weights require " + std::to_string(modelBytes) +
+          "model weights require " + std::to_string(requiredWeightBytes) +
               " bytes but the Metal memory budget is " +
               std::to_string(hardBudgetBytes) + " bytes",
           deviceStatusJson(device), {}, RuntimeResourceFailure::EngineCapacity);
     }
-    requireHostCapacity(modelBytes, hostReserveBytes,
+    requireHostCapacity(requiredWeightBytes, hostReserveBytes,
                         RuntimeResourceStage::ModelLoading,
                         "model loading", deviceStatusJson(device));
   } catch (const RuntimeResourcesError &) {
@@ -465,7 +473,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     const uint64_t elasticGrowthCeiling =
         baselineBudget.hardBudgetBytes - runtimeReserve;
     auto memoryGovernor = std::make_unique<MemoryGovernor>(
-        *backend, elasticGrowthCeiling, hostReserveBytes);
+        *backend, elasticGrowthCeiling, hostReserveBytes,
+        package.streamableWeightBytes());
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
     std::string rejected;
@@ -526,8 +535,14 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
           "Metal backend became unhealthy during resource allocation: " +
           backend->unhealthyReason());
     }
-    if (memory.allocatedBytes > budget.hardBudgetBytes ||
-        memory.deviceCurrentAllocatedBytes > budget.hardBudgetBytes) {
+    uint64_t allocatedBytes = memory.allocatedBytes;
+    uint64_t deviceCurrentAllocatedBytes = memory.deviceCurrentAllocatedBytes;
+    if (const uint64_t streamable = package.streamableWeightBytes()) {
+      if (allocatedBytes > streamable) allocatedBytes -= streamable;
+      if (deviceCurrentAllocatedBytes > streamable) deviceCurrentAllocatedBytes -= streamable;
+    }
+    if (allocatedBytes > budget.hardBudgetBytes ||
+        deviceCurrentAllocatedBytes > budget.hardBudgetBytes) {
       throw std::runtime_error(
           "base Metal allocation exceeds immutable hard budget");
     }
@@ -577,6 +592,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   report.sharedPrefillBytes = modelMemory.sharedPrefillActualAllocatedBytes;
   report.sharedDecodeBytes = modelMemory.sharedDecodeActualAllocatedBytes;
   report.kvResidentBytes = kvPages_->actualAllocatedBytes();
+  report.streamCacheBytes = model_.streamCacheActualAllocatedBytes();
   // Optional warmup may end with a rolled-back allocation and no subsequent
   // command. Refresh current residency after that rollback; peaks stay intact.
   metal::MetalMemoryStats memory = backend_->refreshMemoryStats();

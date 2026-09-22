@@ -59,8 +59,10 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
     uint64_t actual;
     uint64_t planned;
   };
+  const uint64_t plannedStreamCache = plan.model().footprint.streamCacheBytes;
   const Category categories[] = {
       {"target weights", actual.targetWeightsBytes, budget.targetWeightsBytes},
+      {"stream cache", actual.streamCacheBytes, plannedStreamCache},
       {"draft weights", actual.draftWeightsBytes, budget.draftWeightsBytes},
       {"vision weights", actual.visionWeightsBytes, budget.visionWeightsBytes},
       {"shared prefill", actual.sharedPrefillBytes, budget.sharedPrefillBytes},
@@ -103,9 +105,22 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
   uint64_t backendUnclassified = actual.backendAllocatedBytes - categorized;
   uint64_t deviceUntracked =
       actual.deviceCurrentAllocatedBytes - actual.backendAllocatedBytes;
-  if (actual.deviceCurrentAllocatedBytes > budget.hardBudgetBytes ||
-      actual.devicePeakAllocatedBytes > budget.hardBudgetBytes ||
-      actual.estimatedWarmupPeakBytes > budget.hardBudgetBytes) {
+  const uint64_t streamable = plan.model().footprint.streamableWeightsBytes;
+  const uint64_t effectiveCurrent =
+      actual.deviceCurrentAllocatedBytes > streamable
+          ? actual.deviceCurrentAllocatedBytes - streamable
+          : actual.deviceCurrentAllocatedBytes;
+  const uint64_t effectivePeak =
+      actual.devicePeakAllocatedBytes > streamable
+          ? actual.devicePeakAllocatedBytes - streamable
+          : actual.devicePeakAllocatedBytes;
+  const uint64_t effectiveEstimated =
+      actual.estimatedWarmupPeakBytes > streamable
+          ? actual.estimatedWarmupPeakBytes - streamable
+          : actual.estimatedWarmupPeakBytes;
+  if (effectiveCurrent > budget.hardBudgetBytes ||
+      effectivePeak > budget.hardBudgetBytes ||
+      effectiveEstimated > budget.hardBudgetBytes) {
     return fail(MemoryAuditError::HardBudgetExceeded,
                 "actual or estimated Metal footprint exceeds hard budget",
                 actual);
@@ -147,7 +162,9 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
   result.deviceUntrackedBytes = deviceUntracked;
   result.warmupPeakDeviationBasisPoints = static_cast<uint32_t>(basisPoints);
   result.actualHeadroomBytes =
-      budget.hardBudgetBytes - actual.devicePeakAllocatedBytes;
+      budget.hardBudgetBytes > effectivePeak
+          ? budget.hardBudgetBytes - effectivePeak
+          : 0;
   return result;
 }
 

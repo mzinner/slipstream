@@ -151,6 +151,43 @@ public:
     [[nodiscard]] void *address() const noexcept { return address_; }
     [[nodiscard]] uint64_t bytes() const noexcept { return bytes_; }
 
+    static int toMadvise(MemoryAdvice advice) noexcept {
+        switch (advice) {
+            case MemoryAdvice::Normal: return MADV_NORMAL;
+            case MemoryAdvice::Random: return MADV_RANDOM;
+            case MemoryAdvice::Sequential: return MADV_SEQUENTIAL;
+            case MemoryAdvice::WillNeed: return MADV_WILLNEED;
+            case MemoryAdvice::DontNeed: return MADV_DONTNEED;
+        }
+    }
+
+    void advise(MemoryAdvice advice) const noexcept {
+        if (address_ && bytes_) {
+            madvise(address_, static_cast<size_t>(bytes_), toMadvise(advice));
+        }
+    }
+
+    void adviseRange(uint64_t offset, uint64_t length, MemoryAdvice advice) const noexcept {
+        if (address_ && offset < bytes_) {
+            uint64_t actual = std::min(length, bytes_ - offset);
+            madvise(static_cast<char *>(address_) + offset,
+                    static_cast<size_t>(actual), toMadvise(advice));
+        }
+    }
+
+    void prefetch(bool touch) const noexcept {
+        if (address_ && bytes_) {
+            madvise(address_, static_cast<size_t>(bytes_), MADV_WILLNEED);
+            if (touch) {
+                const auto *ptr = static_cast<const volatile char *>(address_);
+                constexpr size_t kPage = 16 * 1024;
+                for (size_t i = 0; i < bytes_; i += kPage) {
+                    (void)ptr[i];
+                }
+            }
+        }
+    }
+
 private:
     MappedRegion(void *address, uint64_t bytes)
         : address_(address), bytes_(bytes) {}
@@ -236,6 +273,28 @@ void WeightFile::finish() {
 
 const WeightFileRecord &WeightFile::record() const noexcept {
     return impl_->record;
+}
+
+uint64_t WeightFile::bytes() const noexcept {
+    return impl_->mapping ? impl_->mapping->bytes() : 0;
+}
+
+void WeightFile::advise(MemoryAdvice advice) const noexcept {
+    if (impl_->mapping) {
+        impl_->mapping->advise(advice);
+    }
+}
+
+void WeightFile::adviseRange(uint64_t offset, uint64_t bytes, MemoryAdvice advice) const noexcept {
+    if (impl_->mapping) {
+        impl_->mapping->adviseRange(offset, bytes, advice);
+    }
+}
+
+void WeightFile::prefetch(bool touch) const noexcept {
+    if (impl_->mapping) {
+        impl_->mapping->prefetch(touch);
+    }
 }
 
 ops::Q4Projection readQ4Projection(WeightFile &file,

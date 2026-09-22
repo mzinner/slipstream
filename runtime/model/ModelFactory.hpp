@@ -59,6 +59,15 @@ struct ModelPackage final {
         return 0;
     }, target);
   }
+  [[nodiscard]] uint64_t streamCacheActualAllocatedBytes() const noexcept {
+    return std::visit([](const auto &weights) -> uint64_t {
+      using W = std::remove_cvref_t<decltype(weights)>;
+      if constexpr (std::is_same_v<W, Qwen4ExpWeights>)
+        return weights.expertCacheActualAllocatedBytes();
+      else
+        return 0;
+    }, target);
+  }
   [[nodiscard]] std::span<const WeightFileRecord> targetFiles() const noexcept {
     return std::visit([](const auto &weights) ->
                           std::span<const WeightFileRecord> {

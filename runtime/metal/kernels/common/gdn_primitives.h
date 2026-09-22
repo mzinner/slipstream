@@ -85,8 +85,8 @@ gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
           bfloat(value * scratch[0] * float(norm_weight[thread_index]));
       float gate = float(packed[token * packed_width + ZOffset +
                                 head * HeadDim + thread_index]);
-      float silu = gate / (1.0f + fast::exp2(-1.44269504089f * gate));
-      hidden[base + thread_index] = bfloat(float(normalized) * silu);
+      float sigmoid = 1.0f / (1.0f + fast::exp2(-1.44269504089f * gate));
+      hidden[base + thread_index] = bfloat(float(normalized) * sigmoid);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }

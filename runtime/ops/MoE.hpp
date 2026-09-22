@@ -172,7 +172,6 @@ struct MoE final {
       MoeShape shape, uint32_t lanes,
       MoeConfig config = {MoeExpertTile::M8});
   // Bounded precompiled candidates, shipped baseline first. ExecutionPlans
-  // supplies the device's router threshold to every expert-tile candidate.
   [[nodiscard]] static std::array<MoePlan, 2>
   prefillCandidates(MoeShape shape, uint32_t rows, uint32_t routeWideRows);
   [[nodiscard]] static std::array<MoePlan, 2>
@@ -180,6 +179,11 @@ struct MoE final {
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                   const MoeWeights &weights, const MoePlan &plan,
                   bool addResidual = true);
+  static void addRoute(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                       const MoeWeights &weights, const MoePlan &plan);
+  static void addExecute(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                         const MoeWeights &weights, const MoePlan &plan,
+                         bool addResidual = true);
 };
 
 } // namespace splash::ops

@@ -1,4 +1,5 @@
 #include "model/Runtime.hpp"
+#include "model/Qwen4Exp.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -19,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <list>
 #include <optional>
@@ -1478,6 +1480,7 @@ struct Runtime::Impl {
                                                 "GPU accepted draft count");
       laneResult.nextAnchor =
           *contents<uint32_t>(d(DecodeTensor::NextAnchor), "GPU next anchor");
+
       if (!laneResult.retained || laneResult.retained > kDecodeRows)
         throw std::runtime_error("target policy produced invalid retention");
       if (laneResult.accepted > kDraftProposalTokens ||
@@ -1536,6 +1539,9 @@ struct Runtime::Impl {
     counters.totalDecodeGpuSeconds += timing.gpuSeconds;
     counters.lastDecodeWallSeconds = timing.wallSeconds;
     counters.totalDecodeWallSeconds += timing.wallSeconds;
+    // Allow OS page cache to retain active expert pages across decode steps.
+    // Detached non-expert buffers prevent Metal residency traps, so the OS
+    // naturally keeps frequently touched experts warm in RAM without thrashing.
     return results;
   }
 
@@ -2035,6 +2041,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
           entry.pendingToken = *contents<uint32_t>(
               impl->decodeArena->get(lane, DecodeTensor::OutputTokens),
               "prefill next token");
+
           if (!entry.pendingToken ||
               *entry.pendingToken >=
                   impl->geometry.target.vocabularySize) {

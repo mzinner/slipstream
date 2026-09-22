@@ -76,6 +76,7 @@ double bf16Ulp(double value) {
   return std::max(std::fabs(value), 1e-30) * 0.0078125;
 }
 double silu(double value) { return value / (1.0 + std::exp(-value)); }
+double sigmoid(double value) { return 1.0 / (1.0 + std::exp(-value)); }
 
 MetalBuffer shared(MetalBackend &backend, uint64_t bytes, const char *label) {
   MetalBuffer buffer = backend.allocateBuffer(bytes, BufferStorage::Shared, label);
@@ -365,7 +366,7 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens) {
         const double z = fromBf16(packed[uint64_t{token} * packedWidth + convDim +
                                          head * kHeadDim + dim]);
         const double ref = roundBf16(
-            roundBf16(row[dim] * inverse * fromBf16(mixerNorm[dim])) * silu(z));
+            roundBf16(row[dim] * inverse * fromBf16(mixerNorm[dim])) * sigmoid(z));
         const double got = fromBf16(hidden[base + dim]);
         require(std::isfinite(got), label + "gated output is not finite");
         hiddenUlps = std::max(hiddenUlps, std::fabs(got - ref) / bf16Ulp(ref));

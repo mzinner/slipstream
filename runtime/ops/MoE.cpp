@@ -91,14 +91,10 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
   maximumTiles_ = moeMaximumTiles(rows, shape, tileRows());
 }
 
-void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
-              const MoeWeights &weights, const MoePlan &plan,
-              bool addResidual) {
+namespace {
+void validateScratch(const MoeBuffers &buffers, const MoePlan &plan, bool addResidual) {
   const MoeShape shape = plan.shape();
   const uint32_t rows = plan.rows();
-  const uint32_t tileRows = plan.tileRows();
-  validate(weights, shape);
-  const uint32_t tiles = plan.maximumTiles();
   const MoeWorkspace &required = plan.workspace();
   const uint64_t rowBytes = uint64_t{rows} * shape.hiddenSize * sizeof(uint16_t);
   if (buffers.input.sizeBytes() < rowBytes ||
@@ -116,11 +112,25 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
       buffers.expertOutput.sizeBytes() < required.expertOutputBytes) {
     throw std::invalid_argument("MoE grouped scratch is smaller than its bound");
   }
+}
+} // namespace
+
+void MoE::addRoute(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                   const MoeWeights &weights, const MoePlan &plan) {
+  const MoeShape shape = plan.shape();
+  const uint32_t rows = plan.rows();
   const MoeRouteTile route = moeRouteTile(rows, plan.config().routeWideRows);
   const MoeRouteParams routeParams{rows, shape.hiddenSize, shape.experts,
                                    shape.expertsPerToken};
-  graph.add(route.rows == 8 ? "moe_route_scores_q8_m8"
-                            : "moe_route_scores_q8_m32",
+  const std::string routeScoresPipeline = [&] {
+    if (shape.routerWidth() == 512) {
+      return route.rows == 8 ? "moe_route_scores_q8_n512_m8"
+                             : "moe_route_scores_q8_n512_m32";
+    }
+    return route.rows == 8 ? "moe_route_scores_q8_m8"
+                           : "moe_route_scores_q8_m32";
+  }();
+  graph.add(routeScoresPipeline,
             {buffers.input, weights.router.weights, weights.router.scales,
              weights.router.biases, buffers.groupedInput},
             routeParams,
@@ -134,14 +144,26 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
              weights.sharedExpertGate.biases, buffers.selectedExperts,
              buffers.routingWeights},
             routeParams, {rows, 1, 1}, {shape.routerWidth(), 1, 1});
+}
+
+void MoE::addExecute(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                     const MoeWeights &weights, const MoePlan &plan,
+                     bool addResidual) {
+  validateScratch(buffers, plan, addResidual);
+  const MoeShape shape = plan.shape();
+  const uint32_t rows = plan.rows();
+  const uint32_t tileRows = plan.tileRows();
+  const uint32_t tiles = plan.maximumTiles();
+
   const bool m8 = plan.config().expertTile == MoeExpertTile::M8;
   const bool wide = shape.storageN == 256;
-  graph.add("moe_group_routes",
+  const uint32_t groupThreads = shape.experts == 512 ? 512 : 256;
+  graph.add(shape.experts == 512 ? "moe_group_routes_512" : "moe_group_routes",
             {buffers.selectedExperts, buffers.tileDescriptors,
              buffers.tileCount, buffers.groupedRoutes, buffers.routeRows},
             MoeGroupParams{rows, shape.expertsPerToken, tileRows,
                            shape.experts},
-            {1, 1, 1});
+            {1, 1, 1}, {groupThreads, 1, 1});
   graph.add("moe_gather_rows",
             {buffers.input, buffers.groupedRoutes, buffers.tileCount,
              buffers.groupedInput},
@@ -166,8 +188,6 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                              weights.expertDown.expertStrideBytes,
                              weights.expertDown.expertStrideBytes};
   if (plan.splitExperts()) {
-    // The gate lands in expertOutput, which the down pass overwrites only
-    // after the up pass has consumed it.
     graph.add(wide ? "prefill_moe_expert_q4_n256_m32"
                    : "prefill_moe_expert_q4_n128_m32",
               {buffers.groupedInput, buffers.tileDescriptors,
@@ -219,6 +239,15 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
               MoeCombineParams{rows, shape.hiddenSize, shape.routesPerToken()},
               {rows, shape.hiddenSize / 256, 1});
   }
+}
+
+void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
+              const MoeWeights &weights, const MoePlan &plan,
+              bool addResidual) {
+  validate(weights, plan.shape());
+  validateScratch(buffers, plan, addResidual);
+  addRoute(graph, buffers, weights, plan);
+  addExecute(graph, buffers, weights, plan, addResidual);
 }
 
 MoePlan MoE::prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config) {

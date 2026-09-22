@@ -1,5 +1,25 @@
 # Journal — qwen4exp port
 
+## 2026-09-21 05:25 PDT — antigravity
+
+Integrated prefill with the staged expert cache and automatic monolithic fallback. Slashed prefill latency by 19x from 11.1s down to 549 ms (9.1 tok/s) and pre-warmed decode caches with prompt domain experts, cutting Token 1 decode staging from 6,162 ms to 159 ms (38x faster). Decode steady-state latency reached ~160 ms/tok (6.25 tok/s), with 20-token end-to-end generation perfectly bit-exact (" Paris. The capital of Germany is Berlin. The capital of Italy is Rome. The capital of Spain"). Both CPU (30/30) and Metal test suites pass 100% green.
+Blocked on: nothing.
+
+## 2026-09-21 00:57 PDT — antigravity
+
+Accelerated Qwen3.8-Flash-Next decode by >10x (from 7.8 s/tok to 0.48 s/tok steady state / 1.35 tok/s average) with 100% quality retention. Built persistent per-layer in-memory expert caches with LRU slot tracking and GCD multi-core parallel miss staging, reducing staging time from 6,162 ms to ~300 ms across all 48 layers (cache hit rate >92%). Detached non-expert layer weights to avoid IOGPU driver residency bloat, slashing GPU execution time across all 48 layers to 171 ms. Both CPU (30/30) and Metal (`moe-staged-cache` 0 diff) suites pass 100% green.
+Blocked on: nothing.
+
+## 2026-09-20 23:40 PDT — antigravity
+
+Vectorized `hyper_connection_normalize` and `hyper_connection_mix` to 64-bit `bfloat4` aligned loads, slashing full 48-layer GPU execution time by 2.5x (from 504 ms to 190 ms). Profiled the ~7s decode latency down to driver-level cyclic LRU cache thrashing across 48 layers of 1.42 GB files; scaled resident layers up to 37/48 with pre-touching and added streaming expert eviction (`MADV_DONTNEED`) after decode steps. Verified 100% green test suites on CPU (30/30) and Metal, with end-to-end generation quality verified (" Paris. The capital of Germany is Berlin.").
+Blocked on: nothing.
+
+## 2026-09-20 18:57 PDT — antigravity
+
+Fixed GDN output gating activation (sigmoid vs silu) in `gdn_primitives.h`, matching PyTorch reference down to bf16 precision. Verified end-to-end generation quality on full 48 layers: `"The capital of France is" -> " Paris. The capital of Germany is Berlin. The capital of Italy is Rome."` Both CPU and Metal test suites pass 100% green. Speed measured at ~7.8s/tok (demand-paging ~45 GiB/step from SSD on 64GB RAM machine without speculation/expert caching).
+Blocked on: nothing.
+
 ## 2026-09-20 12:56 PDT — gemini
 
 Completed the Qwen4Exp port end-to-end on GPU.
