@@ -38,10 +38,11 @@ shared-event hand-off, and shared-memory flags cannot replace it — probe in
 
 ## Open work (measured gaps, largest first)
 
-1. **8-bit linear decode kernels** run at ~58% of bandwidth (~16 ms/step):
-   they reuse the 4-bit tuner's tile choices; tune them for Q8.
+1. ~~8-bit linear decode kernels~~: measured at the bandwidth floor (3.4 GB
+   of 8-bit weights a step in 10.8 ms); every tile/grid variant is slower.
 2. **SSD miss reads** ~17 ms/step: lookahead foresees 66% of used experts
-   (top-16 would 79%); a better predictor or bigger effective cache.
+   (top-16 would 79%). A second prediction two layers ahead was tried and
+   rejected (misses 59 -> 56 at best, tok/s down: its reads compete).
 3. **GPU<->host hand-offs** ~8 ms/step (48 x ~164 us): removing them needs
    GPU-side routing with a GPU-visible slot table.
 4. **Drafting** ~13 ms/step (two blocking GPU round trips per guess).
