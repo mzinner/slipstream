@@ -13,8 +13,8 @@
 namespace splash::model {
 namespace {
 
-constexpr std::string_view kNextHeadMagic = "MDFN0002";
-constexpr std::string_view kNextEmbeddingMagic = "MDFN0003";
+constexpr std::string_view kNextHeadMagic = "MDFN0012";  // 8-bit logits
+constexpr std::string_view kNextEmbeddingMagic = "MDFN0013";  // 8-bit rows
 constexpr std::string_view kNextNgramMagic = "MDFN0004";
 
 void requireLayout(const Qwen4ExpLayout &layout) {
@@ -187,18 +187,18 @@ ops::ExpertQ4Projection detachExpert(metal::MetalBackend &backend, const ops::Ex
   // 2. Mixer
   if (std::holds_alternative<QwenGdnWeights>(layer.mixer)) {
     auto &gdn = std::get<QwenGdnWeights>(layer.mixer);
-    gdn.inputProjection = detachQ4(backend, gdn.inputProjection, "gdn-in");
+    gdn.inputProjectionQ8 = detachQ8(backend, gdn.inputProjectionQ8, "gdn-in");
     gdn.convolutionWeights = detachBuffer(backend, gdn.convolutionWeights, "gdn-conv");
     gdn.decay = detachBuffer(backend, gdn.decay, "gdn-decay");
     gdn.timeBias = detachBuffer(backend, gdn.timeBias, "gdn-bias");
     gdn.mixerNorm = detachBuffer(backend, gdn.mixerNorm, "gdn-norm");
-    gdn.outputProjection = detachQ4(backend, gdn.outputProjection, "gdn-out");
+    gdn.outputProjectionQ8 = detachQ8(backend, gdn.outputProjectionQ8, "gdn-out");
   } else {
     auto &attn = std::get<QwenAttentionWeights>(layer.mixer);
-    attn.inputProjection = detachQ4(backend, attn.inputProjection, "attn-in");
+    attn.inputProjectionQ8 = detachQ8(backend, attn.inputProjectionQ8, "attn-in");
     attn.queryNorm = detachBuffer(backend, attn.queryNorm, "attn-qnorm");
     attn.keyNorm = detachBuffer(backend, attn.keyNorm, "attn-knorm");
-    attn.outputProjection = detachQ4(backend, attn.outputProjection, "attn-out");
+    attn.outputProjectionQ8 = detachQ8(backend, attn.outputProjectionQ8, "attn-out");
   }
 
   // 3. Indexer
@@ -266,7 +266,8 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     layer.attentionHyperConnection =
         readHyperConnection(file, layout, "attention-hyper", true);
     layer.mixer =
-        readQwenMixer(file, backend, layout.mixerGeometry(), fullAttention);
+        readQwenMixer(file, backend, layout.mixerGeometry(), fullAttention,
+                      /*eightBit=*/true);
     if (fullAttention) layer.indexer = readIndexer(file, backend, layout);
     layer.mlpHyperConnection = readHyperConnection(file, layout, "mlp-hyper", true);
     readExperts(file, backend, layout, layer.ffn);
@@ -339,7 +340,7 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
         checkedWeightMultiply(layout.hiddenSize, kBFloat16Bytes,
                               "qwen4exp norm bytes"),
         "final-norm");
-    result.logitsProjection = readQ4Projection(
+    result.logitsProjection = readQ8Projection(
         file, backend, layout.vocabularySize, layout.hiddenSize, "logits");
     file.finish();
     result.files.push_back(file.record());
@@ -350,8 +351,14 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
                     layout.vocabularySize, layout.hiddenSize);
     file.advise(MemoryAdvice::WillNeed);
     file.prefetch(false);
-    result.tokenEmbedding = readQ4ProjectionComponents(
-        file, layout.vocabularySize, layout.hiddenSize, "embedding");
+    // Rows of hidden bytes, then a bf16 scale and bias per 64 (the layout
+    // embedding_q8 reads).
+    const uint64_t elements = uint64_t{layout.vocabularySize} * layout.hiddenSize;
+    result.tokenEmbedding = {
+        file.section(elements, "embedding-weights"),
+        file.section(elements / 32, "embedding-scales"),
+        file.section(elements / 32, "embedding-biases"),
+        layout.vocabularySize, layout.hiddenSize};
     file.finish();
     result.files.push_back(file.record());
   }

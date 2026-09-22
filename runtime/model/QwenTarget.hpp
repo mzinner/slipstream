@@ -27,6 +27,9 @@ enum class QwenFfnKind : uint8_t { Dense, SparseMoe };
 
 // Both supported targets bind the same mixer tensors per hybrid layer; only
 // the FFN differs between them.
+// A package stores each projection as 4-bit or 8-bit; qwen4exp stores its
+// mixer projections 8-bit (the `...Q8` fields) and leaves the 4-bit ones
+// empty. Every other target is 4-bit throughout.
 struct QwenGdnWeights final {
   ops::Q4Projection inputProjection;
   metal::MetalBuffer convolutionWeights;
@@ -34,6 +37,8 @@ struct QwenGdnWeights final {
   metal::MetalBuffer timeBias;
   metal::MetalBuffer mixerNorm;
   ops::Q4Projection outputProjection;
+  ops::Q8Projection inputProjectionQ8;
+  ops::Q8Projection outputProjectionQ8;
 };
 
 struct QwenAttentionWeights final {
@@ -41,6 +46,8 @@ struct QwenAttentionWeights final {
   metal::MetalBuffer queryNorm;
   metal::MetalBuffer keyNorm;
   ops::Q4Projection outputProjection;
+  ops::Q8Projection inputProjectionQ8;
+  ops::Q8Projection outputProjectionQ8;
 };
 
 using QwenMixerWeights = std::variant<QwenGdnWeights, QwenAttentionWeights>;
@@ -61,7 +68,8 @@ struct QwenMixerGeometry final {
 [[nodiscard]] QwenMixerWeights readQwenMixer(WeightFile &file,
                                              metal::MetalBackend &backend,
                                              const QwenMixerGeometry &geometry,
-                                             bool fullAttention);
+                                             bool fullAttention,
+                                             bool eightBit = false);
 
 inline constexpr std::string_view kEmbeddingMagic = "MDFE0001";
 
@@ -416,7 +424,9 @@ public:
   [[nodiscard]] const QwenTargetGeometry &geometry() const noexcept {
     return geometry_;
   }
-  [[nodiscard]] const ops::Q4Projection &
+  // Null when the head is 8-bit (qwen4exp), whose package drafts with its
+  // own MTP head and never runs the DFlash draft that borrows this.
+  [[nodiscard]] const ops::Q4Projection *
   vocabularyProjection() const noexcept;
 
   void addPrefill(

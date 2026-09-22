@@ -44,6 +44,7 @@ from tools.package_format import (  # noqa: E402
     pad_rows,
     plain_q4,
     q4_bytes,
+    read_sections,
     tile_q4,
 )
 from tools.quantize import from_bf16, quantize_affine, to_bf16  # noqa: E402
@@ -130,6 +131,27 @@ class Checkpoint:
         return handle.read(end - start)
 
 
+def quantized_q8_tile(values, pad_to=None) -> bytes:
+    """Eight-bit affine in the order linear_q8 reads: codes as [tile of 256
+    rows][group of 64 inputs][row][64], then a bf16 scale and bias per
+    (tile, group, row). Bias is the group minimum, scale its range / 255."""
+    values = np.ascontiguousarray(values, dtype=np.float32)
+    if pad_to is not None and values.shape[0] < pad_to:
+        values = np.vstack([values, np.zeros((pad_to - values.shape[0], values.shape[1]), np.float32)])
+    out, inp = values.shape
+    if out % STORAGE_N or inp % GROUP:
+        raise ValueError(f"{values.shape} is not a whole number of {STORAGE_N}x{GROUP} tiles")
+    tiled = values.reshape(out // STORAGE_N, STORAGE_N, inp // GROUP, GROUP).transpose(0, 2, 1, 3)
+    low = tiled.min(axis=-1)
+    spread = tiled.max(axis=-1) - low
+    scale_bits = to_bf16(np.where(spread > 0, spread / 255.0, 1.0))
+    bias_bits = to_bf16(low)
+    scale = from_bf16(scale_bits)[..., None]
+    bias = from_bf16(bias_bits)[..., None]
+    codes = np.clip(np.rint((tiled - bias) / scale), 0, 255).astype(np.uint8)
+    return codes.tobytes() + scale_bits.tobytes() + bias_bits.tobytes()
+
+
 def quantized_tile(values, storage_n=STORAGE_N, group=GROUP, pad_to=None):
     codes, scales, biases = quantize_affine(values, group=group)
     if pad_to is not None:
@@ -137,9 +159,13 @@ def quantized_tile(values, storage_n=STORAGE_N, group=GROUP, pad_to=None):
     return tile_q4(codes, scales, biases, storage_n=storage_n, group=group)
 
 
-LAYER_MAGIC = b"MDFN0001"
-HEAD_MAGIC = b"MDFN0002"
-EMBEDDING_MAGIC = b"MDFN0003"
+# 0011-0013: the mixer projections, the output head and the token embedding
+# are 8-bit. At 4-bit they cost the most quality of anything but the experts
+# (reference_logits.py --quant: same top pick 81% -> 89% on the code prompt).
+LAYER_MAGIC = b"MDFN0011"
+HEAD_MAGIC = b"MDFN0012"
+EMBEDDING_MAGIC = b"MDFN0013"
+OLD_LAYER_MAGIC = b"MDFN0001"
 NGRAM_MAGIC = b"MDFN0004"
 DRAFT_MAGIC = b"MDFD0004"
 VISION_MAGIC = b"MDFV0001"
@@ -217,28 +243,32 @@ def expert_sections() -> list[tuple[int, str]]:
     ]
 
 
-def layer_sections(index: int) -> tuple[int, list[tuple[int, str]]]:
+def layer_sections(index: int, eight_bit: bool = True,
+                   full: bool | None = None) -> tuple[int, list[tuple[int, str]]]:
+    """Sections of a layer file; eight_bit=False is the 0001 layout."""
     hidden = LAYOUT["hidden"]
-    full = (index + 1) % LAYOUT["full_attention_period"] == 0
+    if full is None:
+        full = (index + 1) % LAYOUT["full_attention_period"] == 0
+    mixer = q8_bytes if eight_bit else q4_bytes
     entries = hyper_sections(True)
     if full:
         entries += [
-            (q4_bytes(LAYOUT["packed_full"], hidden), "attention-input"),
+            (mixer(LAYOUT["packed_full"], hidden), "attention-input"),
             (LAYOUT["attention_head_dimension"] * BF16, "query-norm"),
             (LAYOUT["attention_head_dimension"] * BF16, "key-norm"),
-            (q4_bytes(hidden, LAYOUT["attention_width"]), "attention-output"),
+            (mixer(hidden, LAYOUT["attention_width"]), "attention-output"),
             (q4_bytes(indexer_width(), hidden), "indexer-qk"),
             (LAYOUT["indexer_head_dimension"] * BF16, "indexer-query-norm"),
             (LAYOUT["indexer_head_dimension"] * BF16, "indexer-key-norm"),
         ]
     else:
         entries += [
-            (q4_bytes(LAYOUT["packed_gdn"], hidden), "gdn-input"),
+            (mixer(LAYOUT["packed_gdn"], hidden), "gdn-input"),
             (LAYOUT["convolution"] * 4 * BF16, "gdn-convolution"),
             (LAYOUT["value_heads"] * 4, "gdn-decay"),
             (LAYOUT["value_heads"] * BF16, "gdn-time-bias"),
             (LAYOUT["head_dimension"] * BF16, "gdn-norm"),
-            (q4_bytes(hidden, LAYOUT["attention_width"]), "gdn-output"),
+            (mixer(hidden, LAYOUT["attention_width"]), "gdn-output"),
         ]
     entries += hyper_sections(True) + expert_sections()
     return (1 if full else 0), entries
@@ -248,7 +278,7 @@ def head_sections() -> list[tuple[int, str]]:
     return (
         hyper_sections(False)
         + [(LAYOUT["hidden"] * BF16, "final-norm")]
-        + [(q4_bytes(LAYOUT["vocabulary"], LAYOUT["hidden"]), "logits")]
+        + [(q8_bytes(LAYOUT["vocabulary"], LAYOUT["hidden"]), "logits")]
     )
 
 
@@ -256,7 +286,7 @@ def embedding_sections() -> list[tuple[int, str]]:
     elements = LAYOUT["vocabulary"] * LAYOUT["hidden"]
     parameters = elements // GROUP * BF16
     return [
-        (elements // 2, "embedding-weights"),
+        (elements, "embedding-weights"),
         (parameters, "embedding-scales"),
         (parameters, "embedding-biases"),
     ]
@@ -304,14 +334,14 @@ def write_attention(packed, source: Checkpoint, prefix: str) -> None:
         source.tensor(prefix + ".k_proj.weight"),
         source.tensor(prefix + ".v_proj.weight"),
     ]
-    packed.section(quantized_tile(np.vstack(parts), pad_to=LAYOUT["packed_full"]))
+    packed.section(quantized_q8_tile(np.vstack(parts), pad_to=LAYOUT["packed_full"]))
     # Upstream Qwen4ExpTextRMSNorm uses (1.0 + weight) on zero-initialized weights,
     # whereas the shared Metal attention kernels expect standard RMSNorm weights.
     q_norm = source.tensor(prefix + ".q_norm.weight") + 1.0
     k_norm = source.tensor(prefix + ".k_norm.weight") + 1.0
     packed.section(to_bf16(q_norm).tobytes())
     packed.section(to_bf16(k_norm).tobytes())
-    packed.section(quantized_tile(source.tensor(prefix + ".o_proj.weight")))
+    packed.section(quantized_q8_tile(source.tensor(prefix + ".o_proj.weight")))
     # The indexer tiles 128 wide: its projection is 640 out, not a multiple
     # of 256.
     packed.section(
@@ -411,24 +441,53 @@ def write_layer(source: Checkpoint, index: int, destination: Path) -> int:
         write_experts(packed, source, prefix + ".mlp")
         return packed.finish()
 
-    linear = prefix + ".linear_attn"
+    write_gdn(packed, source, prefix + ".linear_attn")
+    write_hyper(packed, source, prefix + ".mlp_hyper_connection", True)
+    write_experts(packed, source, prefix + ".mlp")
+    return packed.finish()
+
+
+def write_gdn(packed, source: Checkpoint, linear: str) -> None:
     parts = [
         source.tensor(linear + ".in_proj_qkv.weight"),
         source.tensor(linear + ".in_proj_z.weight"),
         source.tensor(linear + ".in_proj_b.weight"),
         source.tensor(linear + ".in_proj_a.weight"),
     ]
-    packed.section(quantized_tile(np.vstack(parts), pad_to=LAYOUT["packed_gdn"]))
+    packed.section(quantized_q8_tile(np.vstack(parts), pad_to=LAYOUT["packed_gdn"]))
     packed.section(source.raw(linear + ".conv1d.weight"))
     logarithm = source.tensor(linear + ".A_log")
     packed.section((-np.exp(logarithm)).astype("<f4").tobytes())
     packed.section(source.raw(linear + ".dt_bias"))
     packed.section(source.raw(linear + ".norm.weight"))
-    packed.section(quantized_tile(source.tensor(linear + ".out_proj.weight")))
+    packed.section(quantized_q8_tile(source.tensor(linear + ".out_proj.weight")))
 
-    write_hyper(packed, source, prefix + ".mlp_hyper_connection", True)
-    write_experts(packed, source, prefix + ".mlp")
-    return packed.finish()
+
+def requantize_layer(source: Checkpoint, path: Path, index: int, prefix: str,
+                     full: bool) -> int:
+    """Rewrite a 0001 layer file as 0011: the mixer is requantized from the
+    checkpoint at 8 bits, and everything else - both hyper-connections and
+    the 4-bit experts - is copied byte for byte. Much faster than a full
+    conversion and needs one layer file of spare disk, not a package."""
+    kind, old = layer_sections(index, eight_bit=False, full=full)
+    magic, _, old_kind, sections = read_sections(path, [size for size, _ in old])
+    if magic != OLD_LAYER_MAGIC or old_kind != kind:
+        raise ValueError(f"{path.name}: expected a {OLD_LAYER_MAGIC!r} layer, found {magic!r}")
+    mixer_count = len(old) - 2 * len(hyper_sections(True)) - len(expert_sections())
+    hyper = len(hyper_sections(True))
+    temporary = path.with_suffix(".bin.partial")
+    packed = WeightFile(temporary, LAYER_MAGIC, index, kind)
+    for section in sections[:hyper]:
+        packed.section(section)
+    if full:
+        write_attention(packed, source, prefix + ".self_attn")
+    else:
+        write_gdn(packed, source, prefix + ".linear_attn")
+    for section in sections[hyper + mixer_count:]:
+        packed.section(section)
+    written = packed.finish()
+    temporary.replace(path)
+    return written
 
 
 def write_per_layer_embedding(source: Checkpoint, destination: Path) -> int:
@@ -499,7 +558,7 @@ def write_head(source: Checkpoint, destination: Path) -> int:
         packed.section(source.raw("model.language_model.norm.weight"))
     else:
         packed.section(b"\0" * (LAYOUT["hidden"] * BF16))
-    packed.section(quantized_tile(source.tensor("lm_head.weight")))
+    packed.section(quantized_q8_tile(source.tensor("lm_head.weight")))
     return packed.finish()
 
 
@@ -544,10 +603,20 @@ def write_mtp(source: Checkpoint, destination: Path) -> int:
 def write_embedding(source: Checkpoint, destination: Path) -> int:
     path = destination / "embedding.bin"
     packed = WeightFile(path, EMBEDDING_MAGIC, LAYOUT["vocabulary"], LAYOUT["hidden"])
+    # Row-major, a byte per weight, then a bf16 scale and a bias per 64:
+    # gathered a row at a time by embedding_q8, never multiplied as a tile.
     raw_embed = source.tensor("model.language_model.embed_tokens.weight")
-    codes, scales, biases = quantize_affine(raw_embed, group=GROUP)
-    for run in plain_q4(codes, scales, biases):
-        packed.section(run)
+    rows, width = raw_embed.shape
+    groups = raw_embed.reshape(rows, width // GROUP, GROUP)
+    low = groups.min(axis=-1)
+    spread = groups.max(axis=-1) - low
+    scale_bits = to_bf16(np.where(spread > 0, spread / 255.0, 1.0))
+    bias_bits = to_bf16(low)
+    codes = np.clip(np.rint((groups - from_bf16(bias_bits)[..., None])
+                            / from_bf16(scale_bits)[..., None]), 0, 255).astype(np.uint8)
+    packed.section(codes.tobytes())
+    packed.section(scale_bits.tobytes())
+    packed.section(bias_bits.tobytes())
     return packed.finish()
 
 
@@ -803,6 +872,9 @@ def main() -> int:
     parser.add_argument("--destination", required=True, type=Path)
     parser.add_argument("--source", type=Path)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--requantize-mixers", action="store_true",
+                        help="rewrite an existing 0001 package's layer files "
+                        "with 8-bit mixers, keeping its experts")
     parser.add_argument("--mtp-only", action="store_true",
                         help="write only the MTP draft head into an existing package")
     parser.add_argument(
@@ -833,6 +905,26 @@ def main() -> int:
         return 0
 
     source = Checkpoint(arguments.source)
+    if arguments.requantize_mixers:
+        target = arguments.destination / "target"
+        for index in range(LAYOUT["layers"]):
+            path = target / f"layer-{index}.bin"
+            full = (index + 1) % LAYOUT["full_attention_period"] == 0
+            written = requantize_layer(source, path, index,
+                                       f"model.language_model.layers.{index}", full)
+            print(f"  layer-{index}.bin {written / 2**30:.2f} GiB", flush=True)
+        written = requantize_layer(source, target / "mtp-layer.bin",
+                                   LAYOUT["layers"], "mtp.layers.0", True)
+        print(f"  mtp-layer.bin {written / 2**30:.2f} GiB", flush=True)
+        write_head(source, target)
+        print("  head.bin", flush=True)
+        write_embedding(source, target)
+        print("  embedding.bin", flush=True)
+        manifest_path = arguments.destination / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["format"]["target_layer_magic"] = LAYER_MAGIC.decode()
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        return 0
     if arguments.mtp_only:
         written = write_mtp(source, arguments.destination / "target")
         print(f"mtp head        {written / 2**30:.2f} GiB")

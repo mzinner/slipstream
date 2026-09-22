@@ -111,25 +111,32 @@ constexpr bool isGdnMixer =
 
 QwenMixerWeights readQwenMixer(WeightFile &file, metal::MetalBackend &backend,
                                const QwenMixerGeometry &geometry,
-                               bool fullAttention) {
+                               bool fullAttention, bool eightBit) {
   constexpr uint64_t kFloat32Bytes = 4;
+  auto projection = [&](auto &q4, auto &q8, uint32_t out, uint32_t in,
+                        const char *label) {
+    if (eightBit)
+      q8 = readQ8Projection(file, backend, out, in, label);
+    else
+      q4 = readQ4Projection(file, backend, out, in, label);
+  };
   if (fullAttention) {
     QwenAttentionWeights attention;
-    attention.inputProjection =
-        readQ4Projection(file, backend, geometry.packedAttentionWidth,
-                         geometry.hiddenSize, "attention-input");
+    projection(attention.inputProjection, attention.inputProjectionQ8,
+               geometry.packedAttentionWidth, geometry.hiddenSize,
+               "attention-input");
     const uint64_t headNormBytes = checkedWeightMultiply(
         geometry.attentionHeadDimension, kBFloat16Bytes, "head norm bytes");
     attention.queryNorm = file.section(headNormBytes, "query-norm");
     attention.keyNorm = file.section(headNormBytes, "key-norm");
-    attention.outputProjection =
-        readQ4Projection(file, backend, geometry.hiddenSize,
-                         geometry.attentionWidth, "attention-output");
+    projection(attention.outputProjection, attention.outputProjectionQ8,
+               geometry.hiddenSize, geometry.attentionWidth,
+               "attention-output");
     return attention;
   }
   QwenGdnWeights gdn;
-  gdn.inputProjection = readQ4Projection(
-      file, backend, geometry.packedGdnWidth, geometry.hiddenSize, "gdn-input");
+  projection(gdn.inputProjection, gdn.inputProjectionQ8, geometry.packedGdnWidth,
+             geometry.hiddenSize, "gdn-input");
   gdn.convolutionWeights = file.section(
       checkedWeightMultiply(
           checkedWeightMultiply(geometry.convolutionDimension, kGdnConvolutionTaps,
@@ -148,8 +155,8 @@ QwenMixerWeights readQwenMixer(WeightFile &file, metal::MetalBackend &backend,
       checkedWeightMultiply(geometry.gdnHeadDimension, kBFloat16Bytes,
                             "GDN norm bytes"),
       "gdn-norm");
-  gdn.outputProjection = readQ4Projection(
-      file, backend, geometry.hiddenSize, geometry.attentionWidth, "gdn-output");
+  projection(gdn.outputProjection, gdn.outputProjectionQ8, geometry.hiddenSize,
+             geometry.attentionWidth, "gdn-output");
   return gdn;
 }
 
@@ -198,9 +205,13 @@ QwenTargetGeometry qwenTargetGeometry(const Qwen4ExpWeights &weights) {
   return geometryFor(weights.layout);
 }
 
-const ops::Q4Projection &QwenTarget::vocabularyProjection() const noexcept {
-  return std::visit([](const auto *weights) -> const ops::Q4Projection & {
-    return weights->logitsProjection;
+const ops::Q4Projection *QwenTarget::vocabularyProjection() const noexcept {
+  return std::visit([](const auto *weights) -> const ops::Q4Projection * {
+    if constexpr (std::is_same_v<decltype(weights->logitsProjection),
+                                 const ops::Q4Projection>)
+      return &weights->logitsProjection;
+    else
+      return nullptr;  // an 8-bit head; only placeholder drafts pair with it
   }, weights_);
 }
 
@@ -604,7 +615,7 @@ void QwenTarget::addVerifyImpl(
                              buffers.finalHidden, geometry_.hiddenSize, rows);
   const ops::LinearMatrix head{geometry_.vocabularySize, geometry_.hiddenSize};
   operators_.linear().addDecodeBatch(graph, buffers.finalHidden,
-                     vocabularyProjection(), buffers.logits, head, lanes,
+                     *vocabularyProjection(), buffers.logits, head, lanes,
                      stats);
 }
 
@@ -631,7 +642,7 @@ void QwenTarget::addHead(metal::CommandGraph &graph,
                              geometry_.hiddenSize, normalizedRows);
   const ops::LinearMatrix head{geometry_.vocabularySize, geometry_.hiddenSize};
   operators_.linear().addDecode(graph,
-                std::move(finalHidden), vocabularyProjection(),
+                std::move(finalHidden), *vocabularyProjection(),
                 std::move(logits), head);
 }
 
@@ -645,13 +656,12 @@ void QwenTarget::addEmbedding(metal::CommandGraph &graph,
                                  std::move(hidden), embeddingScratch_, rows);
     return;
   }
-  const ops::Q4Projection &embedding = std::visit(
-      [](const auto *weights) -> const ops::Q4Projection & {
-        return weights->tokenEmbedding;
+  std::visit(
+      [&](const auto *weights) {
+        ops::Embedding::add(graph, std::move(tokens), weights->tokenEmbedding,
+                            std::move(hidden), rows);
       },
       weights_);
-  ops::Embedding::add(graph, std::move(tokens), embedding, std::move(hidden),
-                      rows);
 }
 
 void QwenTarget::addDraftEmbedding(metal::CommandGraph &graph,

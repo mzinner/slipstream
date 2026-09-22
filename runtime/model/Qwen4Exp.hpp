@@ -29,7 +29,9 @@ namespace splash::model {
 // they are recorded here so the package validator can check them and so the
 // gaps are visible in one place. See kUnsupported* below.
 struct Qwen4ExpLayout final {
-  static constexpr std::string_view layerMagic = "MDFN0001";
+  // 0011: mixer projections 8-bit (they were 4-bit in 0001; see
+  // dev/benchmarks/qwen4exp/reference_logits.py --quant for why).
+  static constexpr std::string_view layerMagic = "MDFN0011";
 
   // Provisional: the draft is deferred, so these five indices are evenly
   // spaced rather than chosen against a trained DFlash 2 draft.
@@ -310,8 +312,8 @@ struct Qwen4ExpWeights final {
   std::vector<Qwen4ExpLayerWeights> layers;
   Qwen4ExpHyperConnection hyperConnectionMixer;
   metal::MetalBuffer finalNorm;
-  ops::Q4Projection logitsProjection;
-  ops::Q4Projection tokenEmbedding;
+  ops::Q8Projection logitsProjection;
+  ops::Q8Projection tokenEmbedding;
   // Its own file: the embedding table alone is 26.8 GiB, which does not
   // belong inside a layer file.
   Qwen4ExpPerLayerEmbedding perLayerEmbedding;

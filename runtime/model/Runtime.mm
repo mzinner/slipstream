@@ -922,6 +922,9 @@ struct Runtime::Impl {
 
   void addPackedDraftContext(CommandGraph &graph,
                              const PackedPrefillBatch &batch) {
+    // A placeholder draft proposes nothing worth keeping; it never runs.
+    if (package.descriptor.draftPlaceholder)
+      return;
     if (!batch.capturedRows)
       return;
     auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor); };
@@ -1166,6 +1169,9 @@ struct Runtime::Impl {
                              std::span<Request *const> entries,
                              std::span<const uint64_t> logicalPositions,
                              ops::Q4DispatchStats &stats) {
+    // A placeholder draft proposes nothing worth keeping; it never runs.
+    if (package.descriptor.draftPlaceholder)
+      return;
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != logicalPositions.size()) {
       throw std::invalid_argument("invalid draft decode batch");
@@ -1203,7 +1209,7 @@ struct Runtime::Impl {
     buffers.gateScratch = decodeArena->gateScratch();
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
     draftModel.addDecode(graph, std::move(buffers),
-                         targetModel.vocabularyProjection(), cacheLengths,
+                         *targetModel.vocabularyProjection(), cacheLengths,
                          lanes, stats);
     std::array<uint32_t, kLaneCount> anchors{};
     std::array<ops::SamplingPolicy, kLaneCount> policies{};
@@ -1399,6 +1405,9 @@ struct Runtime::Impl {
                                    std::span<Request *const> entries,
                                    std::span<const ModelBatchItem> items,
                                    ops::Q4DispatchStats &stats) {
+    // A placeholder draft proposes nothing worth keeping; it never runs.
+    if (package.descriptor.draftPlaceholder)
+      return;
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid draft state commit batch");

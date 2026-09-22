@@ -606,7 +606,7 @@ void Qwen4ExpTarget::addPrefill(
       operators.linear().addPrefillSums(g, buffers.hyperMixed,
                                         buffers.projectionSums, gdnInput, rows);
       operators.linear().addPrefill(g, buffers.hyperMixed,
-                                    mixer.inputProjection, buffers.gdnPacked,
+                                    mixer.inputProjectionQ8, buffers.gdnPacked,
                                     buffers.projectionSums, gdnInput, rows);
       for (const QwenTargetPrefillSequence &sequence : sequences) {
         ops::GDN::addPrefill(
@@ -639,7 +639,7 @@ void Qwen4ExpTarget::addPrefill(
                                         buffers.projectionSums, mixerOutput,
                                         rows);
       operators.linear().addPrefill(g, buffers.gdnHidden,
-                                    mixer.outputProjection, buffers.gdnOutput,
+                                    mixer.outputProjectionQ8, buffers.gdnOutput,
                                     buffers.projectionSums, mixerOutput, rows);
       ++gdnIdx;
       return buffers.gdnOutput;
@@ -649,7 +649,7 @@ void Qwen4ExpTarget::addPrefill(
                                         buffers.projectionSums, attentionInput,
                                         rows);
       operators.linear().addPrefill(g, buffers.hyperMixed,
-                                    mixer.inputProjection, buffers.fullPacked,
+                                    mixer.inputProjectionQ8, buffers.fullPacked,
                                     buffers.projectionSums, attentionInput,
                                     rows);
       for (const QwenTargetPrefillSequence &sequence : sequences) {
@@ -705,7 +705,7 @@ void Qwen4ExpTarget::addPrefill(
                                         buffers.projectionSums, mixerOutput,
                                         rows);
       operators.linear().addPrefill(g, buffers.attentionHidden,
-                                    mixer.outputProjection,
+                                    mixer.outputProjectionQ8,
                                     buffers.attentionOutput,
                                     buffers.projectionSums, mixerOutput, rows);
       ++attnIdx;
@@ -1161,7 +1161,7 @@ void Qwen4ExpTarget::addPrefill(
     const ops::LinearMatrix attentionInput{geometry.packedAttentionWidth, hidden};
     operators.linear().addPrefillSums(graph, buffers.hyperMixed, buffers.projectionSums,
                                       attentionInput, m);
-    operators.linear().addPrefill(graph, buffers.hyperMixed, mixer.inputProjection,
+    operators.linear().addPrefill(graph, buffers.hyperMixed, mixer.inputProjectionQ8,
                                   buffers.fullPacked, buffers.projectionSums,
                                   attentionInput, m);
     for (const QwenTargetPrefillSequence &sequence : sequences) {
@@ -1315,7 +1315,7 @@ void Qwen4ExpTarget::addVerify(
     if (std::holds_alternative<QwenGdnWeights>(layer.mixer)) {
       const auto &mixer = std::get<QwenGdnWeights>(layer.mixer);
       operators.linear().addDecodeBatch(
-          g, buffers.hyperMixed, mixer.inputProjection,
+          g, buffers.hyperMixed, mixer.inputProjectionQ8,
           buffers.gdnPacked[gdnIdx], gdnInput, lanes, stats);
       ops::GDN::addDecode(
           g,
@@ -1330,7 +1330,7 @@ void Qwen4ExpTarget::addVerify(
            geometry.stateLayout.recurrentLayerBytes(),
            geometry.stateLayout.convolutionBytes()});
       operators.linear().addDecodeBatch(g, buffers.gdnHidden,
-                                        mixer.outputProjection,
+                                        mixer.outputProjectionQ8,
                                         buffers.gdnOutput, mixerOutput, lanes,
                                         stats);
       mixerOutBuffer = buffers.gdnOutput;
@@ -1339,7 +1339,7 @@ void Qwen4ExpTarget::addVerify(
       const auto &mixer = std::get<QwenAttentionWeights>(layer.mixer);
       const uint32_t tileRows = kv::kPageTokens;
       operators.linear().addDecodeBatch(
-          g, buffers.hyperMixed, mixer.inputProjection, buffers.fullPacked,
+          g, buffers.hyperMixed, mixer.inputProjectionQ8, buffers.fullPacked,
           attentionInput, lanes, stats);
       ops::PagedAttention::addVerifyProjection(
           g, buffers.fullPacked, mixer.queryNorm, mixer.keyNorm,
@@ -1359,7 +1359,7 @@ void Qwen4ExpTarget::addVerify(
           buffers.attentionHidden, ExecutionLimits::targetVerifyRows, tileRows,
           tileRows, geometry.attentionQueryHeads, geometry.kvLayout, lanes);
       operators.linear().addDecodeBatch(g, buffers.attentionHidden,
-                                        mixer.outputProjection,
+                                        mixer.outputProjectionQ8,
                                         buffers.attentionOutput, mixerOutput,
                                         lanes, stats);
       mixerOutBuffer = buffers.attentionOutput;
@@ -1911,7 +1911,7 @@ void Qwen4ExpTarget::addVerify(
                          buffers.normalized, buffers.hyperReduced,
                          buffers.hyperMixed, buffers.hyperInjection, kRows, 1);
       const auto &mixer = std::get<QwenAttentionWeights>(head.mixer);
-      operators.linear().addDecodeBatch(a, buffers.hyperMixed, mixer.inputProjection,
+      operators.linear().addDecodeBatch(a, buffers.hyperMixed, mixer.inputProjectionQ8,
                                         buffers.fullPacked, attentionInput, lanes, stats);
       ops::PagedAttention::addVerifyProjection(
           a, buffers.fullPacked, mixer.queryNorm, mixer.keyNorm, weights.mtpCos,
@@ -1929,7 +1929,7 @@ void Qwen4ExpTarget::addVerify(
           kRows, kv::kPageTokens, kv::kPageTokens, geometry.attentionQueryHeads,
           geometry.kvLayout, lanes);
       operators.linear().addDecodeBatch(a, buffers.attentionHidden,
-                                        mixer.outputProjection,
+                                        mixer.outputProjectionQ8,
                                         buffers.attentionOutput, mixerOutput, lanes, stats);
       a.add("hyper_connection_update", {X, buffers.attentionOutput,
                                         buffers.hyperInjection},
