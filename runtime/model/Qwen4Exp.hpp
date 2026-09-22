@@ -363,6 +363,8 @@ struct Qwen4ExpWeights final {
   mutable metal::MetalBuffer predictScratch;
   // Prompt expert waves: one tile count per wave, 256 bytes apart.
   mutable metal::MetalBuffer prefillRangeCounts;
+  // The MTP pick's per-slice candidates and softmax mass (mtp_pick.metal).
+  mutable metal::MetalBuffer mtpPickIds, mtpPickValues, mtpPickMass;
   // The split prompt kernels' gate outputs, kept apart from expertOutput.
   mutable metal::MetalBuffer prefillGateScratch;
   // MTP draft scratch, allocated on first use.

@@ -116,10 +116,12 @@ QUANT_GROUPS = {
 }
 
 
-def fake_quant(weight, bits, group=64):
+def fake_quant(weight, bits, group=64, search=False):
     """Round to the converter's affine format (tools/quantize.py) and back:
     per group of `group` inputs, a bf16 bias at the larger-magnitude end and
-    a bf16 scale, codes 0..2^bits-1."""
+    a bf16 scale, codes 0..2^bits-1. search=True instead picks, per group, the
+    range (min/max pulled in by up to 30%) with the least squared error -
+    same storage, smarter rounding."""
     shape = weight.shape
     rows = weight.reshape(-1, shape[-1])
     out = torch.empty_like(rows)
@@ -128,25 +130,45 @@ def fake_quant(weight, bits, group=64):
         blocks = rows[begin:begin + 8192].reshape(-1, shape[-1] // group, group)
         low = blocks.amin(dim=2, keepdim=True)
         high = blocks.amax(dim=2, keepdim=True)
-        anchor_low = low.abs() > high.abs()
-        bias = torch.where(anchor_low, low, high)
-        other = torch.where(anchor_low, high, low)
-        scale = ((other - bias) / levels).bfloat16().float()
-        bias = bias.bfloat16().float()
-        safe = torch.where(scale == 0, torch.ones_like(scale), scale)
-        codes = torch.clamp(torch.round((blocks - bias) / safe), 0, levels)
-        out[begin:begin + 8192] = (codes * scale + bias).reshape(-1, shape[-1])
+        best, best_error = None, None
+        for shrink_low in ((1.0, 0.9, 0.8, 0.7) if search else (1.0,)):
+            for shrink_high in ((1.0, 0.9, 0.8, 0.7) if search else (1.0,)):
+                lo, hi = low * shrink_low, high * shrink_high
+                if search:
+                    bias, other = lo, hi       # plain min-based affine
+                else:
+                    anchor_low = lo.abs() > hi.abs()
+                    bias = torch.where(anchor_low, lo, hi)
+                    other = torch.where(anchor_low, hi, lo)
+                scale = ((other - bias) / levels).bfloat16().float()
+                bias = bias.bfloat16().float()
+                safe = torch.where(scale == 0, torch.ones_like(scale), scale)
+                codes = torch.clamp(torch.round((blocks - bias) / safe), 0, levels)
+                rebuilt = codes * scale + bias
+                if not search:
+                    best = rebuilt
+                    break
+                error = ((rebuilt - blocks) ** 2).sum(dim=2, keepdim=True)
+                if best is None:
+                    best, best_error = rebuilt, error
+                else:
+                    better = error < best_error
+                    best = torch.where(better, rebuilt, best)
+                    best_error = torch.where(better, error, best_error)
+        out[begin:begin + 8192] = best.reshape(-1, shape[-1])
     return out.reshape(shape)
 
 
 def parse_quant(spec):
-    """"experts:4,router:8" -> {"experts": 4, "router": 8}."""
+    """"experts:4,router:8" -> {"experts": (4, 64, False), ...}. A group may
+    add its group size and "mse": experts:4:32, experts:4:64:mse."""
     result = {}
     for item in filter(None, (spec or "").split(",")):
-        name, bits = item.split(":")
+        name, bits, *rest = item.split(":")
         if name not in QUANT_GROUPS and name not in ("head", "embed"):
             raise SystemExit(f"unknown quant group {name}")
-        result[name] = int(bits)
+        group = int(rest[0]) if rest else None
+        result[name] = (int(bits), group, "mse" in rest)
     return result
 
 
@@ -157,7 +179,8 @@ def run(config, checkpoint, ids, out_path, log, no_ple=False, quant=None):
     T = tokens.shape[1]
     embed = checkpoint.tensor(PREFIX + "embed_tokens.weight")
     if "embed" in quant:
-        embed = fake_quant(embed, quant["embed"], group=32)
+        bits, group, search = quant["embed"]
+        embed = fake_quant(embed, bits, group=group or 32, search=search)
     hidden = embed[tokens]
     del embed
 
@@ -182,10 +205,10 @@ def run(config, checkpoint, ids, out_path, log, no_ple=False, quant=None):
             layer = M.Qwen4ExpTextDecoderLayer(config, index)
         prefix = f"{PREFIX}layers.{index}."
         state = checkpoint.state(prefix)
-        for group, bits in quant.items():
+        for group, (bits, size, search) in quant.items():
             for name in QUANT_GROUPS.get(group, ()):
                 if name in state:
-                    state[name] = fake_quant(state[name], bits)
+                    state[name] = fake_quant(state[name], bits, group=size or 64, search=search)
         if layer.ple is not None:
             # The table is swapped for a disk gather; everything else loads.
             embedding = layer.ple.ple_embedding
@@ -219,7 +242,8 @@ def run(config, checkpoint, ids, out_path, log, no_ple=False, quant=None):
     hidden = mixer.float()(hidden)[0]
     head = checkpoint.tensor("lm_head.weight")
     if "head" in quant:
-        head = fake_quant(head, quant["head"])
+        bits, size, search = quant["head"]
+        head = fake_quant(head, bits, group=size or 64, search=search)
     with open(out_path, "wb") as out:
         for begin in range(0, T, 256):
             logits = hidden[begin:begin + 256] @ head.T

@@ -2340,6 +2340,16 @@ void Qwen4ExpTarget::addVerify(
       operators.linear().addDecodeBatch(b, buffers.finalHidden,
                                         weights.draftLogitsProjection, buffers.logits,
                                         {vocabulary, hidden}, lanes, stats);
+      // Top candidates per vocabulary slice on the GPU (mtp_pick.metal).
+      constexpr uint32_t kSlices = 64, kCandidates = 16;
+      shared(weights.mtpPickIds, kSlices * kCandidates * 4, "mtp-pick-ids");
+      shared(weights.mtpPickValues, kSlices * kCandidates * 4, "mtp-pick-values");
+      shared(weights.mtpPickMass, kSlices * 2 * 4, "mtp-pick-mass");
+      b.add("mtp_pick_slices",
+            {backend.view(buffers.logits, uint64_t{live - 1} * vocabulary * 2,
+                          uint64_t{vocabulary} * 2),
+             weights.mtpPickIds, weights.mtpPickValues, weights.mtpPickMass},
+            vocabulary, {kSlices, 1, 1}, {256, 1, 1});
       (void)backend.submitCommand(b.dispatches());
       const auto clockPick = std::chrono::steady_clock::now();
       auto ms = [](auto from, auto to) {
@@ -2357,43 +2367,35 @@ void Qwen4ExpTarget::addVerify(
         }
       } pickTimer{clockPick, mtpParts[3]};
 
-      const auto *logits = static_cast<const uint16_t *>(buffers.logits.contents()) +
-                           uint64_t{live - 1} * vocabulary;
-      auto logit = [&](uint32_t v) {
-        return std::bit_cast<float>(uint32_t{logits[v]} << 16);
-      };
-      // Greedy: the top token, reported as certain. Sampled: the request's
-      // own sampling applied to the head's logits - top-k (at most 16, the
-      // acceptance's candidate width), temperature, top-p - and the guess
-      // drawn from it; speculative sampling then keeps it with probability
-      // min(1, p/q), so the output is still exactly the target's.
+      // Merge the slices' candidates: the 16 best overall (ties to the lower
+      // id), and the exact softmax mass from each slice's max and sum.
       const uint32_t width16 = mtp.temperature > 0.0f
           ? std::min<uint32_t>(mtp.topK ? mtp.topK : 16, 16) : 1;
+      const auto *pickIds = static_cast<const uint32_t *>(weights.mtpPickIds.contents());
+      const auto *pickValues = static_cast<const float *>(weights.mtpPickValues.contents());
+      const auto *pickMass = static_cast<const float *>(weights.mtpPickMass.contents());
       std::array<uint32_t, 16> ids{};
       std::array<float, 16> values{};
       uint32_t filled = 0;
-      for (uint32_t v = 0; v < vocabulary; ++v) {
-        const float value = logit(v);
-        if (filled < width16) {
-          uint32_t at = filled++;
-          while (at > 0 && values[at - 1] < value) {
-            ids[at] = ids[at - 1]; values[at] = values[at - 1]; --at;
-          }
-          ids[at] = v; values[at] = value;
-        } else if (value > values[width16 - 1]) {
-          uint32_t at = width16 - 1;
-          while (at > 0 && values[at - 1] < value) {
-            ids[at] = ids[at - 1]; values[at] = values[at - 1]; --at;
-          }
-          ids[at] = v; values[at] = value;
+      for (uint32_t c = 0; c < kSlices * kCandidates; ++c) {
+        const uint32_t id = pickIds[c];
+        const float value = pickValues[c];
+        if (id == UINT32_MAX) continue;
+        auto before = [&](uint32_t at) {
+          return values[at] > value || (values[at] == value && ids[at] < id);
+        };
+        if (filled == width16 && before(width16 - 1)) continue;
+        uint32_t at = filled < width16 ? filled++ : width16 - 1;
+        while (at > 0 && !before(at - 1)) {
+          ids[at] = ids[at - 1]; values[at] = values[at - 1]; --at;
         }
+        ids[at] = id; values[at] = value;
       }
       // Confidence: the head's own probability for its top token.
       float total = 0.0f;
-      for (uint32_t v = 0; v < vocabulary; ++v) {
-        const float value = logit(v);
-        if (value > values[0] - 16.0f) total += std::exp(value - values[0]);
-      }
+      for (uint32_t slice = 0; slice < kSlices; ++slice)
+        if (pickMass[2 * slice + 1] > 0.0f)
+          total += pickMass[2 * slice + 1] * std::exp(pickMass[2 * slice] - values[0]);
       lastConfidence = 1.0f / total;
       lastCandidates.fill(UINT32_MAX);
       lastProbabilities.fill(0.0f);
