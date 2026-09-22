@@ -39,6 +39,13 @@ wanted 128 MiB, long before any real weights existed.
   correct.
 - **N-gram table shape**: 320,001,536 x 160 (16 heads), not 20M x 2560. Same
   element count, so the 26.82 GiB total matched and hid the error.
+- **`make` does not relink `generate-sample`.** Run
+  `make build/engine-tests/generate-sample` after every engine change.
+- **`/tmp` is not storage.** The bf16 reference logits took ~40 min to make;
+  they now live in `~/models/qwen38-flash-next-reference/`.
+- **Changing a shared constant breaks tests quietly in many places.** Raising
+  the prompt chunk to 4096 needed ~12 test edits where 2048/2049 were
+  hardcoded; tests should use the constants.
 - **PLE gate offset**: normalized rows go at `row + (taps-1)*dilation`, because
   the convolution reads history first.
 

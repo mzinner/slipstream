@@ -1,5 +1,14 @@
 # Journal — qwen4exp port
 
+## 2026-09-22 09:15 PDT — claude-code
+
+Correction to the entry below: the 8-bit matrix kernels are at the bandwidth
+floor (3.4 GB a step in 10.8 ms); every tile/grid variant measured slower.
+Two-layers-ahead prefetch rejected (misses 59 -> 56, tok/s down). Final bench:
+greedy 50.0/37.9/36.3, sampled 46.1/35.4/34.4 tok/s; prompts 178-217/583/
+609-666 tok/s. State persisted: `.agents/next-session.md`, reference logits in
+`~/models/qwen38-flash-next-reference/`, `agent_turn.py` in the repo.
+
 ## 2026-09-22 08:30 PDT — claude-code
 
 GPU draft pick (mtp_pick_slices) replaces the 248K-logit host scan: sampled
