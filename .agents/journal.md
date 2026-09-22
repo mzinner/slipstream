@@ -1,5 +1,18 @@
 # Journal — qwen4exp port
 
+## 2026-09-22 06:45 PDT — claude-code
+
+Quality: a fake-quantized reference run showed the long-context drift was
+quantization, not a bug. Mixers, head, embedding and hyper-connection weights
+are now 8-bit: code prompt 91% same pick, KL 0.12 (was 81%, 0.40), level with
+llama.cpp V3. Prompts: expert-first waves with overlapped reads (each expert
+read once per layer per chunk) roughly doubled prompt speed; a race in the
+single pipeline event (host start signals satisfied "stage done" waits) was
+fixed with a GPU-only done event. Decode: 4-bit draft head, faster host
+routing, guess cap 5 -> 36–52 tok/s. Tried and rejected: 3-bit experts
+(83%/KL 0.34), shared-memory hand-off flags (not visible mid command buffer),
+earlier prefetch (competes with blocking reads), staging-only prompt misses.
+
 ## 2026-09-22 02:05 PDT — claude-code
 
 Server now starts and serves Flash-Next end to end. Three fixes: the memory

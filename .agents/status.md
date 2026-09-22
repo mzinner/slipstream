@@ -1,56 +1,63 @@
-# Status — qwen4exp port
+# Status — qwen4exp (Qwen3.8-Flash-Next) in Splash
 
-**Updated:** 2026-09-22 02:05 PDT by claude-code
+**Updated:** 2026-09-22 06:45 PDT by claude-code
 **Branch:** `qwen4exp-review` (not pushed; never push to upstream `incoai/splash`)
 
-## Where we are in one line
+## In one line
 
-Flash-Next runs in Splash at **33–45 tok/s** (llama.cpp V3: 18, or 27 with its
-draft head), same memory budget. The server works end to end, tool calls included.
+Quality now matches llama.cpp V3, decode is 36–52 tok/s (llama.cpp: 18, or 27
+with its draft head), and prompt reading is ~2x faster than before (154–390
+tok/s, above llama.cpp) — same 36 GiB expert budget.
 
-## Numbers (one warm engine, 384 generated tokens, 36 GiB expert cache)
+## Numbers (one warm engine, 384 tokens, guess cap 5)
 
-| Prompt | Greedy | Sampled 0.7 | Reading the prompt |
+| Prompt | Greedy | Sampled 0.7 | Prompt reading |
 |---|---|---|---|
-| Short, 65 tok | 45.1 tok/s | 41.5 | 87 tok/s |
-| Code, 1,495 tok | 35.2 | 36.0 | 222 tok/s |
-| Long, 9,129 tok | 37.9 | 33.3 | 211 tok/s |
+| Short, 65 tok | 52.3 | 41.3 | ~154 tok/s |
+| Code, 1,495 tok | 38.1 | 36.6 | ~380 tok/s |
+| Long, 9,129 tok | 38.2 | 38.0 | ~375–390 tok/s |
 
-Through the server: tool requests 33–52 tok/s; first token after a new
-339-token tool prompt 3–4 s, 0.2 s when the prompt is cached.
+Quality on the code prompt (bf16 reference): 91% same top pick, KL 0.12
+(second half 90%, 0.16). llama.cpp V3: 89%, 0.18.
 
-## Quality
+## Package format now (no backward compatibility)
 
-- Short text: perplexity 8.93 vs bf16 reference 8.93.
-- Code prompt second half: 79% same top pick, KL 0.51 (llama.cpp 89%, 0.18).
-  Drift grows with position; cause open. Sparse indexer unwired (>2K context).
+- Routed experts 4-bit (unchanged). Mixers, output head, embedding: 8-bit.
+  Hyper-connection mix weights: 8-bit, row-major, scale+bias per 64.
+- 4-bit copy of the output head, used only by the MTP draft.
+- Magics: layer MDFN0021, head MDFN0024, embedding MDFN0013, MTP combiner
+  MDFN0025. `convert_qwen4exp.py --requantize-mixers` / `--head-only` rewrite
+  an existing package in place in under a minute (experts copied).
 
-## Open work, in order
+## Where decode time goes (code prompt, ~84 ms a step, ~3.2 tokens a step at cap 3)
 
-1. **Code-prompt drift** (quality). Compare layer by layer with
-   `reference_logits.py` at late positions.
-2. **Short-prompt reading speed** 87 tok/s vs llama.cpp ~110.
-3. **Sparse indexer** for contexts past 2,048 tokens.
-4. 27B regression check needs a 4-bit 27B package: the installed 27B is
-   `splash-packed-q8`, which only the `splash2` fork reads (main and this
-   branch both reject it), so this branch cannot affect it today.
+GPU kernels ~41 ms (near bandwidth; mixing kernels the least efficient);
+host miss reads ~18 ms; per-layer hand-offs ~7–11 ms (structural: 164 us per
+shared-event hand-off, and shared-memory flags cannot replace it — probe in
+`dev/benchmarks/qwen4exp/probes/handoff_latency.mm`); MTP draft ~9 ms.
 
-## Tools (all in repo)
+## Open work
 
-- `generate-sample`: `SPLASH_PROFILE_STEPS=N`, `SPLASH_PROFILE_PREFILL=1`,
-  `SPLASH_DUMP_PREFILL_LOGITS=path`, `SPLASH_TEMPERATURE`; several prompts
-  separated by `;`. **Build it explicitly** (`make build/engine-tests/generate-sample`).
-- `SPLASH_LOG_ALLOCATIONS=1`: every Metal allocation ≥ 1 MiB.
-- `dev/benchmarks/qwen4exp/`: `bench_splash.py --one-process`, `bench_llama.py`,
-  `reference_logits.py`, `compare_logits.py`, `simulate_cache.py`, `probes/`.
-- Server: `.venv/bin/python -m server.server $M/target $M/draft --tokenizer $M/tokenizer
-  --model local/qwen3.8-flash-next-splash --port 8090 --binary build/splash`
-  with `M=~/models/qwen38-flash-next-splash`.
+1. **Attention past 2,048 tokens** (sparse indexer unwired): measuring
+   whether dense attention hurts quality there (4K reference run).
+2. Decode: hide misses / hand-offs (needs GPU-side routing to go further);
+   MTP draft ~9 ms; mixing kernels ~100 GB/s.
+3. 27B regression check needs a 4-bit 27B package (installed one is Q8,
+   readable only by the splash2 fork).
+
+## Tools
+
+- `dev/benchmarks/qwen4exp/profile_steps.py`: per-step decode profile
+  (tokens/step, step-time spread, staging/GPU/MTP split).
+- `reference_logits.py --quant group:bits,...`: price any quantization
+  choice against the bf16 reference (the simulation matched the engine to
+  0.1%).
+- `SPLASH_STEP_TIMING=1`, `SPLASH_PROFILE_STEPS=N`, `SPLASH_LOG_ALLOCATIONS=1`,
+  `SPLASH_MTP_DRAFTS=1..7`, `SPLASH_PREFILL_ROW_SLICES`, `SPLASH_PROMPT_KEEP`.
 
 ## Do not touch
 
-- `~/models/qwen38-flash-next-bf16` — 338 GB source.
-- `~/models/qwen38-flash-next-v3` — the model Nitin runs daily (llama.cpp, port 8080).
-- `splash2/` checkout — serves the 27B.
+- `~/models/qwen38-flash-next-bf16` (338 GB source), `~/models/qwen38-flash-next-v3`
+  (Nitin's daily llama.cpp model), the `splash2/` checkout.
 
-Full write-up: https://claude.ai/artifact/PB7F2nj2KRtST91NfMGoEQ
+Write-up: https://claude.ai/artifact/PB7F2nj2KRtST91NfMGoEQ
