@@ -354,6 +354,10 @@ struct Qwen4ExpWeights final {
   ops::Q8Projection logitsProjection;
   // The same head at 4 bits, for the MTP head's guesses only.
   ops::Q4Projection draftLogitsProjection;
+  // SPLASH_DRAFT_VOCAB=N: the rows of draftLogitsProjection for the N most
+  // common tokens, and their token ids. Empty when off.
+  ops::Q4Projection draftVocabProjection;
+  std::vector<uint32_t> draftVocabIds;
   ops::Q8Projection tokenEmbedding;
   // Its own file: the embedding table alone is 26.8 GiB, which does not
   // belong inside a layer file.

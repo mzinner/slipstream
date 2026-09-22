@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <dispatch/dispatch.h>
 #include <mach/mach.h>
 #include <iostream>
@@ -406,6 +407,64 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
         file, backend, layout.vocabularySize, layout.hiddenSize, "draft-logits");
     file.finish();
     result.files.push_back(file.record());
+  }
+  // The draft head scores only the most common tokens when the package has
+  // a ranking (target/draft-vocab.bin, written by dev/tools/draft_vocab.py).
+  // Guesses are still checked by the full head, so this changes speed, never
+  // answers. 65536 of 248320 cut the head's time 12.3 -> 8.4 ms a step and
+  // kept tokens per step (32768 made it overconfident: more rejected
+  // guesses). SPLASH_DRAFT_VOCAB=N overrides; 0 scores every token. Rows are
+  // copied out of the 4-bit tiled layout: 256-row tiles, 64-input groups, rows.
+  const auto rankingPath = directory / "draft-vocab.bin";
+  const char *envVocab = getenv("SPLASH_DRAFT_VOCAB");
+  const int wantedVocab = envVocab ? std::atoi(envVocab)
+                                   : (std::filesystem::exists(rankingPath) ? 65536 : 0);
+  if (wantedVocab > 0 && static_cast<uint32_t>(wantedVocab) < layout.vocabularySize) {
+    const uint32_t tileRows = kQ4StorageN;
+    const uint32_t rows = std::min<uint32_t>(
+        layout.vocabularySize,
+        (static_cast<uint32_t>(wantedVocab) + tileRows - 1) / tileRows * tileRows);
+    std::vector<uint32_t> ids(rows);
+    {
+      const int fd = ::open(rankingPath.c_str(), O_RDONLY);
+      const ssize_t want = static_cast<ssize_t>(rows * sizeof(uint32_t));
+      const ssize_t got = fd >= 0 ? ::pread(fd, ids.data(), want, 0) : -1;
+      if (fd >= 0) ::close(fd);
+      if (got != want)
+        throw std::runtime_error("SPLASH_DRAFT_VOCAB needs " + rankingPath.string() +
+                                 " (dev/tools/draft_vocab.py) with at least " +
+                                 std::to_string(rows) + " ids");
+    }
+    for (uint32_t id : ids)
+      if (id >= layout.vocabularySize)
+        throw std::runtime_error(rankingPath.string() + " holds an id past the vocabulary");
+    const ops::Q4Projection &full = result.draftLogitsProjection;
+    const uint32_t groups = layout.hiddenSize / 64;
+    const uint64_t cells = uint64_t{rows} * groups;
+    ops::Q4Projection subset{
+        backend.allocateBuffer(cells * 32, metal::BufferStorage::Shared, "draft-vocab-weights"),
+        backend.allocateBuffer(cells * 2, metal::BufferStorage::Shared, "draft-vocab-scales"),
+        backend.allocateBuffer(cells * 2, metal::BufferStorage::Shared, "draft-vocab-biases"),
+        rows, layout.hiddenSize};
+    const auto *fromWeights = static_cast<const uint8_t *>(full.weights.contents());
+    const auto *fromScales = static_cast<const uint16_t *>(full.scales.contents());
+    const auto *fromBiases = static_cast<const uint16_t *>(full.biases.contents());
+    auto *toWeights = static_cast<uint8_t *>(subset.weights.contents());
+    auto *toScales = static_cast<uint16_t *>(subset.scales.contents());
+    auto *toBiases = static_cast<uint16_t *>(subset.biases.contents());
+    for (uint32_t row = 0; row < rows; ++row) {
+      const uint32_t source = ids[row];
+      for (uint32_t group = 0; group < groups; ++group) {
+        const uint64_t from = (uint64_t{source / tileRows} * groups + group) * tileRows + source % tileRows;
+        const uint64_t to = (uint64_t{row / tileRows} * groups + group) * tileRows + row % tileRows;
+        std::memcpy(toWeights + to * 32, fromWeights + from * 32, 32);
+        toScales[to] = fromScales[from];
+        toBiases[to] = fromBiases[from];
+      }
+    }
+    result.draftVocabProjection = std::move(subset);
+    result.draftVocabIds = std::move(ids);
+    std::cerr << "[Qwen4Exp] draft head scores the " << rows << " most common tokens\n";
   }
   {
     WeightFile file(backend, directory / "embedding.bin",

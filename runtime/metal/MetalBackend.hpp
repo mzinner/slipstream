@@ -357,9 +357,14 @@ public:
   void keepResident(std::span<const MetalBuffer> buffers);
 
   [[nodiscard]] uint64_t reservePipelineEvents(uint32_t stages);
+  // `quietStages[k]` true: stage k still waits for base + 2k but does not
+  // raise the pipeline event when it ends (it still counts as done for
+  // waitPipelineStageDone). The host can then start stage k + 1 without
+  // waiting for stage k: the event only ever moves forward.
   [[nodiscard]] CommandTicket
   submitPipelineAsync(std::span<const ComputeDispatch> dispatches,
-                      std::span<const size_t> stageStarts, uint64_t base);
+                      std::span<const size_t> stageStarts, uint64_t base,
+                      std::span<const bool> quietStages = {});
   [[nodiscard]] bool waitPipelineEvent(uint64_t value, uint64_t timeoutMs);
   // Waits until stage `stage` of the pipeline at `base` has finished on the
   // GPU, whatever the host has signalled since.

@@ -240,7 +240,7 @@ void addHyperConnection(metal::CommandGraph &graph,
       rows, geometry.hiddenSize, geometry.hyperConnectionCount,
       geometry.hyperConnectionLowRank, 1e-6f, withInject ? 1u : 0u, rowStep,
       splits};
-  graph.add("hyper_connection_rms", {std::move(input), weights.norm, normalized},
+  graph.add("hyper_connection_rms", {input, weights.norm, normalized},
             params, {rows, geometry.hyperConnectionCount, 1}, {256, 1, 1});
   const uint32_t outputs = geometry.hyperConnectionLowRank +
                            (withInject ? geometry.hyperConnectionCount : 0);
@@ -271,6 +271,40 @@ void addHyperConnection(metal::CommandGraph &graph,
               params, {(rows * geometry.hiddenSize + 255) / 256, 1, 1}, {256, 1, 1});
     return;
   }
+  // SPLASH_HC_REPEAT=n encodes the decode mix n times. Every pass rewrites
+  // the same outputs from the same inputs, so answers are unchanged and the
+  // added GPU time is what the mix costs. Measurement only.
+  static const uint32_t repeat = [] {
+    const char *value = std::getenv("SPLASH_HC_REPEAT");
+    return value ? static_cast<uint32_t>(std::clamp(std::atoi(value), 1, 8)) : 1u;
+  }();
+  // SPLASH_HC_REPEAT_PARTS picks which repeat: 1 normalize, 2 down,
+  // 4 down-finish, 8 up-mix (default all).
+  static const uint32_t parts = [] {
+    const char *value = std::getenv("SPLASH_HC_REPEAT_PARTS");
+    return value ? static_cast<uint32_t>(std::atoi(value)) : 15u;
+  }();
+  for (uint32_t pass = 1; pass < repeat; ++pass) {
+    if (parts & 1)
+    graph.add("hyper_connection_rms", {input, weights.norm, normalized},
+              params, {rows, geometry.hyperConnectionCount, 1}, {256, 1, 1});
+    if (parts & 2)
+    graph.add("hyper_connection_down",
+              {normalized, weights.mixDown.weights, weights.mixDown.scales,
+               weights.mixDown.biases,
+               withInject ? *weights.blockInject : weights.mixDown.scales, reduced,
+               withInject ? injection : reduced, weights.downPartials},
+              params, {(outputs + 7) / 8, splits, 1}, {256, 1, 1});
+    if (splits > 1 && (parts & 4))
+      graph.add("hyper_connection_down_finish",
+                {weights.downPartials, reduced, withInject ? injection : reduced},
+                params, {(rows * outputs + 255) / 256, 1, 1}, {256, 1, 1});
+    if (parts & 8)
+    graph.add("hyper_connection_up_mix",
+              {normalized, reduced, weights.mixUp.weights,
+               weights.mixUp.scales, weights.mixUp.biases, mixed},
+              params, {geometry.hiddenSize / 8, 1, 1}, {256, 1, 1});
+  }
   graph.add("hyper_connection_down",
             {normalized, weights.mixDown.weights, weights.mixDown.scales,
              weights.mixDown.biases,
@@ -287,6 +321,16 @@ void addHyperConnection(metal::CommandGraph &graph,
             params, {geometry.hiddenSize / 8, 1, 1}, {256, 1, 1});
 }
 
+// Reads per matrix of one expert (SPLASH_READ_PIECES, default 1). A slot's
+// read counter starts at 3 * this and each finished piece takes one off.
+uint32_t readPieces() noexcept {
+  static const uint32_t pieces = [] {
+    const char *value = std::getenv("SPLASH_READ_PIECES");
+    return value ? static_cast<uint32_t>(std::clamp(std::atoi(value), 1, 16)) : 1u;
+  }();
+  return pieces;
+}
+
 // Reads missed experts straight from the layer file into their cache slots:
 // three reads per expert (gate, up, down), all in flight together. The SSD
 // reaches ~15 GB/s this way; faulting pages in one at a time reached ~1.5.
@@ -298,7 +342,7 @@ void readMissedExperts(const Qwen4ExpExpertSource &source, const Miss *misses,
     return;
   // One read per matrix. Splitting each into 4 smaller reads in flight
   // together was measured slower (staging 30 -> 39 ms a step).
-  constexpr uint32_t kPieces = 1;
+  const uint32_t kPieces = readPieces();
   const uint64_t piece = (stride + kPieces - 1) / kPieces;
   dispatch_apply(count * 3 * kPieces,
                  dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
@@ -1832,7 +1876,14 @@ void Qwen4ExpTarget::addVerify(
   auto layerRef = [&](uint32_t index) -> const Qwen4ExpLayerWeights & {
     return index < geometry.layers ? weights.layers[index] : *weights.mtpLayer;
   };
-  auto stageActiveExperts = [&](uint32_t layerIndex) -> bool {
+  // Decode misses waiting to be read (deferred staging), and their slots.
+  struct DecodeMiss { uint32_t expert; uint32_t slot; };
+  std::vector<DecodeMiss> pendingMisses;
+  uint32_t pendingLayer = 0;
+  std::bitset<512> pendingMissSlots;
+  // deferReads: assign slots but leave the missing experts' reads for
+  // readPendingMisses(), so the GPU can run the cached ones meanwhile.
+  auto stageActiveExperts = [&](uint32_t layerIndex, bool deferReads = false) -> bool {
     auto &cache = layerRef(layerIndex).expertCache;
     // Predicted experts may still be loading; their slots are already claimed.
     // Predicted experts may still be loading; their slots are claimed. Wait
@@ -1874,10 +1925,7 @@ void Qwen4ExpTarget::addVerify(
       return false;
     }
 
-    struct Miss {
-      uint32_t expert;
-      uint32_t slot;
-    };
+    using Miss = DecodeMiss;
     std::vector<Miss> misses;
     misses.reserve(uniqueExperts.size());
     ++cache.clock;
@@ -1937,7 +1985,12 @@ void Qwen4ExpTarget::addVerify(
 
     totalMisses += static_cast<uint32_t>(misses.size());
 
-    if (!misses.empty()) {
+    pendingMissSlots.reset();
+    for (const Miss &miss : misses) pendingMissSlots.set(miss.slot);
+    if (deferReads) {
+      pendingMisses = misses;
+      pendingLayer = layerIndex;
+    } else if (!misses.empty()) {
       const auto &layer = layerRef(layerIndex);
       const uint64_t stride = layer.ffn.expertGate.expertStrideBytes;
       char *cg = static_cast<char *>(cache.cacheGate.contents());
@@ -2034,7 +2087,7 @@ void Qwen4ExpTarget::addVerify(
       for (uint32_t slot = 0; slot < cache.capacity; ++slot) cache.slotReads[slot] = 0;
     }
     for (const Miss &miss : misses)
-      cache.slotReads[miss.slot].fetch_add(3, std::memory_order_relaxed);
+      cache.slotReads[miss.slot].fetch_add(3 * readPieces(), std::memory_order_relaxed);
     auto slotReads = cache.slotReads;
     const auto &source = weights.layers[layer].expertSource;
     const uint64_t stride = weights.layers[layer].ffn.expertGate.expertStrideBytes;
@@ -2094,7 +2147,10 @@ void Qwen4ExpTarget::addVerify(
   // As moe_group_routes lays it out: routed tiles in ascending slot order,
   // tile_rows each, padding marked ~0; then the shared expert's tiles. Rows
   // that cannot be kept get no routes at all.
-  auto hostGroup = [&]() {
+  // waves: order tiles as cached experts, then the shared expert, then the
+  // experts still being read (pendingMissSlots), and write the two ranges
+  // [0, split) and [split, end) to weights.decodeRanges for the ranged passes.
+  auto hostGroup = [&](bool waves = false) {
     const auto *selected = static_cast<const uint32_t *>(buffers.selectedExperts.contents());
     auto *tiles = static_cast<MoeTileDescriptor *>(buffers.tileDescriptors.contents());
     auto *tileCount = static_cast<uint32_t *>(buffers.tileCount.contents());
@@ -2127,7 +2183,7 @@ void Qwen4ExpTarget::addVerify(
       }
     }
     uint32_t tile = 0;
-    for (uint32_t e = 0; e < experts; ++e) {
+    auto addExpert = [&](uint32_t e) {
       const std::span<const uint32_t> routes(sorted.data() + start[e],
                                              start[e + 1] - start[e]);
       for (uint32_t first = 0; first < routes.size(); first += tileRows) {
@@ -2144,7 +2200,9 @@ void Qwen4ExpTarget::addVerify(
         }
         ++tile;
       }
-    }
+    };
+    for (uint32_t e = 0; e < experts; ++e)
+      if (!waves || !pendingMissSlots[e]) addExpert(e);
     std::vector<uint32_t> shared;
     for (uint32_t r = 0; r < rows; ++r)
       if (isLive(r)) shared.push_back(r * hostRoutesPerRow + k);
@@ -2161,6 +2219,16 @@ void Qwen4ExpTarget::addVerify(
         }
       }
       ++tile;
+    }
+    uint32_t split = tile;
+    if (waves) {
+      for (uint32_t e = 0; e < experts; ++e)
+        if (pendingMissSlots[e]) addExpert(e);
+      auto *ranges = static_cast<uint32_t *>(weights.decodeRanges.contents());
+      ranges[0] = 0;
+      ranges[1] = split;
+      ranges[64] = split;   // second range, 256 bytes on
+      ranges[65] = tile;
     }
     *tileCount = tile;
   };
@@ -2337,19 +2405,24 @@ void Qwen4ExpTarget::addVerify(
             all, {64, 1, 1}, {256, 1, 1});
       addHyperConnection(b, geometry, Y, combiner.mixer, buffers.normalized,
                          buffers.hyperReduced, buffers.finalHidden, {}, kRows, 1);
+      // With SPLASH_DRAFT_VOCAB the head scores only the most common tokens;
+      // picked positions are mapped back to token ids below.
+      const bool subset = !weights.draftVocabIds.empty();
+      const uint32_t scored = subset ? weights.draftVocabProjection.outputSize : vocabulary;
       operators.linear().addDecodeBatch(b, buffers.finalHidden,
-                                        weights.draftLogitsProjection, buffers.logits,
-                                        {vocabulary, hidden}, lanes, stats);
+                                        subset ? weights.draftVocabProjection
+                                               : weights.draftLogitsProjection,
+                                        buffers.logits, {scored, hidden}, lanes, stats);
       // Top candidates per vocabulary slice on the GPU (mtp_pick.metal).
       constexpr uint32_t kSlices = 64, kCandidates = 16;
       shared(weights.mtpPickIds, kSlices * kCandidates * 4, "mtp-pick-ids");
       shared(weights.mtpPickValues, kSlices * kCandidates * 4, "mtp-pick-values");
       shared(weights.mtpPickMass, kSlices * 2 * 4, "mtp-pick-mass");
       b.add("mtp_pick_slices",
-            {backend.view(buffers.logits, uint64_t{live - 1} * vocabulary * 2,
-                          uint64_t{vocabulary} * 2),
+            {backend.view(buffers.logits, uint64_t{live - 1} * scored * 2,
+                          uint64_t{scored} * 2),
              weights.mtpPickIds, weights.mtpPickValues, weights.mtpPickMass},
-            vocabulary, {kSlices, 1, 1}, {256, 1, 1});
+            scored, {kSlices, 1, 1}, {256, 1, 1});
       (void)backend.submitCommand(b.dispatches());
       const auto clockPick = std::chrono::steady_clock::now();
       auto ms = [](auto from, auto to) {
@@ -2391,6 +2464,8 @@ void Qwen4ExpTarget::addVerify(
         }
         ids[at] = id; values[at] = value;
       }
+      if (subset)
+        for (uint32_t i = 0; i < filled; ++i) ids[i] = weights.draftVocabIds[ids[i]];
       // Confidence: the head's own probability for its top token.
       float total = 0.0f;
       for (uint32_t slice = 0; slice < kSlices; ++slice)
@@ -2608,12 +2683,47 @@ void Qwen4ExpTarget::addVerify(
     };
     // Stage 0 has already been submitted and completed above (resident
     // graph), so stages here start at layer R's experts.
+    // Waves: every layer after the first is two stages. A runs the experts
+    // already cached while the host reads the missing ones; B runs those,
+    // then the rest of the layer as before. A is quiet (raises no event), so
+    // the host starts B as soon as its reads land. Same outputs; 84.6 -> 79.6
+    // ms a step on the 10-prompt suite. SPLASH_DECODE_WAVES=0 turns it off.
+    static const bool waves = [] {
+      const char *value = std::getenv("SPLASH_DECODE_WAVES");
+      return !value || std::atoi(value) != 0;
+    }();
+    // One flag per stage (at most two per layer); std::vector<bool> is packed
+    // bits and cannot be viewed as bools.
+    std::array<bool, 2 * 64> quiet{};
+    size_t quietCount = 0;
+    if (waves && !weights.decodeRanges)
+      weights.decodeRanges = backend.allocateBuffer(
+          512, metal::BufferStorage::Shared, "qwen4exp-decode-ranges");
+    const ops::MoeBuffers moeBuffers{
+        buffers.hyperMixed, buffers.hyperMixed, buffers.gdnOutput,
+        buffers.selectedExperts, buffers.routingWeights, buffers.tileDescriptors,
+        buffers.tileCount, buffers.groupedRoutes, buffers.routeRows,
+        buffers.groupedInput, buffers.expertIntermediate, buffers.expertOutput};
     const auto encodeStart = std::chrono::steady_clock::now();
     for (uint32_t L = R; L < geometry.layers - 1; ++L) {
       deferredPerStage.emplace_back();
       pipelineDeferred = &deferredPerStage.back();
+      if (waves && L > R) {
+        metal::CommandGraph &cached = stageGraphs.emplace_back();
+        ops::MoE::addGather(cached, moeBuffers, moePlan);
+        ops::MoE::addExpertTilesInRange(cached, moeBuffers, makeCacheWeights(L), moePlan,
+                                        backend.view(weights.decodeRanges, 0, 8));
+        append(cached);
+        quiet[quietCount++] = true;
+      }
       metal::CommandGraph &stepGraph = stageGraphs.emplace_back();
-      encodeMoEExecute(stepGraph, makeCacheWeights(L), /*hostGrouped=*/true);
+      if (waves && L > R) {
+        ops::MoE::addExpertTilesInRange(stepGraph, moeBuffers, makeCacheWeights(L), moePlan,
+                                        backend.view(weights.decodeRanges, 256, 8));
+        ops::MoE::addCombine(stepGraph, moeBuffers, moePlan, /*addResidual=*/false);
+      } else {
+        encodeMoEExecute(stepGraph, makeCacheWeights(L), /*hostGrouped=*/true);
+      }
       encodeMlpUpdate(stepGraph, L);
       encodeCapture(stepGraph, L);
       encodeAttentionHC(stepGraph, L + 1, /*priorWorkComplete=*/true);
@@ -2624,6 +2734,7 @@ void Qwen4ExpTarget::addVerify(
       if (lookahead && L + 2 < geometry.layers)
         encodePredictRoute(stepGraph, L + 2);
       append(stepGraph);
+      quiet[quietCount++] = false;
       pipelineDeferred = nullptr;
     }
     // The first stage's host work (layer R's experts) happens before commit:
@@ -2639,13 +2750,19 @@ void Qwen4ExpTarget::addVerify(
     const uint32_t stages = static_cast<uint32_t>(starts.size());
     const uint64_t base = backend.reservePipelineEvents(stages);
     auto tg0 = std::chrono::steady_clock::now();
-    metal::CommandTicket ticket = backend.submitPipelineAsync(all, starts, base);
+    metal::CommandTicket ticket = backend.submitPipelineAsync(
+        all, starts, base, waves ? std::span<const bool>(quiet.data(), quietCount) : std::span<const bool>{});
     static uint32_t tracedSteps = 0;
     const bool trace = std::getenv("SPLASH_TRACE_STAGES") && tracedSteps++ < 3;
     std::vector<double> waits;
-    for (uint32_t k = 1; k < stages; ++k) {
+    const uint32_t layerStages = geometry.layers - 1 - R;
+    for (uint32_t k = 1; k < layerStages; ++k) {
+      // Stage indices: layer R+k's A stage (waves) and its main (B) stage.
+      const uint32_t mainStage = waves ? 2 * k : k;
+      const uint32_t cachedStage = mainStage - 1;
+      const uint32_t previous = waves ? (k == 1 ? 0 : 2 * (k - 1)) : k - 1;
       const auto waitStart = std::chrono::steady_clock::now();
-      if (!backend.waitPipelineEvent(base + 2 * k - 1, 60000))
+      if (!backend.waitPipelineEvent(base + 2 * previous + 1, 60000))
         throw std::runtime_error("pipelined decode stage timed out");
       if (trace)
         waits.push_back(std::chrono::duration<double, std::milli>(
@@ -2654,19 +2771,35 @@ void Qwen4ExpTarget::addVerify(
       const uint32_t layer = R + k;
       const auto hostStart = ts;
       hostSelect(layer);
-      if (!stageActiveExperts(layer))
+      if (!stageActiveExperts(layer, /*deferReads=*/waves))
         throw std::logic_error("pipelined decode found more experts than the cache holds");
-      hostGroup();
+      hostGroup(waves);
+      for (auto &work : deferredPerStage[k]) work();
+      if (waves) {
+        // Cached experts go now; the missing ones follow once read.
+        backend.signalPipelineEvent(base + 2 * cachedStage);
+        if (!pendingMisses.empty()) {
+          const auto &src = layerRef(pendingLayer);
+          auto &cache = src.expertCache;
+          const auto readStart = std::chrono::steady_clock::now();
+          readMissedExperts(src.expertSource, pendingMisses.data(), pendingMisses.size(),
+                            src.ffn.expertGate.expertStrideBytes,
+                            static_cast<char *>(cache.cacheGate.contents()),
+                            static_cast<char *>(cache.cacheUp.contents()),
+                            static_cast<char *>(cache.cacheDown.contents()));
+          hostParts[1] += std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - readStart).count();
+        }
+      }
       // Stage k-1 also predicted layer + 1; start those reads now so they
       // land while stage k runs.
       if (lookahead)
         prefetchPredicted(layer + 1);
-      for (auto &work : deferredPerStage[k]) work();
       totalStageMs += std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - ts).count();
       hostParts[2] += std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - hostStart).count();
-      backend.signalPipelineEvent(base + 2 * k);
+      backend.signalPipelineEvent(base + 2 * mainStage);
     }
     metal::CommandTiming timing = ticket.wait();
     totalGpuMs += std::chrono::duration<double, std::milli>(

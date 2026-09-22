@@ -335,6 +335,36 @@ void MoE::addExpertRange(metal::CommandGraph &graph, const MoeBuffers &buffers,
             down, {shape.hiddenSize / 128, tiles, 1});
 }
 
+void MoE::addExpertTilesInRange(metal::CommandGraph &graph,
+                                const MoeBuffers &buffers,
+                                const MoeWeights &weights, const MoePlan &plan,
+                                metal::MetalBuffer range) {
+  const MoeShape shape = plan.shape();
+  if (plan.config().expertTile != MoeExpertTile::M8 || shape.storageN != 128 ||
+      plan.splitExperts())
+    throw std::invalid_argument("ranged expert tiles are decode M8, 128-wide only");
+  const uint32_t tiles = plan.maximumTiles();
+  const MoeExpertParams gateUp{shape.hiddenSize, shape.expertIntermediateSize,
+                               shape.experts, 0,
+                               weights.expertGate.expertStrideBytes,
+                               weights.expertUp.expertStrideBytes};
+  const MoeExpertParams down{shape.expertIntermediateSize, shape.hiddenSize,
+                             shape.experts, 0,
+                             weights.expertDown.expertStrideBytes,
+                             weights.expertDown.expertStrideBytes};
+  graph.add("moe_expert_gate_up_q4_n128_m8_range",
+            {buffers.groupedInput, buffers.tileDescriptors, range,
+             weights.expertGate.packed, weights.expertUp.packed,
+             weights.sharedGate.packed, weights.sharedUp.packed,
+             buffers.expertIntermediate},
+            gateUp, {shape.expertIntermediateSize / 128, tiles, 1});
+  graph.add("moe_expert_down_q4_n128_m8_range",
+            {buffers.expertIntermediate, buffers.tileDescriptors, range,
+             weights.expertDown.packed, weights.sharedDown.packed,
+             buffers.expertOutput},
+            down, {shape.hiddenSize / 128, tiles, 1});
+}
+
 void MoE::addCombine(metal::CommandGraph &graph, const MoeBuffers &buffers,
                      const MoePlan &plan, bool addResidual) {
   const MoeShape shape = plan.shape();

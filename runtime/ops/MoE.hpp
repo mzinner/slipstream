@@ -208,6 +208,13 @@ struct MoE final {
                              metal::MetalBuffer gateScratch);
   static void addCombine(metal::CommandGraph &graph, const MoeBuffers &buffers,
                          const MoePlan &plan, bool addResidual);
+  // Decode (M8, 128-wide expert tiles) only: run the host-grouped tiles whose
+  // index lies in [range[0], range[1]), read from `range` when the pass runs,
+  // so the host can pick the split after encoding.
+  static void addExpertTilesInRange(metal::CommandGraph &graph,
+                                    const MoeBuffers &buffers,
+                                    const MoeWeights &weights, const MoePlan &plan,
+                                    metal::MetalBuffer range);
 };
 
 } // namespace splash::ops

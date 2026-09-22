@@ -382,6 +382,7 @@ struct MetalBackend::Impl {
     uint64_t pipelineValue = 0;
     // Set only for the duration of a pipelined submission.
     const std::vector<size_t> *pipelineStarts = nullptr;
+    const std::vector<bool> *pipelineQuiet = nullptr;
     uint64_t pipelineBase = 0;
     __strong id<MTLLibrary> library = nil;
     __strong NSMutableDictionary<NSString *, id<MTLComputePipelineState>>
@@ -657,7 +658,11 @@ MetalBackend::MetalBackend(std::string metallibPath, double commandTimeoutSecond
             throw MetalBackendError("Metal device unavailable");
         }
         impl_->asyncState->device = impl_->device;
-        impl_->queue = [impl_->device newCommandQueue];
+        // Pipelined decode commits a command buffer per stage up front and
+        // releases them one by one; the default 64 in flight is fewer than a
+        // step with two stages a layer needs, and creating one past the limit
+        // blocks until another completes - which waits on this thread.
+        impl_->queue = [impl_->device newCommandQueueWithMaxCommandBufferCount:256];
         if (!impl_->queue) {
             throw MetalBackendError("unable to create Metal command queue");
         }
@@ -1290,20 +1295,27 @@ void MetalBackend::signalPipelineEvent(uint64_t value) {
 
 CommandTicket MetalBackend::submitPipelineAsync(
     std::span<const ComputeDispatch> dispatches,
-    std::span<const size_t> stageStarts, uint64_t base) {
+    std::span<const size_t> stageStarts, uint64_t base,
+    std::span<const bool> quietStages) {
     if (stageStarts.empty() || stageStarts.front() != 0 ||
         !std::is_sorted(stageStarts.begin(), stageStarts.end()) ||
         stageStarts.back() >= dispatches.size() || !impl_->pipelineEvent)
         throw MetalBackendError("invalid pipeline stages");
     const std::vector<size_t> starts(stageStarts.begin(), stageStarts.end());
+    if (!quietStages.empty() && quietStages.size() != starts.size())
+        throw MetalBackendError("quiet stage flags do not match the stages");
+    const std::vector<bool> quiet(quietStages.begin(), quietStages.end());
     impl_->pipelineStarts = &starts;
+    impl_->pipelineQuiet = quiet.empty() ? nullptr : &quiet;
     impl_->pipelineBase = base;
     try {
         CommandTicket ticket = submitCommandAsync(dispatches);
         impl_->pipelineStarts = nullptr;
+        impl_->pipelineQuiet = nullptr;
         return ticket;
     } catch (...) {
         impl_->pipelineStarts = nullptr;
+        impl_->pipelineQuiet = nullptr;
         throw;
     }
 }
@@ -1563,8 +1575,9 @@ CommandTicket MetalBackend::submitCommandAsync(
             }
         }
         if (pipelined) {
-            [command encodeSignalEvent:impl_->pipelineEvent
-                                 value:impl_->pipelineBase + 2 * c + 1];
+            if (!impl_->pipelineQuiet || !(*impl_->pipelineQuiet)[c])
+                [command encodeSignalEvent:impl_->pipelineEvent
+                                     value:impl_->pipelineBase + 2 * c + 1];
             [command encodeSignalEvent:impl_->pipelineDoneEvent
                                  value:impl_->pipelineBase + 2 * c + 1];
         }

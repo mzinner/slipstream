@@ -597,7 +597,10 @@ kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
 // per tile instead of once per route. Decode plans and the M8 prefill plan
 // run this fused gate/up tile; the M32 prefill plan runs the split N256
 // passes in prefill/moe.metal.
-template <ushort Rows, bool GateUp, ushort StorageN = 256>
+// Ranged: `tile_count` holds [first, end) instead of a count, so one pass can
+// run part of a step's tiles (decode runs cached experts while the host still
+// reads the missing ones, then the rest).
+template <ushort Rows, bool GateUp, ushort StorageN = 256, bool Ranged = false>
 inline void moe_expert_tile(device bfloat *grouped_input,
                             device const MoeTileDescriptor *tiles,
                             device const uint *tile_count,
@@ -607,8 +610,12 @@ inline void moe_expert_tile(device bfloat *grouped_input,
                             constant MoeExpertParams &params, uint2 group,
                             threadgroup float *input_sums, uint simd_lane,
                             uint simd_group) {
-  if (group.y >= *tile_count)
+  if constexpr (Ranged) {
+    if (group.y < tile_count[0] || group.y >= tile_count[1])
+      return;
+  } else if (group.y >= *tile_count) {
     return;
+  }
   const uint expert = tiles[group.y].expert;
   const MoeQ4Slab slab_0 =
       moe_q4_slab(packed_0, shared_0, expert, params.experts,
@@ -770,3 +777,34 @@ kernel void moe_combine_no_residual(
   output[ulong(row) * params.hidden_size + dimension] = bfloat(value);
 }
 
+// Decode expert passes over a tile range (see moe_expert_tile's Ranged).
+kernel void moe_expert_gate_up_q4_n128_m8_range(
+    device bfloat *grouped_input [[buffer(0)]],
+    device const MoeTileDescriptor *tiles [[buffer(1)]],
+    device const uint *tile_range [[buffer(2)]],
+    device uchar *gate_packed [[buffer(3)]], device uchar *up_packed [[buffer(4)]],
+    device uchar *shared_gate [[buffer(5)]], device uchar *shared_up [[buffer(6)]],
+    device bfloat *output [[buffer(7)]], constant MoeExpertParams &params [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float input_sums[64];
+  moe_expert_tile<8, true, 128, true>(grouped_input, tiles, tile_range, gate_packed,
+                                      up_packed, shared_gate, shared_up, output, params,
+                                      group, input_sums, simd_lane, simd_group);
+}
+
+kernel void moe_expert_down_q4_n128_m8_range(
+    device bfloat *grouped_input [[buffer(0)]],
+    device const MoeTileDescriptor *tiles [[buffer(1)]],
+    device const uint *tile_range [[buffer(2)]],
+    device uchar *down_packed [[buffer(3)]], device uchar *shared_down [[buffer(4)]],
+    device bfloat *output [[buffer(5)]], constant MoeExpertParams &params [[buffer(6)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float input_sums[64];
+  moe_expert_tile<8, false, 128, true>(grouped_input, tiles, tile_range, down_packed,
+                                       down_packed, shared_down, shared_down, output,
+                                       params, group, input_sums, simd_lane, simd_group);
+}
