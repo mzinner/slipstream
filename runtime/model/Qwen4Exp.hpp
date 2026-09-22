@@ -34,8 +34,8 @@ namespace splash::model {
 struct Qwen4ExpLayout final {
   // 0011: mixer projections 8-bit (they were 4-bit in 0001; see
   // dev/benchmarks/qwen4exp/reference_logits.py --quant for why).
-  // 0021: hyper-connection mix weights 8-bit as well.
-  static constexpr std::string_view layerMagic = "MDFN0021";
+  // 0031: hyper-connection mix weights 8-bit, in the tiled matrix layout.
+  static constexpr std::string_view layerMagic = "MDFN0031";
 
   // Provisional: the draft is deferred, so these five indices are evenly
   // spaced rather than chosen against a trained DFlash 2 draft.
@@ -207,9 +207,11 @@ struct Qwen4ExpLayout final {
 //
 //   x = x + outer(inj, y)               [hc,d], flattened back to H
 //
-// The mix projections are 8-bit, row-major (not tiled: the down projection
-// is 320 wide, not a multiple of a tile), with a bf16 scale and bias per 64
-// weights along each row: w = code * scale + bias.
+// The mix projections are 8-bit in the matrix kernels' tiled layout, so a
+// prompt can run them as matrix products while decode reads them with its
+// own kernels. The down projection's 320 outputs are padded to 512 (a whole
+// number of 256-row tiles); decode never reads the padding.
+inline constexpr uint32_t kHyperDownPadded = 512;
 // The down projection splits its 10240-long dot products across this many
 // threadgroups when a call has at most kHyperDownSplitRows rows.
 inline constexpr uint32_t kHyperDownSplits = 10;
@@ -218,18 +220,19 @@ inline constexpr uint32_t kHyperDownSplitRows = 32;
 
 struct Qwen4ExpHyperConnection final {
   metal::MetalBuffer norm;         // hyperConnectionWidth
-  metal::MetalBuffer mixDown;      // lowRank x hyperConnectionWidth codes
-  metal::MetalBuffer mixDownScales;
-  metal::MetalBuffer mixDownBiases;
-  metal::MetalBuffer mixUp;        // hyperConnectionWidth x lowRank codes
-  metal::MetalBuffer mixUpScales;
-  metal::MetalBuffer mixUpBiases;
+  ops::Q8Projection mixDown;       // kHyperDownPadded x hyperConnectionWidth
+  ops::Q8Projection mixUp;         // hyperConnectionWidth x lowRank
   // Absent on the final mixer, which collapses the streams before the head
   // and never injects a block result back (use_combine=False upstream).
   std::optional<metal::MetalBuffer> blockInject;  // count x width
   // Scratch for the split down projection's partial sums, shared by every
   // hyper-connection (they run one at a time).
   metal::MetalBuffer downPartials;
+  // Prompt-path scratch, shared likewise: input sums for the products, the
+  // padded down outputs, and the up logits (prefill budget rows each).
+  metal::MetalBuffer promptSums;
+  metal::MetalBuffer promptDown;
+  metal::MetalBuffer promptLogits;
 };
 
 // The per-layer embedding on layer ngramLayer. It gathers a hashed n-gram

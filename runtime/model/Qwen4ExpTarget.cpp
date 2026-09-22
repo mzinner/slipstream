@@ -232,7 +232,8 @@ void addHyperConnection(metal::CommandGraph &graph,
                         metal::MetalBuffer normalized,
                         metal::MetalBuffer reduced, metal::MetalBuffer mixed,
                         metal::MetalBuffer injection, uint32_t rows,
-                        uint32_t rowStep = 1) {
+                        uint32_t rowStep = 1,
+                        const ops::ExecutionPlans *operators = nullptr) {
   const bool withInject = weights.blockInject.has_value();
   const uint32_t splits = rows <= kHyperDownSplitRows ? kHyperDownSplits : 1;
   const HyperConnectionParams params{
@@ -243,10 +244,37 @@ void addHyperConnection(metal::CommandGraph &graph,
             params, {rows, geometry.hyperConnectionCount, 1}, {256, 1, 1});
   const uint32_t outputs = geometry.hyperConnectionLowRank +
                            (withInject ? geometry.hyperConnectionCount : 0);
+  // A prompt's rows run the projections as 8-bit matrix products over the
+  // same tiled weights; the scalar kernels below are for decode's few rows.
+  static const bool scalarPrompt = std::getenv("SPLASH_HC_SCALAR_PROMPT") != nullptr;
+  if (operators && !scalarPrompt && rows > kHyperDownSplitRows && rowStep <= 1) {
+    const uint32_t width = geometry.hyperConnectionCount * geometry.hiddenSize;
+    const uint32_t lowRank = geometry.hyperConnectionLowRank;
+    const ops::LinearMatrix down{kHyperDownPadded, width};
+    const ops::LinearMatrix up{width, lowRank};
+    const auto &linear = operators->linear();
+    linear.addPrefillSums(graph, normalized, weights.promptSums, down, rows);
+    linear.addPrefill(graph, normalized, weights.mixDown, weights.promptDown,
+                      weights.promptSums, down, rows);
+    static_assert(kHyperDownPadded == 512, "hyper_connection_prompt_reduce assumes 512");
+    graph.add("hyper_connection_prompt_reduce", {weights.promptDown, reduced},
+              params, {(rows * lowRank + 255) / 256, 1, 1}, {256, 1, 1});
+    if (withInject)
+      graph.add("hyper_connection_prompt_inject",
+                {normalized, *weights.blockInject, std::move(injection)}, params,
+                {rows, geometry.hyperConnectionCount, 1}, {256, 1, 1});
+    linear.addPrefillSums(graph, reduced, weights.promptSums, up, rows);
+    linear.addPrefill(graph, reduced, weights.mixUp, weights.promptLogits,
+                      weights.promptSums, up, rows);
+    graph.add("hyper_connection_prompt_mix",
+              {std::move(normalized), weights.promptLogits, std::move(mixed)},
+              params, {(rows * geometry.hiddenSize + 255) / 256, 1, 1}, {256, 1, 1});
+    return;
+  }
   graph.add("hyper_connection_down",
-            {normalized, weights.mixDown, weights.mixDownScales,
-             weights.mixDownBiases,
-             withInject ? *weights.blockInject : weights.mixDownScales, reduced,
+            {normalized, weights.mixDown.weights, weights.mixDown.scales,
+             weights.mixDown.biases,
+             withInject ? *weights.blockInject : weights.mixDown.scales, reduced,
              withInject ? injection : reduced, weights.downPartials},
             params, {(outputs + 7) / 8, splits, 1}, {256, 1, 1});
   if (splits > 1)
@@ -254,8 +282,8 @@ void addHyperConnection(metal::CommandGraph &graph,
               {weights.downPartials, reduced, withInject ? injection : reduced},
               params, {(rows * outputs + 255) / 256, 1, 1}, {256, 1, 1});
   graph.add("hyper_connection_up_mix",
-            {std::move(normalized), std::move(reduced), weights.mixUp,
-             weights.mixUpScales, weights.mixUpBiases, std::move(mixed)},
+            {std::move(normalized), std::move(reduced), weights.mixUp.weights,
+             weights.mixUp.scales, weights.mixUp.biases, std::move(mixed)},
             params, {geometry.hiddenSize / 8, 1, 1}, {256, 1, 1});
 }
 
@@ -608,7 +636,8 @@ void Qwen4ExpTarget::addPrefill(
     metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
     addHyperConnection(g, geometry, input, layer.attentionHyperConnection,
                        buffers.normalized, buffers.hyperReduced,
-                       buffers.hyperMixed, buffers.hyperInjection, rows);
+                       buffers.hyperMixed, buffers.hyperInjection, rows, 1,
+                       &operators);
   };
 
   auto encodeMixer = [&](metal::CommandGraph &g, uint32_t layerIndex,
@@ -739,7 +768,8 @@ void Qwen4ExpTarget::addPrefill(
     metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
     addHyperConnection(g, geometry, input, layer.mlpHyperConnection,
                        buffers.normalized, buffers.hyperReduced,
-                       buffers.hyperMixed, buffers.hyperInjection, rows);
+                       buffers.hyperMixed, buffers.hyperInjection, rows, 1,
+                       &operators);
   };
 
   auto encodeMoERoute = [&](metal::CommandGraph &g, uint32_t layerIndex) {
@@ -1271,6 +1301,19 @@ void Qwen4ExpTarget::addPrefill(
       totalSlices += 1;
       return;
     }
+    // The per-dispatch profiler replays commands one dispatch at a time and
+    // cannot honour pipeline events: run the waves one after another.
+    if (backend.dispatchProfiling()) {
+      for (size_t w = 0; w < waves.size(); ++w) {
+        if (w > 0) loadWave(w);
+        metal::CommandGraph stage;
+        addWave(stage, w);
+        (void)backend.submitCommandAsync(stage.dispatches()).wait();
+      }
+      ops::MoE::addCombine(g, moe, moePlan, /*addResidual=*/false);
+      totalSlices += static_cast<uint32_t>(waves.size());
+      return;
+    }
     // One pipelined submission, a stage per wave. Stage w starts once the
     // host has read wave w, which first waits for the last stage that read
     // the same staging half.
@@ -1418,7 +1461,7 @@ void Qwen4ExpTarget::addPrefill(
               {64, 1, 1}, {256, 1, 1});
     addHyperConnection(graph, geometry, X, head.attentionHyperConnection,
                        buffers.normalized, buffers.hyperReduced, buffers.hyperMixed,
-                       buffers.hyperInjection, m, 1);
+                       buffers.hyperInjection, m, 1, &operators);
     const auto &mixer = std::get<QwenAttentionWeights>(head.mixer);
     const ops::LinearMatrix attentionInput{geometry.packedAttentionWidth, hidden};
     operators.linear().addPrefillSums(graph, buffers.hyperMixed, buffers.projectionSums,

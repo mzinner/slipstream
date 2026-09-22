@@ -164,10 +164,13 @@ def quantized_tile(values, storage_n=STORAGE_N, group=GROUP, pad_to=None):
 # (reference_logits.py --quant: same top pick 81% -> 89% on the code prompt).
 # 0021-0025: the hyper-connection mix weights are 8-bit too (a byte each,
 # bf16 scale and bias per 64), halving the ~1.3 GB of them read every step.
-LAYER_MAGIC = b"MDFN0021"
-HEAD_MAGIC = b"MDFN0024"  # 8-bit logits, 4-bit draft copy, 8-bit mixer
+# 0031-0035: the mix weights use the matrix kernels' tiled 8-bit layout (down
+# padded to 512 outputs), so prompts can run them as matrix products.
+LAYER_MAGIC = b"MDFN0031"
+HEAD_MAGIC = b"MDFN0034"  # 8-bit logits, 4-bit draft copy, tiled 8-bit mixer
+HYPER_DOWN_PADDED = 512
 EMBEDDING_MAGIC = b"MDFN0013"
-OLD_LAYER_MAGIC = b"MDFN0011"
+OLD_LAYER_MAGIC = b"MDFN0021"
 NGRAM_MAGIC = b"MDFN0004"
 DRAFT_MAGIC = b"MDFD0004"
 VISION_MAGIC = b"MDFV0001"
@@ -218,11 +221,15 @@ def q8_bytes(out_size: int, in_size: int) -> int:
     return elements + 2 * (elements // GROUP) * BF16
 
 
-def hyper_sections(with_inject: bool, eight_bit: bool = True) -> list[tuple[int, str]]:
+def hyper_sections(with_inject: bool, form: str = "tiled") -> list[tuple[int, str]]:
+    """form: "tiled" (0031), "rows" (0021: row-major 8-bit), "bf16" (0011)."""
     width = hyper_width() * BF16
     mix = LAYOUT["hyper_low_rank"] * width
     out = [(width, "hyper-norm")]
-    if eight_bit:
+    if form == "tiled":
+        out += [(q8_bytes(HYPER_DOWN_PADDED, hyper_width()), "hyper-mix-down"),
+                (q8_bytes(hyper_width(), LAYOUT["hyper_low_rank"]), "hyper-mix-up")]
+    elif form == "rows":
         codes = mix // BF16
         parameters = codes // GROUP * BF16
         for name in ("down", "up"):
@@ -255,14 +262,14 @@ def expert_sections() -> list[tuple[int, str]]:
 
 def layer_sections(index: int, eight_bit: bool = True,
                    full: bool | None = None,
-                   hyper_eight_bit: bool = True) -> tuple[int, list[tuple[int, str]]]:
-    """Sections of a layer file: 0021 by default, 0011 with
-    hyper_eight_bit=False, 0001 with both False."""
+                   hyper_form: str = "tiled") -> tuple[int, list[tuple[int, str]]]:
+    """Sections of a layer file: 0031 by default; hyper_form "rows" is 0021,
+    "bf16" 0011 (and 0001 with eight_bit=False)."""
     hidden = LAYOUT["hidden"]
     if full is None:
         full = (index + 1) % LAYOUT["full_attention_period"] == 0
     mixer = q8_bytes if eight_bit else q4_bytes
-    entries = hyper_sections(True, hyper_eight_bit)
+    entries = hyper_sections(True, hyper_form)
     if full:
         entries += [
             (mixer(LAYOUT["packed_full"], hidden), "attention-input"),
@@ -282,7 +289,7 @@ def layer_sections(index: int, eight_bit: bool = True,
             (LAYOUT["head_dimension"] * BF16, "gdn-norm"),
             (mixer(hidden, LAYOUT["attention_width"]), "gdn-output"),
         ]
-    entries += hyper_sections(True, hyper_eight_bit) + expert_sections()
+    entries += hyper_sections(True, hyper_form) + expert_sections()
     return (1 if full else 0), entries
 
 
@@ -327,15 +334,12 @@ def ngram_sections() -> list[tuple[int, str]]:
 
 
 def write_hyper(packed, source: Checkpoint, prefix: str, with_inject: bool):
-    """Order matches readHyperConnection: norm, mix down and mix up (each as
-    8-bit codes then a bf16 scale and bias per 64, row-major), inject."""
+    """Order matches readHyperConnection: norm, mix down (its 320 outputs
+    padded to 512) and mix up in the tiled 8-bit layout, inject (bf16)."""
     packed.section(source.raw(prefix + ".hc_norm.weight"))
-    for name in ("input_mix_weight_down", "input_mix_weight_up"):
-        codes, scales, biases = quantize_affine(source.tensor(f"{prefix}.{name}.weight"),
-                                                group=GROUP, bits=8)
-        packed.section(codes.tobytes())
-        packed.section(scales.tobytes())
-        packed.section(biases.tobytes())
+    packed.section(quantized_q8_tile(source.tensor(prefix + ".input_mix_weight_down.weight"),
+                                     pad_to=HYPER_DOWN_PADDED))
+    packed.section(quantized_q8_tile(source.tensor(prefix + ".input_mix_weight_up.weight")))
     if with_inject:
         packed.section(source.raw(prefix + ".block_inject_weight.weight"))
 
@@ -483,14 +487,14 @@ def write_gdn(packed, source: Checkpoint, linear: str) -> None:
 
 def requantize_layer(source: Checkpoint, path: Path, index: int, prefix: str,
                      full: bool) -> int:
-    """Rewrite a 0011 layer file as 0021: both hyper-connections are
-    requantized from the checkpoint at 8 bits; the mixer and the experts are
-    copied byte for byte. Needs one layer file of spare disk."""
-    kind, old = layer_sections(index, full=full, hyper_eight_bit=False)
+    """Rewrite a 0021 layer file as 0031: both hyper-connections are
+    requantized from the checkpoint into the tiled layout; the mixer and the
+    experts are copied byte for byte. Needs one layer file of spare disk."""
+    kind, old = layer_sections(index, full=full, hyper_form="rows")
     magic, _, old_kind, sections = read_sections(path, [size for size, _ in old])
     if magic != OLD_LAYER_MAGIC or old_kind != kind:
         raise ValueError(f"{path.name}: expected a {OLD_LAYER_MAGIC!r} layer, found {magic!r}")
-    hyper = len(hyper_sections(True, False))
+    hyper = len(hyper_sections(True, "rows"))
     experts = len(expert_sections())
     mixer = sections[hyper:len(sections) - hyper - experts]
     temporary = path.with_suffix(".bin.partial")
@@ -583,7 +587,7 @@ def write_head(source: Checkpoint, destination: Path) -> int:
     return packed.finish()
 
 
-MTP_COMBINER_MAGIC = b"MDFN0025"
+MTP_COMBINER_MAGIC = b"MDFN0035"
 
 
 def write_mtp(source: Checkpoint, destination: Path) -> int:

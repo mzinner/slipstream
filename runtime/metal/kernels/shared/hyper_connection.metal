@@ -378,11 +378,15 @@ kernel void hyper_connection_down(
   const uint output = group * kSimdgroups + simd_group;
   const bool active = output < outputs;
   const bool is_inject = output >= params.low_rank;
-  // Low-rank rows are 8-bit (scale and bias per 64); the few inject rows
-  // stay bf16. The branch is uniform across a simdgroup (one output each).
+  // Low-rank rows are 8-bit in the matrix kernels' tiled layout - codes as
+  // [256-row tile][group of 64 inputs][row][64], a scale and bias per (tile,
+  // group, row) - so prompts can run them as a matrix product; the few inject
+  // rows stay bf16. The branch is uniform across a simdgroup (one output each).
   device const bfloat *w = inject + ulong(active && is_inject ? output - params.low_rank : 0) * width;
-  const ulong row_codes = ulong(active && !is_inject ? output : 0) * width;
-  const ulong row_groups = row_codes / 64;
+  const uint down_row = active && !is_inject ? output : 0;
+  const uint down_groups = width / 64;
+  const ulong tile_base = ulong(down_row >> 8) * down_groups;  // (tile, group 0)
+  const uint tile_row = down_row & 255u;
   threadgroup float4 staged[kRowBlock][kDownSlice / 4];
   for (uint first = 0; first < params.rows; first += kRowBlock) {
     const uint count = min(kRowBlock, params.rows - first);
@@ -406,10 +410,13 @@ kernel void hyper_connection_down(
             acc[r] += dot(wv, staged[r][i]);
         }
       } else if (active) {
-        device const uchar4 *c4 = reinterpret_cast<device const uchar4 *>(down + row_codes + slice);
         for (uint i = simd_lane; i < kDownSlice / 4; i += kSimdWidth) {
-          const ulong g = row_groups + (slice + 4 * i) / 64;
-          const float4 wv = float4(c4[i]) * float(down_scales[g]) + float(down_biases[g]);
+          const uint k = slice + 4 * i;
+          const ulong parameter = (tile_base + k / 64) * 256 + tile_row;
+          const float4 wv = float4(*reinterpret_cast<device const uchar4 *>(
+                                down + parameter * 64 + k % 64)) *
+                                float(down_scales[parameter]) +
+                            float(down_biases[parameter]);
           for (uint r = 0; r < kRowBlock; ++r)
             acc[r] += dot(wv, staged[r][i]);
         }
@@ -480,15 +487,17 @@ kernel void hyper_connection_up_mix(
   threadgroup float staged[kRowBlock][kLowRank];
   // This lane's slice of the position's four up rows.
   float w[kStreams][kPerLane];
+  // Tiled like the down projection: 256-row tiles, 5 groups of 64 inputs.
   for (uint k = 0; k < kStreams; ++k) {
-    const ulong row = ulong(k * hidden + position);
-    device const uchar2 *codes2 = reinterpret_cast<device const uchar2 *>(
-        up + row * kLowRank + simd_lane * kPerLane);
+    const uint row = k * hidden + position;
+    const ulong tile_base = ulong(row >> 8) * (kLowRank / 64);
     for (uint j = 0; j < kPerLane / 2; ++j) {
-      const float2 v = float2(codes2[j]);
       // The pair never straddles a group: 64 and the lane's 10 are even.
-      const ulong g = row * (kLowRank / 64) + (simd_lane * kPerLane + 2 * j) / 64;
-      const float scale = float(up_scales[g]), bias = float(up_biases[g]);
+      const uint input = simd_lane * kPerLane + 2 * j;
+      const ulong parameter = (tile_base + input / 64) * 256 + (row & 255u);
+      const float2 v = float2(*reinterpret_cast<device const uchar2 *>(
+          up + parameter * 64 + input % 64));
+      const float scale = float(up_scales[parameter]), bias = float(up_biases[parameter]);
       w[k][2 * j] = v.x * scale + bias;
       w[k][2 * j + 1] = v.y * scale + bias;
     }
@@ -516,4 +525,80 @@ kernel void hyper_connection_up_mix(
         mixed[hc_row(params, first + r) * hidden + position] = bfloat(mean / float(params.count));
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Prompt path. With thousands of rows the down and up projections run as
+// matrix products (prefill_linear_q8 over the tiled weights); these kernels
+// finish around them. Rows here are physical (row_step 1).
+// ---------------------------------------------------------------------------
+
+// reduced = silu(raw / count) from the down product, whose rows are padded to
+// kDownPadded outputs (kHyperDownPadded on the host). One thread per (row,
+// low-rank output).
+constant constexpr uint kDownPadded = 512;
+kernel void hyper_connection_prompt_reduce(
+    device const bfloat *raw [[buffer(0)]],
+    device bfloat *reduced [[buffer(1)]],
+    constant HyperConnectionParams &params [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+  const uint padded = kDownPadded;
+  if (index >= params.rows * params.low_rank)
+    return;
+  const uint row = index / params.low_rank, output = index % params.low_rank;
+  reduced[ulong(row) * params.low_rank + output] = bfloat(hc_down_activation(
+      float(raw[ulong(row) * padded + output]), false, params.count));
+}
+
+// injection = 2 sigmoid(inject . xn / count). One threadgroup per (row, stream).
+kernel void hyper_connection_prompt_inject(
+    device const bfloat *normalized [[buffer(0)]],
+    device const bfloat *inject [[buffer(1)]],
+    device bfloat *injection [[buffer(2)]],
+    constant HyperConnectionParams &params [[buffer(3)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  const uint row = group.x, stream = group.y;
+  if (row >= params.rows || stream >= params.count)
+    return;
+  const uint width = params.count * params.hidden;
+  device const bfloat4 *x4 = reinterpret_cast<device const bfloat4 *>(normalized + ulong(row) * width);
+  device const bfloat4 *w4 = reinterpret_cast<device const bfloat4 *>(inject + ulong(stream) * width);
+  float sum = 0.0f;
+  for (uint i = thread_index; i < width / 4; i += kThreads)
+    sum += dot(float4(x4[i]), float4(w4[i]));
+  threadgroup float partial[kSimdgroups];
+  sum = simd_sum(sum);
+  if (simd_lane == 0)
+    partial[simd_group] = sum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (thread_index == 0) {
+    float total = 0.0f;
+    for (uint s = 0; s < kSimdgroups; ++s)
+      total += partial[s];
+    injection[ulong(row) * params.count + stream] =
+        bfloat(hc_down_activation(total, true, params.count));
+  }
+}
+
+// mixed = mean over streams of sigmoid(up logit) * xn. One thread per
+// (row, hidden position).
+kernel void hyper_connection_prompt_mix(
+    device const bfloat *normalized [[buffer(0)]],
+    device const bfloat *logits [[buffer(1)]],
+    device bfloat *mixed [[buffer(2)]],
+    constant HyperConnectionParams &params [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+  if (index >= params.rows * params.hidden)
+    return;
+  const uint row = index / params.hidden, position = index % params.hidden;
+  const uint width = params.count * params.hidden;
+  float mean = 0.0f;
+  for (uint k = 0; k < params.count; ++k) {
+    const ulong at = ulong(row) * width + k * params.hidden + position;
+    mean += float(normalized[at]) / (1.0f + exp(-float(logits[at])));
+  }
+  mixed[ulong(row) * params.hidden + position] = bfloat(mean / float(params.count));
 }

@@ -13,7 +13,7 @@
 namespace splash::model {
 namespace {
 
-constexpr std::string_view kNextHeadMagic = "MDFN0024";  // 8-bit logits and mixer, 4-bit draft copy
+constexpr std::string_view kNextHeadMagic = "MDFN0034";  // 8-bit logits and tiled mixer, 4-bit draft copy
 constexpr std::string_view kNextEmbeddingMagic = "MDFN0013";  // 8-bit rows
 constexpr std::string_view kNextNgramMagic = "MDFN0004";
 
@@ -75,26 +75,20 @@ void requireLayout(const Qwen4ExpLayout &layout) {
 }
 
 Qwen4ExpHyperConnection readHyperConnection(WeightFile &file,
+                                            metal::MetalBackend &backend,
                                             const Qwen4ExpLayout &layout,
                                             std::string_view label,
                                             bool withInject) {
   const uint64_t width =
       checkedWeightMultiply(layout.hyperConnectionWidth(), kBFloat16Bytes,
                             "hyper-connection width bytes");
-  const uint64_t mix =
-      checkedWeightMultiply(layout.hyperConnectionLowRank, width,
-                            "hyper-connection mix bytes");
   const std::string prefix(label);
-  const uint64_t codes = mix / kBFloat16Bytes;
-  const uint64_t parameters = codes / 64 * kBFloat16Bytes;
   Qwen4ExpHyperConnection result;
   result.norm = file.section(width, prefix + "-norm");
-  result.mixDown = file.section(codes, prefix + "-mix-down");
-  result.mixDownScales = file.section(parameters, prefix + "-mix-down-scales");
-  result.mixDownBiases = file.section(parameters, prefix + "-mix-down-biases");
-  result.mixUp = file.section(codes, prefix + "-mix-up");
-  result.mixUpScales = file.section(parameters, prefix + "-mix-up-scales");
-  result.mixUpBiases = file.section(parameters, prefix + "-mix-up-biases");
+  result.mixDown = readQ8Projection(file, backend, kHyperDownPadded,
+                                    layout.hyperConnectionWidth(), prefix + "-mix-down");
+  result.mixUp = readQ8Projection(file, backend, layout.hyperConnectionWidth(),
+                                  layout.hyperConnectionLowRank, prefix + "-mix-up");
   if (withInject) {
     result.blockInject =
         file.section(checkedWeightMultiply(layout.hyperConnectionCount, width,
@@ -184,12 +178,8 @@ ops::ExpertQ4Projection detachExpert(metal::MetalBackend &backend, const ops::Ex
 [[maybe_unused]] void detachStreamingLayer(metal::MetalBackend &backend, Qwen4ExpLayerWeights &layer) {
   // 1. Attention Hyper-connection
   layer.attentionHyperConnection.norm = detachBuffer(backend, layer.attentionHyperConnection.norm, "att-norm");
-  layer.attentionHyperConnection.mixDown = detachBuffer(backend, layer.attentionHyperConnection.mixDown, "att-down");
-  layer.attentionHyperConnection.mixDownScales = detachBuffer(backend, layer.attentionHyperConnection.mixDownScales, "att-down-s");
-  layer.attentionHyperConnection.mixDownBiases = detachBuffer(backend, layer.attentionHyperConnection.mixDownBiases, "att-down-b");
-  layer.attentionHyperConnection.mixUp = detachBuffer(backend, layer.attentionHyperConnection.mixUp, "att-up");
-  layer.attentionHyperConnection.mixUpScales = detachBuffer(backend, layer.attentionHyperConnection.mixUpScales, "att-up-s");
-  layer.attentionHyperConnection.mixUpBiases = detachBuffer(backend, layer.attentionHyperConnection.mixUpBiases, "att-up-b");
+  layer.attentionHyperConnection.mixDown = detachQ8(backend, layer.attentionHyperConnection.mixDown, "att-down");
+  layer.attentionHyperConnection.mixUp = detachQ8(backend, layer.attentionHyperConnection.mixUp, "att-up");
   if (layer.attentionHyperConnection.blockInject) {
     layer.attentionHyperConnection.blockInject = detachBuffer(backend, *layer.attentionHyperConnection.blockInject, "att-inject");
   }
@@ -220,12 +210,8 @@ ops::ExpertQ4Projection detachExpert(metal::MetalBackend &backend, const ops::Ex
 
   // 4. MLP Hyper-connection
   layer.mlpHyperConnection.norm = detachBuffer(backend, layer.mlpHyperConnection.norm, "mlp-norm");
-  layer.mlpHyperConnection.mixDown = detachBuffer(backend, layer.mlpHyperConnection.mixDown, "mlp-down");
-  layer.mlpHyperConnection.mixDownScales = detachBuffer(backend, layer.mlpHyperConnection.mixDownScales, "mlp-down-s");
-  layer.mlpHyperConnection.mixDownBiases = detachBuffer(backend, layer.mlpHyperConnection.mixDownBiases, "mlp-down-b");
-  layer.mlpHyperConnection.mixUp = detachBuffer(backend, layer.mlpHyperConnection.mixUp, "mlp-up");
-  layer.mlpHyperConnection.mixUpScales = detachBuffer(backend, layer.mlpHyperConnection.mixUpScales, "mlp-up-s");
-  layer.mlpHyperConnection.mixUpBiases = detachBuffer(backend, layer.mlpHyperConnection.mixUpBiases, "mlp-up-b");
+  layer.mlpHyperConnection.mixDown = detachQ8(backend, layer.mlpHyperConnection.mixDown, "mlp-down");
+  layer.mlpHyperConnection.mixUp = detachQ8(backend, layer.mlpHyperConnection.mixUp, "mlp-up");
   if (layer.mlpHyperConnection.blockInject) {
     layer.mlpHyperConnection.blockInject = detachBuffer(backend, *layer.mlpHyperConnection.blockInject, "mlp-inject");
   }
@@ -278,12 +264,12 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     }
     Qwen4ExpLayerWeights layer;
     layer.attentionHyperConnection =
-        readHyperConnection(file, layout, "attention-hyper", true);
+        readHyperConnection(file, backend, layout, "attention-hyper", true);
     layer.mixer =
         readQwenMixer(file, backend, layout.mixerGeometry(), fullAttention,
                       /*eightBit=*/true);
     if (fullAttention) layer.indexer = readIndexer(file, backend, layout);
-    layer.mlpHyperConnection = readHyperConnection(file, layout, "mlp-hyper", true);
+    layer.mlpHyperConnection = readHyperConnection(file, backend, layout, "mlp-hyper", true);
     readExperts(file, backend, layout, layer.ffn);
     if (layerIndex >= residentLayers) {
       const uint8_t *base = file.mappedBase();
@@ -317,7 +303,7 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
       std::filesystem::exists(directory / "mtp-combiner.bin")) {
     result.mtpLayer = readLayer("mtp-layer.bin", layout.layers, true);
     WeightFile file(backend, directory / "mtp-combiner.bin",
-                    "target/mtp-combiner.bin", "MDFN0025", layout.layers, 3);
+                    "target/mtp-combiner.bin", "MDFN0035", layout.layers, 3);
     Qwen4ExpMtpCombiner combiner;
     const uint64_t hidden = uint64_t{layout.hiddenSize} * kBFloat16Bytes;
     combiner.embeddingNorm = detachBuffer(
@@ -333,14 +319,10 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
         backend, readQ4Projection(file, backend, layout.hiddenSize,
                                   layout.hiddenSize, "mtp-fc-hidden"),
         "mtp-fc-hidden");
-    combiner.mixer = readHyperConnection(file, layout, "mtp-mixer", false);
+    combiner.mixer = readHyperConnection(file, backend, layout, "mtp-mixer", false);
     combiner.mixer.norm = detachBuffer(backend, combiner.mixer.norm, "mtp-mix-norm");
-    combiner.mixer.mixDown = detachBuffer(backend, combiner.mixer.mixDown, "mtp-mix-down");
-    combiner.mixer.mixDownScales = detachBuffer(backend, combiner.mixer.mixDownScales, "mtp-mix-down-s");
-    combiner.mixer.mixDownBiases = detachBuffer(backend, combiner.mixer.mixDownBiases, "mtp-mix-down-b");
-    combiner.mixer.mixUp = detachBuffer(backend, combiner.mixer.mixUp, "mtp-mix-up");
-    combiner.mixer.mixUpScales = detachBuffer(backend, combiner.mixer.mixUpScales, "mtp-mix-up-s");
-    combiner.mixer.mixUpBiases = detachBuffer(backend, combiner.mixer.mixUpBiases, "mtp-mix-up-b");
+    combiner.mixer.mixDown = detachQ8(backend, combiner.mixer.mixDown, "mtp-mix-down");
+    combiner.mixer.mixUp = detachQ8(backend, combiner.mixer.mixUp, "mtp-mix-up");
     file.finish();
     result.files.push_back(file.record());
     result.mtpCombiner = std::move(combiner);
@@ -353,7 +335,7 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     file.advise(MemoryAdvice::WillNeed);
     file.prefetch(false);
     result.hyperConnectionMixer =
-        readHyperConnection(file, layout, "hyper-mixer", false);
+        readHyperConnection(file, backend, layout, "hyper-mixer", false);
     result.finalNorm = file.section(
         checkedWeightMultiply(layout.hiddenSize, kBFloat16Bytes,
                               "qwen4exp norm bytes"),
@@ -450,17 +432,34 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
         uint64_t{kHyperDownSplits} * kHyperDownSplitRows *
             (layout.hyperConnectionLowRank + layout.hyperConnectionCount) * sizeof(float),
         metal::BufferStorage::Private, "qwen4exp-hyper-partials");
+    // Prompt-path scratch: rows padded to whole 32-row tiles.
+    const uint64_t rows = (ExecutionLimits::prefillTokenBudget + 31) / 32 * 32;
+    const uint64_t width = layout.hyperConnectionWidth();
+    const metal::MetalBuffer sums = backend.allocateBuffer(
+        rows * (width / 64) * sizeof(float), metal::BufferStorage::Private,
+        "qwen4exp-hyper-prompt-sums");
+    const metal::MetalBuffer down = backend.allocateBuffer(
+        rows * kHyperDownPadded * 2, metal::BufferStorage::Private,
+        "qwen4exp-hyper-prompt-down");
+    const metal::MetalBuffer logits = backend.allocateBuffer(
+        rows * width * 2, metal::BufferStorage::Private, "qwen4exp-hyper-prompt-logits");
+    auto share = [&](Qwen4ExpHyperConnection &hc) {
+      hc.downPartials = partials;
+      hc.promptSums = sums;
+      hc.promptDown = down;
+      hc.promptLogits = logits;
+    };
     for (auto &layer : result.layers) {
-      layer.attentionHyperConnection.downPartials = partials;
-      layer.mlpHyperConnection.downPartials = partials;
+      share(layer.attentionHyperConnection);
+      share(layer.mlpHyperConnection);
     }
     if (result.mtpLayer) {
-      result.mtpLayer->attentionHyperConnection.downPartials = partials;
-      result.mtpLayer->mlpHyperConnection.downPartials = partials;
+      share(result.mtpLayer->attentionHyperConnection);
+      share(result.mtpLayer->mlpHyperConnection);
     }
     if (result.mtpCombiner)
-      result.mtpCombiner->mixer.downPartials = partials;
-    result.hyperConnectionMixer.downPartials = partials;
+      share(result.mtpCombiner->mixer);
+    share(result.hyperConnectionMixer);
   }
   result.lastSelectedExperts.resize(layout.layers);
   if (residentLayers < layout.layers) {

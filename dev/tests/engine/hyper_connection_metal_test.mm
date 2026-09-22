@@ -69,35 +69,40 @@ uint16_t *hostOf(MetalBuffer &buffer) {
   return static_cast<uint16_t *>(buffer.contents());
 }
 
-// The package's 8-bit mix weights: per 64 along a row, a bf16 bias at the
-// larger-magnitude end and a bf16 scale, codes 0..255 (tools/quantize.py).
-// `dequantized` gets the exact values the kernels compute with.
+// The package's 8-bit mix weights, in the matrix kernels' tiled layout: rows
+// padded to a multiple of 256, codes as [256-row tile][group of 64][row][64],
+// and per (tile, group, row) a bf16 bias (the group minimum) and scale
+// (range / 255), as convert_qwen4exp.quantized_q8_tile writes them.
+// `dequantized` (unpadded, row-major) gets the exact values the kernels use.
 struct Quantized {
   std::vector<uint8_t> codes;
   std::vector<uint16_t> scales, biases;
   std::vector<float> dequantized;
 };
 Quantized quantize8(const std::vector<uint16_t> &values, size_t rows, size_t columns) {
+  const size_t padded = (rows + 255) / 256 * 256, groups = columns / 64;
   Quantized q;
-  q.codes.resize(rows * columns);
+  q.codes.assign(padded * columns, 0);
+  q.scales.assign(padded * groups, toBf16(1.0f));
+  q.biases.assign(padded * groups, 0);
   q.dequantized.resize(rows * columns);
   for (size_t row = 0; row < rows; ++row)
-    for (size_t group = 0; group < columns / 64; ++group) {
+    for (size_t group = 0; group < groups; ++group) {
       const size_t first = row * columns + group * 64;
       float low = INFINITY, high = -INFINITY;
       for (size_t i = 0; i < 64; ++i) {
         low = std::min(low, fromBf16(values[first + i]));
         high = std::max(high, fromBf16(values[first + i]));
       }
-      const bool anchorLow = std::fabs(low) > std::fabs(high);
-      const float bias = fromBf16(toBf16(anchorLow ? low : high));
-      const float scale = fromBf16(toBf16(((anchorLow ? high : low) - (anchorLow ? low : high)) / 255.0f));
-      q.scales.push_back(toBf16(scale));
-      q.biases.push_back(toBf16(bias));
+      const float scale = fromBf16(toBf16(high > low ? (high - low) / 255.0f : 1.0f));
+      const float bias = fromBf16(toBf16(low));
+      const size_t parameter = ((row / 256) * groups + group) * 256 + row % 256;
+      q.scales[parameter] = toBf16(scale);
+      q.biases[parameter] = toBf16(bias);
       for (size_t i = 0; i < 64; ++i) {
-        const float code = scale == 0.0f ? 0.0f
-            : std::clamp(std::nearbyint((fromBf16(values[first + i]) - bias) / scale), 0.0f, 255.0f);
-        q.codes[first + i] = static_cast<uint8_t>(code);
+        const float code = std::clamp(
+            std::nearbyint((fromBf16(values[first + i]) - bias) / scale), 0.0f, 255.0f);
+        q.codes[parameter * 64 + i] = static_cast<uint8_t>(code);
         q.dequantized[first + i] = code * scale + bias;
       }
     }
