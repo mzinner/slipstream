@@ -1,5 +1,20 @@
 # Journal — qwen4exp port
 
+## 2026-09-22 — claude-code
+
+Redesign pass, per the profile (artifact: https://claude.ai/artifact/PB7F2nj2KRtST91NfMGoEQ). Decode went from ~2.5 to 31-44 tok/s at llama.cpp's 36 GiB budget; llama.cpp V3 does 23-25 on the same prompts.
+
+In order, each measured before the next:
+- Hyper-connection kernels rewritten weight-stationary (224 -> 25 ms/step). Removed Gemini's blanket read-ahead of the previous step's experts, which after any prompt made the OS read ~68 GB in the background (steps stalled 1.6 s).
+- Expert misses read with parallel pread, F_NOCACHE, into a pinned (mlock) cache sized like llama.cpp's (36 GiB = 291/layer). Unpinned, macOS compressed it and a 36 GiB cache stalled for minutes.
+- Decode pipelined: all 48 layer stages committed at once, gated by a shared event the host raises after staging each layer's experts; host polls. Lookahead predicts the next layer's experts from the current state. Host does expert selection and grouping (the GPU stage stops at router scores).
+- Hyper-connections on live rows only. Frequency-first eviction.
+- MTP draft head (the model's own): converted (--mtp-only), loaded, 13th KV layer, prefill fills its KV, 3 guesses per step, greedy identical output, sampled via the head's own distribution. Stops guessing under p 0.3.
+- Expert caches kept resident via a Metal residency set (first step 0.8 -> 0.4 s).
+
+Dead ends (recorded in code comments): 256-slot unpinned cache, split miss reads, lookahead of 14, file-cached expert reads.
+Trap: kernel-skip ablation misleads when downstream work depends on the skipped kernel's output (grouping).
+
 ## 2026-09-21 21:30 PDT — claude-code
 
 Reviewed Gemini/antigravity's work, measured it honestly, and fixed what the measurements found.

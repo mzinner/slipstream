@@ -184,8 +184,9 @@ void ngramGeometryIsPinned() {
 void stateLayoutsAreConsistent() {
   constexpr Qwen4ExpLayout layout;
   const auto kv = layout.q8Layout();
-  require(kv.attentionLayers == 12,
-          "KV cache covers only the attention layers");
+  // The trunk's 12 attention layers, and one for the MTP draft head.
+  require(kv.attentionLayers == 12 + layout.mtpLayers && layout.mtpLayers == 1,
+          "KV cache covers the attention layers and the MTP head");
   require(kv.kvHeads == layout.attentionKvHeads, "KV heads mismatch");
   require(kv.headDimension == layout.attentionHeadDimension,
           "KV head dimension mismatch");
