@@ -212,6 +212,35 @@ void logRoutes(char phase, uint32_t layer, const uint32_t *selected,
   }
 }
 
+// The hyper-connection mix in front of a block: normalize the streams, reduce
+// them (and compute the injection gates), then mix them into the block input.
+// Weight-stationary kernels: each weight is read once for all rows.
+void addHyperConnection(metal::CommandGraph &graph,
+                        const QwenTargetGeometry &geometry,
+                        metal::MetalBuffer input,
+                        const Qwen4ExpHyperConnection &weights,
+                        metal::MetalBuffer normalized,
+                        metal::MetalBuffer reduced, metal::MetalBuffer mixed,
+                        metal::MetalBuffer injection, uint32_t rows) {
+  const bool withInject = weights.blockInject.has_value();
+  const HyperConnectionParams params{
+      rows, geometry.hiddenSize, geometry.hyperConnectionCount,
+      geometry.hyperConnectionLowRank, 1e-6f, withInject ? 1u : 0u};
+  graph.add("hyper_connection_rms", {std::move(input), weights.norm, normalized},
+            params, {rows, geometry.hyperConnectionCount, 1}, {256, 1, 1});
+  const uint32_t outputs = geometry.hyperConnectionLowRank +
+                           (withInject ? geometry.hyperConnectionCount : 0);
+  graph.add("hyper_connection_down",
+            {normalized, weights.mixDown,
+             withInject ? *weights.blockInject : weights.mixDown, reduced,
+             withInject ? std::move(injection) : reduced},
+            params, {(outputs + 7) / 8, 1, 1}, {256, 1, 1});
+  graph.add("hyper_connection_up_mix",
+            {std::move(normalized), std::move(reduced), weights.mixUp,
+             std::move(mixed)},
+            params, {geometry.hiddenSize / 8, 1, 1}, {256, 1, 1});
+}
+
 // One sequence's gate, convolution and residual update. `normalized` holds
 // this sequence's history rows followed by its current rows.
 void addPleApply(const Qwen4ExpWeights &weights, metal::MetalBackend &backend,
@@ -295,7 +324,7 @@ void Qwen4ExpTarget::addEmbedding(
   // 2. Broadcast across hyperConnectionCount streams
   const HyperConnectionParams params{
       rows, geometry.hiddenSize, geometry.hyperConnectionCount,
-      geometry.hyperConnectionLowRank, 1e-6f};
+      geometry.hyperConnectionLowRank, 1e-6f, 1};
   const uint32_t total = rows * geometry.residualWidth();
   const uint32_t groups = (total + 255) / 256;
   graph.add("hyper_connection_broadcast",
@@ -318,21 +347,10 @@ void Qwen4ExpTarget::addHead(
       normalizedRows > ExecutionLimits::targetVerifyRows) {
     throw std::invalid_argument("invalid Qwen head row count");
   }
-  const HyperConnectionParams params{
-      normalizedRows, geometry.hiddenSize, geometry.hyperConnectionCount,
-      geometry.hyperConnectionLowRank, 1e-6f};
-
-  // 1. Normalize residual -> normalized, reduced
-  graph.add("hyper_connection_normalize",
-            {std::move(hidden), weights.hyperConnectionMixer.norm,
-             weights.hyperConnectionMixer.mixDown, headNormalized, headReduced},
-            params, {normalizedRows, 1, 1}, {256, 1, 1});
-
-  // 2. Mix without injection -> finalHidden
-  graph.add("hyper_connection_mix_no_inject",
-            {std::move(headNormalized), std::move(headReduced),
-             weights.hyperConnectionMixer.mixUp, finalHidden},
-            params, {normalizedRows, 1, 1}, {256, 1, 1});
+  // Collapse the streams: the final mixer has no injection gates.
+  addHyperConnection(graph, geometry, std::move(hidden),
+                     weights.hyperConnectionMixer, headNormalized, headReduced,
+                     finalHidden, {}, normalizedRows);
 
   // 3. Project finalHidden -> logits
   const ops::LinearMatrix head{geometry.vocabularySize, geometry.hiddenSize};
@@ -387,7 +405,7 @@ void Qwen4ExpTarget::addPrefill(
 
   const HyperConnectionParams hcParams{
       rows, geometry.hiddenSize, geometry.hyperConnectionCount,
-      geometry.hyperConnectionLowRank, 1e-6f};
+      geometry.hyperConnectionLowRank, 1e-6f, 1};
 
   uint32_t gdnIndex = 0;
   uint32_t attentionIndex = 0;
@@ -448,17 +466,9 @@ void Qwen4ExpTarget::addPrefill(
       encodePerLayerEmbedding(g, layerIndex, priorWorkComplete);
     const auto &layer = weights.layers[layerIndex];
     metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
-    g.add("hyper_connection_normalize",
-          {input, layer.attentionHyperConnection.norm,
-           layer.attentionHyperConnection.mixDown, buffers.normalized,
-           buffers.hyperReduced},
-          hcParams, {rows, 1, 1}, {256, 1, 1});
-    g.add("hyper_connection_mix",
-          {buffers.normalized, buffers.hyperReduced,
-           layer.attentionHyperConnection.mixUp,
-           *layer.attentionHyperConnection.blockInject,
-           buffers.hyperMixed, buffers.hyperInjection},
-          hcParams, {rows, 1, 1}, {256, 1, 1});
+    addHyperConnection(g, geometry, input, layer.attentionHyperConnection,
+                       buffers.normalized, buffers.hyperReduced,
+                       buffers.hyperMixed, buffers.hyperInjection, rows);
   };
 
   auto encodeMixer = [&](metal::CommandGraph &g, uint32_t layerIndex,
@@ -587,17 +597,9 @@ void Qwen4ExpTarget::addPrefill(
   auto encodeMlpHC = [&](metal::CommandGraph &g, uint32_t layerIndex) {
     const auto &layer = weights.layers[layerIndex];
     metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
-    g.add("hyper_connection_normalize",
-          {input, layer.mlpHyperConnection.norm,
-           layer.mlpHyperConnection.mixDown, buffers.normalized,
-           buffers.hyperReduced},
-          hcParams, {rows, 1, 1}, {256, 1, 1});
-    g.add("hyper_connection_mix",
-          {buffers.normalized, buffers.hyperReduced,
-           layer.mlpHyperConnection.mixUp,
-           *layer.mlpHyperConnection.blockInject,
-           buffers.hyperMixed, buffers.hyperInjection},
-          hcParams, {rows, 1, 1}, {256, 1, 1});
+    addHyperConnection(g, geometry, input, layer.mlpHyperConnection,
+                       buffers.normalized, buffers.hyperReduced,
+                       buffers.hyperMixed, buffers.hyperInjection, rows);
   };
 
   auto encodeMoERoute = [&](metal::CommandGraph &g, uint32_t layerIndex) {
@@ -864,7 +866,9 @@ void Qwen4ExpTarget::addPrefill(
   // Submit residentGraph and prefetch streaming experts in background
   auto t0 = std::chrono::steady_clock::now();
   metal::CommandTicket residentTicket = backend.submitCommandAsync(residentGraph.dispatches());
-  weights.prefetchStreamingExperts();
+  // No blanket read-ahead of the previous step's experts: after a long
+  // prompt that is nearly every expert, ~68 GB the OS then reads in the
+  // background for minutes, stalling decode. Misses are fetched on demand.
   (void)residentTicket.wait();
   auto t1 = std::chrono::steady_clock::now();
   double residentMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -966,7 +970,7 @@ void Qwen4ExpTarget::addVerify(
 
   const HyperConnectionParams hcParams{
       rows, geometry.hiddenSize, geometry.hyperConnectionCount,
-      geometry.hyperConnectionLowRank, 1e-6f};
+      geometry.hyperConnectionLowRank, 1e-6f, 1};
 
   uint32_t gdnIndex = 0;
   uint32_t attentionIndex = 0;
@@ -1012,17 +1016,9 @@ void Qwen4ExpTarget::addVerify(
       encodePerLayerEmbedding(g, layerIndex, priorWorkComplete);
     const auto &layer = weights.layers[layerIndex];
     metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
-    g.add("hyper_connection_normalize",
-          {input, layer.attentionHyperConnection.norm,
-           layer.attentionHyperConnection.mixDown, buffers.normalized,
-           buffers.hyperReduced},
-          hcParams, {rows, 1, 1}, {256, 1, 1});
-    g.add("hyper_connection_mix",
-          {buffers.normalized, buffers.hyperReduced,
-           layer.attentionHyperConnection.mixUp,
-           *layer.attentionHyperConnection.blockInject,
-           buffers.hyperMixed, buffers.hyperInjection},
-          hcParams, {rows, 1, 1}, {256, 1, 1});
+    addHyperConnection(g, geometry, input, layer.attentionHyperConnection,
+                       buffers.normalized, buffers.hyperReduced,
+                       buffers.hyperMixed, buffers.hyperInjection, rows);
   };
 
   auto encodeMixer = [&](metal::CommandGraph &g, uint32_t layerIndex,
@@ -1096,17 +1092,9 @@ void Qwen4ExpTarget::addVerify(
   auto encodeMlpHC = [&](metal::CommandGraph &g, uint32_t layerIndex) {
     const auto &layer = weights.layers[layerIndex];
     metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
-    g.add("hyper_connection_normalize",
-          {input, layer.mlpHyperConnection.norm,
-           layer.mlpHyperConnection.mixDown, buffers.normalized,
-           buffers.hyperReduced},
-          hcParams, {rows, 1, 1}, {256, 1, 1});
-    g.add("hyper_connection_mix",
-          {buffers.normalized, buffers.hyperReduced,
-           layer.mlpHyperConnection.mixUp,
-           *layer.mlpHyperConnection.blockInject,
-           buffers.hyperMixed, buffers.hyperInjection},
-          hcParams, {rows, 1, 1}, {256, 1, 1});
+    addHyperConnection(g, geometry, input, layer.mlpHyperConnection,
+                       buffers.normalized, buffers.hyperReduced,
+                       buffers.hyperMixed, buffers.hyperInjection, rows);
   };
 
   auto encodeMoERoute = [&](metal::CommandGraph &g, uint32_t layerIndex) {
@@ -1153,16 +1141,9 @@ void Qwen4ExpTarget::addVerify(
   };
 
   auto encodeHead = [&](metal::CommandGraph &g) {
-    g.add("hyper_connection_normalize",
-          {buffers.hidden[geometry.layers & 1],
-           weights.hyperConnectionMixer.norm,
-           weights.hyperConnectionMixer.mixDown, buffers.normalized,
-           buffers.hyperReduced},
-          hcParams, {rows, 1, 1}, {256, 1, 1});
-    g.add("hyper_connection_mix_no_inject",
-          {buffers.normalized, buffers.hyperReduced,
-           weights.hyperConnectionMixer.mixUp, buffers.finalHidden},
-          hcParams, {rows, 1, 1}, {256, 1, 1});
+    addHyperConnection(g, geometry, buffers.hidden[geometry.layers & 1],
+                       weights.hyperConnectionMixer, buffers.normalized,
+                       buffers.hyperReduced, buffers.finalHidden, {}, rows);
     const ops::LinearMatrix head{geometry.vocabularySize, geometry.hiddenSize};
     operators.linear().addDecodeBatch(g, buffers.finalHidden,
                                       weights.logitsProjection, buffers.logits,
@@ -1388,7 +1369,9 @@ void Qwen4ExpTarget::addVerify(
   // Submit residentGraph and prefetch streaming experts in background
   auto t0 = std::chrono::steady_clock::now();
   metal::CommandTicket residentTicket = backend.submitCommandAsync(residentGraph.dispatches());
-  weights.prefetchStreamingExperts();
+  // No blanket read-ahead of the previous step's experts: after a long
+  // prompt that is nearly every expert, ~68 GB the OS then reads in the
+  // background for minutes, stalling decode. Misses are fetched on demand.
   (void)residentTicket.wait();
   auto t1 = std::chrono::steady_clock::now();
   double residentMs = std::chrono::duration<double, std::milli>(t1 - t0).count();

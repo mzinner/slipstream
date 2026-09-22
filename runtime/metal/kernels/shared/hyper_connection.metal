@@ -287,3 +287,173 @@ kernel void hyper_connection_accumulate(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Weight-stationary hyper-connection: the same math in three dispatches that
+// read each weight once for every row, instead of once per row.
+//
+// The per-row kernels above ran one threadgroup per row. With the 8 rows of a
+// decode step that kept 8 threadgroups busy on a GPU with far more cores, and
+// each re-read the whole 6.5 MB down and up matrices: about 2% of the
+// machine's bandwidth, and 75% of all decode GPU time. Here parallelism comes
+// from the outputs (324 down rows, 2560 mixed positions), and rows are
+// processed in blocks against weights already in registers.
+// ---------------------------------------------------------------------------
+
+constant constexpr uint kRowBlock = 8;
+
+// 1. xn = rms_per_stream(x) * (1 + gain). One threadgroup per (row, stream).
+kernel void hyper_connection_rms(
+    device const bfloat *input [[buffer(0)]],
+    device const bfloat *gain [[buffer(1)]],
+    device bfloat *normalized [[buffer(2)]],
+    constant HyperConnectionParams &params [[buffer(3)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  const uint row = group.x, stream = group.y;
+  if (row >= params.rows || stream >= params.count)
+    return;
+  const uint hidden = params.hidden, width = params.count * hidden;
+  const ulong base = ulong(row) * width + stream * hidden;
+  device const bfloat4 *x4 = reinterpret_cast<device const bfloat4 *>(input + base);
+  float sum = 0.0f;
+  for (uint i = thread_index; i < hidden / 4; i += kThreads) {
+    const float4 v = float4(x4[i]);
+    sum += dot(v, v);
+  }
+  threadgroup float partial[kSimdgroups];
+  sum = simd_sum(sum);
+  if (simd_lane == 0)
+    partial[simd_group] = sum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float total = 0.0f;
+  for (uint s = 0; s < kSimdgroups; ++s)
+    total += partial[s];
+  const float scale = rsqrt(total / float(hidden) + params.epsilon);
+  device const bfloat4 *g4 =
+      reinterpret_cast<device const bfloat4 *>(gain + stream * hidden);
+  device bfloat4 *out4 = reinterpret_cast<device bfloat4 *>(normalized + base);
+  for (uint i = thread_index; i < hidden / 4; i += kThreads)
+    out4[i] = bfloat4(float4(x4[i]) * scale * (1.0f + float4(g4[i])));
+}
+
+// 2. reduced = silu(down . xn / count), injection = 2 sigmoid(inject . xn / count).
+// A threadgroup owns 8 outputs (one per simdgroup) for up to 8 rows. The
+// rows' normalized input is staged in threadgroup memory a slice at a time,
+// so it is read from device memory once per threadgroup rather than once
+// per output, and each weight element is read exactly once.
+constant constexpr uint kDownSlice = 512;
+kernel void hyper_connection_down(
+    device const bfloat *normalized [[buffer(0)]],
+    device const bfloat *down [[buffer(1)]],
+    device const bfloat *inject [[buffer(2)]],
+    device bfloat *reduced [[buffer(3)]],
+    device bfloat *injection [[buffer(4)]],
+    constant HyperConnectionParams &params [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  const uint width = params.count * params.hidden;
+  const uint outputs = params.low_rank + (params.with_inject ? params.count : 0);
+  const uint output = group * kSimdgroups + simd_group;
+  const bool active = output < outputs;
+  const bool is_inject = output >= params.low_rank;
+  device const bfloat *w = active ? (is_inject ? inject + ulong(output - params.low_rank) * width
+                                               : down + ulong(output) * width)
+                                  : down;
+  threadgroup float4 staged[kRowBlock][kDownSlice / 4];
+  for (uint first = 0; first < params.rows; first += kRowBlock) {
+    const uint count = min(kRowBlock, params.rows - first);
+    float acc[kRowBlock] = {0};
+    for (uint slice = 0; slice < width; slice += kDownSlice) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint e = thread_index; e < kRowBlock * kDownSlice / 4; e += kThreads) {
+        const uint r = e / (kDownSlice / 4), c = e % (kDownSlice / 4);
+        staged[r][c] = r < count
+            ? float4(reinterpret_cast<device const bfloat4 *>(
+                  normalized + ulong(first + r) * width + slice)[c])
+            : float4(0);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (active) {
+        device const bfloat4 *w4 = reinterpret_cast<device const bfloat4 *>(w + slice);
+        for (uint i = simd_lane; i < kDownSlice / 4; i += kSimdWidth) {
+          const float4 wv = float4(w4[i]);
+          for (uint r = 0; r < kRowBlock; ++r)
+            acc[r] += dot(wv, staged[r][i]);
+        }
+      }
+    }
+    for (uint r = 0; r < kRowBlock; ++r) {
+      const float total = simd_sum(acc[r]);
+      if (active && simd_lane == 0 && r < count) {
+        const float v = total / float(params.count);
+        if (is_inject)
+          injection[ulong(first + r) * params.count + (output - params.low_rank)] =
+              bfloat(2.0f / (1.0f + exp(-v)));
+        else
+          reduced[ulong(first + r) * params.low_rank + output] =
+              bfloat(v / (1.0f + exp(-v)));
+      }
+    }
+  }
+}
+
+// 3. mixed = mean over streams of sigmoid(up . reduced) * xn.
+// One simdgroup per hidden position: it owns that position's up row in each
+// of the 4 streams, splits the 320-long dot products across its 32 lanes
+// (10 each), and averages the streams itself. The rows' reduced vectors are
+// staged once per threadgroup.
+kernel void hyper_connection_up_mix(
+    device const bfloat *normalized [[buffer(0)]],
+    device const bfloat *reduced [[buffer(1)]],
+    device const bfloat *up [[buffer(2)]],
+    device bfloat *mixed [[buffer(3)]],
+    constant HyperConnectionParams &params [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint kLowRank = 320;
+  constexpr uint kPerLane = kLowRank / kSimdWidth;   // 10
+  constexpr uint kStreams = 4;
+  const uint hidden = params.hidden, width = params.count * hidden;
+  const uint position = group * kSimdgroups + simd_group;
+  threadgroup float staged[kRowBlock][kLowRank];
+  // This lane's slice of the position's four up rows.
+  float w[kStreams][kPerLane];
+  for (uint k = 0; k < kStreams; ++k) {
+    device const bfloat2 *row2 = reinterpret_cast<device const bfloat2 *>(
+        up + ulong(k * hidden + position) * kLowRank + simd_lane * kPerLane);
+    for (uint j = 0; j < kPerLane / 2; ++j) {
+      const float2 v = float2(row2[j]);
+      w[k][2 * j] = v.x;
+      w[k][2 * j + 1] = v.y;
+    }
+  }
+  for (uint first = 0; first < params.rows; first += kRowBlock) {
+    const uint count = min(kRowBlock, params.rows - first);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = thread_index; e < kRowBlock * kLowRank; e += kThreads) {
+      const uint r = e / kLowRank, c = e % kLowRank;
+      staged[r][c] = r < count ? float(reduced[ulong(first + r) * kLowRank + c]) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint r = 0; r < count; ++r) {
+      threadgroup const float *v = staged[r] + simd_lane * kPerLane;
+      float mean = 0.0f;
+      for (uint k = 0; k < kStreams; ++k) {
+        float sum = 0.0f;
+        for (uint j = 0; j < kPerLane; ++j)
+          sum += w[k][j] * v[j];
+        sum = simd_sum(sum);
+        const float gate = 1.0f / (1.0f + exp(-sum));
+        mean += gate * float(normalized[ulong(first + r) * width + k * hidden + position]);
+      }
+      if (simd_lane == 0)
+        mixed[ulong(first + r) * hidden + position] = bfloat(mean / float(params.count));
+    }
+  }
+}

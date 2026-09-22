@@ -39,6 +39,7 @@ struct Params {
   uint32_t count;
   uint32_t lowRank;
   float epsilon;
+  uint32_t withInject;
 };
 
 uint16_t toBf16(float value) {
@@ -149,19 +150,23 @@ double worstRelative(const uint16_t *got, const std::vector<float> &want,
     const double scale = std::max({std::abs(a), std::abs(b), 1e-3});
     worst = std::max(worst, std::abs(a - b) / scale);
   }
-  std::cout << "  " << label << " worst relative error " << worst << '\n';
-  return worst;
+  // Relative error on near-zero values measures cancellation, not the
+  // kernel, so the check is the worst absolute error against the typical
+  // size of the output.
+  double squares = 0.0, absolute = 0.0;
+  for (size_t i = 0; i < count; ++i) {
+    squares += double(want[i]) * want[i];
+    absolute = std::max(absolute, std::abs(fromBf16(got[i]) - double(want[i])));
+  }
+  const double normalized = absolute / std::sqrt(squares / double(count));
+  std::cout << "  " << label << " worst relative error " << worst
+            << ", worst error / rms " << normalized << '\n';
+  return normalized;
 }
 
-} // namespace
-
-int main(int argc, const char *argv[]) {
-  try {
-    require(argc >= 2, "usage: hyper-connection <metallib>");
-    MetalBackend backend(argv[1]);
-
+void runCase(MetalBackend &backend, uint32_t rows) {
     // Production geometry: four streams of 2560, low rank 320.
-    const Params params{8, 2560, 4, 320, 1e-6f};
+    const Params params{rows, 2560, 4, 320, 1e-6f, 1};
     const uint32_t width = params.count * params.hidden;
 
     std::mt19937 engine(20260919);
@@ -200,12 +205,17 @@ int main(int argc, const char *argv[]) {
         "hc-injection");
 
     CommandGraph graph;
-    graph.add("hyper_connection_normalize",
-              {xBuffer, gainBuffer, downBuffer, normalized, reduced}, params,
-              {params.rows, 1, 1}, {256, 1, 1});
-    graph.add("hyper_connection_mix",
-              {normalized, reduced, upBuffer, injectBuffer, mixed, injection},
-              params, {params.rows, 1, 1}, {256, 1, 1});
+    // The production path: normalize, then down with the injection gates,
+    // then up and the stream mix, then the residual update.
+    graph.add("hyper_connection_rms", {xBuffer, gainBuffer, normalized}, params,
+              {params.rows, params.count, 1}, {256, 1, 1});
+    graph.add("hyper_connection_down",
+              {normalized, downBuffer, injectBuffer, reduced, injection},
+              params, {(params.lowRank + params.count + 7) / 8, 1, 1},
+              {256, 1, 1});
+    graph.add("hyper_connection_up_mix",
+              {normalized, reduced, upBuffer, mixed}, params,
+              {params.hidden / 8, 1, 1}, {256, 1, 1});
     graph.add("hyper_connection_update",
               {xBuffer, blockBuffer, injection}, params, {64, 1, 1},
               {256, 1, 1});
@@ -214,7 +224,7 @@ int main(int argc, const char *argv[]) {
     const Reference reference =
         cpuReference(params, x, gain, down, up, inject, block);
 
-    std::cout << "hyper-connection, " << params.count << " streams of "
+    std::cout << "hyper-connection, " << rows << " rows, " << params.count << " streams of "
               << params.hidden << ", low rank " << params.lowRank << '\n';
     const double mixedError =
         worstRelative(hostOf(mixed), reference.mixed,
@@ -231,6 +241,18 @@ int main(int argc, const char *argv[]) {
     require(injectionError < 0.02, "injection gate does not match");
     require(updatedError < 0.02, "residual update does not match");
 
+}
+
+
+} // namespace
+
+int main(int argc, const char *argv[]) {
+  try {
+    require(argc >= 2, "usage: hyper-connection <metallib>");
+    MetalBackend backend(argv[1]);
+
+    for (uint32_t rows : {1u, 8u, 37u})
+      runCase(backend, rows);
     std::cout << "hyper connection metal test passed\n";
     return 0;
   } catch (const std::exception &error) {

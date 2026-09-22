@@ -13,7 +13,10 @@ struct HyperConnectionParams {
   uint32_t count;
   uint32_t low_rank;
   float epsilon;
+  // hyper_connection_down also computes the injection gates. Zero for the
+  // final mixer, which has none.
+  uint32_t with_inject;
 };
 
-static_assert(sizeof(HyperConnectionParams) == 20,
-              "HyperConnectionParams must be 20 bytes on both sides");
+static_assert(sizeof(HyperConnectionParams) == 24,
+              "HyperConnectionParams must be 24 bytes on both sides");
