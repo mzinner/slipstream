@@ -255,6 +255,15 @@ struct Qwen4ExpLayerExpertCache final {
 //   indexer                      attention layers only
 //   mlp hyper-connection         norm, inject, mix down, mix up
 //   experts                      router, gate, up, down, shared x3, gate
+// Where a streaming layer's routed experts sit in its file, for reading
+// cache misses directly (file cache off) instead of faulting them in.
+struct Qwen4ExpExpertSource final {
+  int fd = -1;
+  uint64_t gate = 0; // file offsets of expert 0 of each matrix
+  uint64_t up = 0;
+  uint64_t down = 0;
+};
+
 struct Qwen4ExpLayerWeights final {
   Qwen4ExpHyperConnection attentionHyperConnection;
   QwenMixerWeights mixer;
@@ -262,6 +271,7 @@ struct Qwen4ExpLayerWeights final {
   Qwen4ExpHyperConnection mlpHyperConnection;
   ops::MoeWeights ffn;
   mutable Qwen4ExpLayerExpertCache expertCache;
+  Qwen4ExpExpertSource expertSource;
 };
 
 struct Qwen4ExpWeights final {

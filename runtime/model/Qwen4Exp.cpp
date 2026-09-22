@@ -1,3 +1,5 @@
+#include <unistd.h>
+#include <fcntl.h>
 #include "Qwen4Exp.hpp"
 
 #include <algorithm>
@@ -6,6 +8,7 @@
 #include <iostream>
 #include <string_view>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 
 namespace splash::model {
 namespace {
@@ -266,6 +269,22 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     if (fullAttention) layer.indexer = readIndexer(file, backend, layout);
     layer.mlpHyperConnection = readHyperConnection(file, layout, "mlp-hyper", true);
     readExperts(file, backend, layout, layer.ffn);
+    if (layerIndex >= residentLayers) {
+      const uint8_t *base = file.mappedBase();
+      auto offset = [&](const metal::MetalBuffer &view) {
+        return uint64_t(static_cast<const uint8_t *>(view.contents()) - base);
+      };
+      layer.expertSource.gate = offset(layer.ffn.expertGate.packed);
+      layer.expertSource.up = offset(layer.ffn.expertUp.packed);
+      layer.expertSource.down = offset(layer.ffn.expertDown.packed);
+      layer.expertSource.fd = ::open((directory / filename).c_str(), O_RDONLY);
+      if (layer.expertSource.fd < 0)
+        throw WeightStoreError("cannot open " + filename + " for expert reads");
+      // Misses go around the file cache, as llama.cpp's --moe-stream-direct
+      // does: the expert cache already holds them, so a second copy in the
+      // file cache only crowds memory.
+      (void)::fcntl(layer.expertSource.fd, F_NOCACHE, 1);
+    }
     file.finish();
     if (layerIndex >= residentLayers) {
       detachStreamingLayer(backend, layer);
@@ -364,11 +383,31 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
 
   result.lastSelectedExperts.resize(layout.layers);
   if (residentLayers < layout.layers) {
-    uint32_t cacheCapacity = 128;
+    const uint64_t expertStride = uint64_t{layout.expertIntermediateSize} * layout.hiddenSize * 9 / 16;
+    // The expert cache gets the budget llama.cpp's --moe-stream-cache uses on
+    // this machine: everything but ~28 GiB, i.e. 36 GiB of 64. Measured on a
+    // 64 GB M5 Pro: 16 GiB (128 per layer) 10-13 tok/s, 36 GiB 14-19. Past
+    // ~38 GiB both engines swap. SPLASH_EXPERT_CACHE_GIB or _CAPACITY override.
+    uint32_t cacheCapacity = 0;
+    {
+      uint64_t physical = 0;
+      size_t length = sizeof(physical);
+      (void)sysctlbyname("hw.memsize", &physical, &length, nullptr, 0);
+      const double physicalGiB = double(physical) / double(1ULL << 30);
+      double budgetGiB = std::max(8.0, physicalGiB - 28.0);
+      if (const char *envGiB = getenv("SPLASH_EXPERT_CACHE_GIB"))
+        budgetGiB = std::max(1.0, std::atof(envGiB));
+      const uint64_t perSlot =
+          3 * expertStride * uint64_t(layout.layers - residentLayers);
+      cacheCapacity = static_cast<uint32_t>(std::min<double>(
+          layout.experts, budgetGiB * double(1ULL << 30) / double(perSlot)));
+    }
     if (const char *envCap = getenv("SPLASH_EXPERT_CACHE_CAPACITY")) {
       cacheCapacity = std::max(16, std::atoi(envCap));
     }
-    const uint64_t expertStride = uint64_t{layout.expertIntermediateSize} * layout.hiddenSize * 9 / 16;
+    cacheCapacity = std::max<uint32_t>(cacheCapacity, 16);
+    std::cerr << "[Qwen4Exp] expert cache: " << cacheCapacity
+              << " experts per layer\n";
     const uint64_t cacheBytes = uint64_t{cacheCapacity} * expertStride;
     for (uint32_t l = residentLayers; l < layout.layers; ++l) {
       auto &cache = result.layers[l].expertCache;
@@ -383,7 +422,9 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
       cache.clock = 0;
     }
     const uint32_t streamingLayersCount = layout.layers - residentLayers;
-    uint32_t prewarmCount = cacheCapacity;
+    // Loading experts 0..N at startup is an arbitrary guess that costs a read
+    // of the whole cache; the first request fills it with the right ones.
+    uint32_t prewarmCount = 0;
     if (const char *envPre = getenv("SPLASH_PREWARM_EXPERTS")) {
       prewarmCount = std::atoi(envPre);
     }
@@ -403,6 +444,16 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
         cg[off] = 0;
         cu[off] = 0;
         cd[off] = 0;
+      }
+      // Pin the cache, as llama.cpp's is. Pageable, macOS compresses it under
+      // pressure, and every hit then pays to decompress: at a 36 GiB cache
+      // decode stalled for minutes with ~28 GB in the compressor. Pinned, the
+      // file cache is what gives way instead.
+      if (!getenv("SPLASH_EXPERT_CACHE_UNPINNED")) {
+        if (::mlock(cg, cacheBytes) || ::mlock(cu, cacheBytes) ||
+            ::mlock(cd, cacheBytes))
+          std::cerr << "[Qwen4Exp] could not pin expert cache of layer " << l
+                    << "; it may be compressed under memory pressure\n";
       }
       for (uint32_t s = 0; s < prewarm; ++s) {
         cache.slotToExpert[s] = s;

@@ -71,6 +71,9 @@ public:
   void finish();
   [[nodiscard]] const WeightFileRecord &record() const noexcept;
   [[nodiscard]] uint64_t bytes() const noexcept;
+  // Start of the file's mapping; a section's file offset is its contents()
+  // minus this.
+  [[nodiscard]] const uint8_t *mappedBase() const noexcept;
   void advise(MemoryAdvice advice) const noexcept;
   void adviseRange(uint64_t offset, uint64_t bytes, MemoryAdvice advice) const noexcept;
   void prefetch(bool touch = false) const noexcept;

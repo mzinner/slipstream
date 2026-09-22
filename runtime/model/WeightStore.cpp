@@ -260,6 +260,10 @@ metal::MetalBuffer WeightFile::section(uint64_t bytes,
     return impl_->backend->view(impl_->base, start, bytes);
 }
 
+const uint8_t *WeightFile::mappedBase() const noexcept {
+    return static_cast<const uint8_t *>(impl_->base.contents());
+}
+
 void WeightFile::finish() {
     if (impl_->finished) return;
     uint64_t consumed = alignPacked(impl_->offset);
