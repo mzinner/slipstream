@@ -61,6 +61,14 @@ each, probe `dev/benchmarks/qwen4exp/probes/handoff_latency.mm`); MTP draft
    current format despite lower weight error - unexplained, worth a look.
 6. 27B regression check needs a 4-bit 27B package.
 
+## Running it day to day
+
+- Server: `~/models/bin/splash-flashnext-server.sh` (port 8090, context pinned
+  at 131,072, ready in ~15 s, logs in `~/models/logs/`). Stop llama.cpp first.
+- omp: provider `splash-flashnext` in `~/.omp/agent/models.yml` (window 126,976):
+  `omp --model splash-flashnext/local/qwen3.8-flash-next-splash`.
+- Reference card in Nitin's hub: `~/Documents/shared-with-google-drive/INDEX.html`.
+
 ## Handoff
 
 Next-session prompt: `.agents/next-session.md`. Reference logits (bf16 ground
