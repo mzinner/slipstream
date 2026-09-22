@@ -1463,7 +1463,9 @@ void Qwen4ExpTarget::addPrefill(
 uint32_t mtpDraftLimit() noexcept {
   static const uint32_t limit = [] {
     const char *value = std::getenv("SPLASH_MTP_DRAFTS");
-    const int parsed = value ? std::atoi(value) : 3;
+    // 5 measured best across greedy and sampled (mean 40.8 tok/s over the
+    // three bench prompts, lowest 36.6; 3 gave 38.9 and 33.6).
+    const int parsed = value ? std::atoi(value) : 5;
     return static_cast<uint32_t>(std::clamp(parsed, 1, 7));
   }();
   return limit;

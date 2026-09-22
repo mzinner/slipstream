@@ -11,7 +11,7 @@
 namespace splash::model {
 
 // How many tokens the MTP head guesses per step at most (SPLASH_MTP_DRAFTS,
-// 1..7; default 3).
+// 1..7; default 5).
 [[nodiscard]] uint32_t mtpDraftLimit() noexcept;
 
 class Qwen4ExpTarget final {
