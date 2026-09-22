@@ -61,7 +61,7 @@ void require(bool condition, const std::string &message) {
 void testStartupCapabilities() {
     using splash::model::ExecutionLimits;
     require(ExecutionLimits::maximumBatchWidth == 4 &&
-                ExecutionLimits::prefillTokenBudget == 4096 &&
+                ExecutionLimits::prefillTokenBudget == 2048 &&
                 ExecutionLimits::defaultPrefillChunkTokens == 2048 &&
                 ExecutionLimits::draftQueryRows == 8 &&
                 ExecutionLimits::draftProposalTokens == 7 &&

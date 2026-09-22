@@ -466,6 +466,20 @@ class Frontend:
         if body.get("model", self.model) != self.model:
             raise APIError(404, f"model {body['model']} not found", "model_not_found")
         reasoning_effort = body.get("reasoning_effort")
+        # Clients built for vLLM / llama.cpp (omp among them) switch thinking
+        # with enable_thinking, top level or in chat_template_kwargs, and may put
+        # the level there too. enable_thinking: false means "none".
+        template_kwargs = body.get("chat_template_kwargs")
+        if template_kwargs is not None and not isinstance(template_kwargs, dict):
+            raise APIError(400, "chat_template_kwargs must be an object")
+        template_kwargs = template_kwargs or {}
+        if reasoning_effort is None:
+            reasoning_effort = template_kwargs.get("reasoning_effort")
+        enable_thinking = body.get("enable_thinking", template_kwargs.get("enable_thinking"))
+        if enable_thinking is not None and not isinstance(enable_thinking, bool):
+            raise APIError(400, "enable_thinking must be a boolean")
+        if enable_thinking is False:
+            reasoning_effort = "none"
         if reasoning_effort is not None and (
             not isinstance(reasoning_effort, str)
             or reasoning_effort
@@ -738,6 +752,7 @@ class Frontend:
             priority=REQUEST_PRIORITIES[priority_name],
             stop_sequences=stop_sequences,
             thinking=thinking,
+            reasoning_effort=prompt.reasoning_effort,
             thinking_display=body.get("thinking_display", "summarized"),
             tool_policy=tool_policy,
             response_validator=response_validator,

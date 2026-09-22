@@ -34,6 +34,8 @@ def print_request(record):
         f"cached {metrics.get('cache', {}).get('matched_tokens', 0):,}",
         f"output {record.get('completion_tokens', 0):,}",
     ]
+    if record.get("thinking"):
+        parts.append(f"think {record['thinking']}")
     tools = record.get("tools")
     if isinstance(tools, dict) and tools.get("count"):
         parts.append(f"tools {tools['count']}·{tools.get('signature', '')}")

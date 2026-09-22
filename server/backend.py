@@ -86,6 +86,8 @@ class Job:
     priority: int = REQUEST_PRIORITIES["normal"]
     stop_sequences: tuple[str, ...] = ()
     thinking: bool = False
+    # The reasoning_effort the client asked for (None: the template default).
+    reasoning_effort: str | None = None
     thinking_display: str = "summarized"
     reasoning_tokens: int = 0
     events: queue.Queue = field(default_factory=queue.Queue)
@@ -742,6 +744,9 @@ class NativeBackend:
         if result:
             record["completion_tokens"] = result.completion_tokens
             record["metrics"] = metrics_dict(result)
+        record["thinking"] = (
+            (job.reasoning_effort or "default") if job.thinking else "off"
+        )
         if job.tools_signature:
             record["tools"] = {
                 "count": job.tools_signature[0],

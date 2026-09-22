@@ -15,7 +15,7 @@ with its draft head), and prompts read at ~180–670 tok/s (llama.cpp ~110–367
 |---|---|---|---|
 | Short, 65 tok | 50.0 | 46.1 | 178–217 tok/s |
 | Code, 1,495 tok | 37.9 | 35.4 | ~583 tok/s |
-| Long, 9,129 tok | 36.3 | 34.4 | 609–666 tok/s (4,096-token chunks) |
+| Long, 9,129 tok | 36.3 | 34.4 | ~600 tok/s (2,048-token chunks; 609–666 at 4,096) |
 
 Server, agent-style (4.6K-token system prompt, 5 tools): first token 8.3 s
 cold, ~1 s with the prompt cached; tool calls correct greedy and sampled.
@@ -31,7 +31,10 @@ Quality on the code prompt (bf16 reference): 91% same top pick, KL 0.12
   products and decode reads them with its own kernels.
 - 4-bit copy of the output head, used only by the MTP draft.
 - Magics: layer MDFN0031, head MDFN0034, embedding MDFN0013, MTP combiner
-  MDFN0035. Manifest `prefill_token_budget` 4096 (built maximum 4096).
+  MDFN0035. Manifest `prefill_token_budget` 2048 (built maximum 2048). 4096
+  was tried: ~10% faster long prompts, but its 2.2 GB prompt scratch (vs 1.2)
+  left too little memory headroom under the server, which then stalled
+  requests with resource_timeout.
 - `convert_qwen4exp.py --requantize-mixers` rewrites the previous layer
   version in place in under a minute (experts copied); `--head-only` rewrites
   head.bin. A package at an older magic must be stepped through in order.
@@ -67,6 +70,13 @@ each, probe `dev/benchmarks/qwen4exp/probes/handoff_latency.mm`); MTP draft
   at 131,072, ready in ~15 s, logs in `~/models/logs/`). Stop llama.cpp first.
 - omp: provider `splash-flashnext` in `~/.omp/agent/models.yml` (window 126,976):
   `omp --model splash-flashnext/local/qwen3.8-flash-next-splash`.
+- Thinking: the model's template defaults to xhigh. omp sends a level only
+  because the entry has `compat: {qwenTemplateReasoningEffort: true}` (without
+  it omp never sent one, so everything ran at xhigh). omp default is medium;
+  `--thinking=low|medium|xhigh|off` (with `=`) or Shift+Tab in a session. The
+  server honours `reasoning_effort`, `enable_thinking` and
+  `chat_template_kwargs`, and logs `think <level>` per request. Changing level
+  mid-session changes the prompt, so the next turn re-reads it once.
 - Reference card in Nitin's hub: `~/Documents/shared-with-google-drive/INDEX.html`.
 
 ## Handoff
