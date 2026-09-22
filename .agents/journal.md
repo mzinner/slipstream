@@ -1,5 +1,15 @@
 # Journal — qwen4exp port
 
+## 2026-09-22 16:50 PDT — claude-code
+
+The Mac crashed twice (kernel watchdog, 90 s freeze). 1st: a hung read-split
+test run (counter wrapped past zero) held 40 GiB while my next run started a
+2nd engine. 2nd: my own test asked for a 60 GiB cache; the startup memory
+check ignored the cache and generate-sample skips it anyway. Fixed both,
+added guarded.py. Speed: waves default + 64K draft vocab = greedy 37.6,
+sampled 37.5 tok/s (was 36.4/35.2), outputs identical. 50 tok/s not reached.
+After reboot the GPU memory limit resets; the launcher now sets it (sudo).
+
 ## 2026-09-22 09:15 PDT — claude-code
 
 Correction to the entry below: the 8-bit matrix kernels are at the bandwidth

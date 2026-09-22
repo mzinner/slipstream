@@ -54,6 +54,11 @@ wanted 128 MiB, long before any real weights existed.
   exited (`pgrep -fl generate-sample`); `pkill -f` patterns can silently miss.
   Diagnose a crash from `/Library/Logs/DiagnosticReports/panic-full-*.panic`
   (JSON; `processByPid` shows who held the memory).
+- **The GPU memory limit (`iogpu.wired_limit_mb`) resets on every reboot.**
+  At the default the Splash server refuses to start (short ~1 GB). The
+  launchers set 59392 with sudo; agents cannot enter the password.
+- **Run-to-run noise is about +-2% tok/s** (SSD timing). To compare kernels,
+  repeat the kernel under test (`SPLASH_HC_REPEAT=8`) so its cost dwarfs the noise.
 - **PLE gate offset**: normalized rows go at `row + (taps-1)*dilation`, because
   the convolution reads history first.
 

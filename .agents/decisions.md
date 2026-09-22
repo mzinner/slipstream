@@ -193,3 +193,22 @@ Each layer hands control to the CPU (~164 us) to pick and load experts. Moving
 routing to the GPU would need the CPU to signal a running command buffer;
 Metal doesn't make host writes visible there (probe: handoff_latency.mm).
 
+
+## Draft head scores the 64K most common tokens (2026-09-22)
+
+Its guesses are checked by the full head, so answers can't change. 64K cut
+the draft 12.3 -> 8.4 ms a step with the same tokens per step; 32K made the
+head's confidence (softmax over fewer tokens) too high, so it guessed further
+and more guesses were rejected. Supersedes the earlier note that shrinking
+the draft vocabulary would cost more than it saves.
+
+## Expert cache must fit in free memory at load (2026-09-22)
+
+The loader refuses when free memory < cache + 2 GiB. A 10% margin (like the
+runtime governor) refused the normal 34 GiB setup, which leaves ~4 GiB.
+
+## Hyper-connection kernels stay two launches (2026-09-22)
+
+Merging down and up-mix needs every threadgroup to wait on the others
+mid-launch. Metal does not promise they all run at once, so it can deadlock
+the GPU. Three safe variants measured no faster.

@@ -1,6 +1,6 @@
 # Status — qwen4exp (Qwen3.8-Flash-Next) in Splash
 
-**Updated:** 2026-09-22 (review) by claude-code
+**Updated:** 2026-09-22 16:50 PDT by claude-code (speed round after two crashes)
 **Branch:** `qwen4exp-review` (not pushed; never push to upstream `incoai/splash`)
 
 ## In one line
@@ -39,35 +39,57 @@ Quality on the code prompt (bf16 reference): 91% same top pick, KL 0.12
   version in place in under a minute (experts copied); `--head-only` rewrites
   head.bin. A package at an older magic must be stepped through in order.
 
-## Where decode time goes (code prompt, ~95 ms a step, ~3.7 tokens a step at cap 5)
+## Speed round, 2026-09-22 afternoon (commits c4eb2a7, b7cad30)
 
-GPU ~46 ms (8-bit matrix kernels at the bandwidth floor; expert kernels ~70%);
-SSD miss reads ~17 ms; per-layer GPU<->host hand-offs ~8 ms (structural: 164 us
-each, probe `dev/benchmarks/qwen4exp/probes/handoff_latency.mm`); MTP draft
-~13 ms (mostly real GPU work).
+10-prompt suite (`dev/benchmarks/qwen4exp/speed_suite.py`, 256 tokens each,
+34 GiB cache): **greedy 36.4 -> 37.6 tok/s, sampled 35.2 -> 37.5.** Greedy
+outputs identical to before on every run. The 50 tok/s goal was not reached;
+see "What's left" below for why.
 
-## Open work (measured gaps, largest first)
+- **Waves on by default** (`SPLASH_DECODE_WAVES=0` off): cached experts run
+  on the GPU while the host reads missing ones.
+- **Draft head scores the 64K most common tokens** when
+  `target/draft-vocab.bin` exists (`dev/tools/draft_vocab.py`). Draft time
+  12.3 -> 8.4 ms a step, same tokens per step. 32K was worse (head became
+  overconfident, more rejected guesses).
+- **Crash guard:** the loader refuses an expert cache that does not fit in
+  free memory with 2 GiB to spare. Two engines at once froze the Mac twice
+  today. Run experiments via `dev/benchmarks/guarded.py -- <cmd>`.
 
-1. ~~8-bit linear decode kernels~~: measured at the bandwidth floor (3.4 GB
-   of 8-bit weights a step in 10.8 ms); every tile/grid variant is slower.
-2. **SSD miss reads** ~17 ms/step: lookahead foresees 66% of used experts
-   (top-16 would 79%). A second prediction two layers ahead was tried and
-   rejected (misses 59 -> 56 at best, tok/s down: its reads compete).
-3. **GPU<->host hand-offs** ~8 ms/step (48 x ~164 us): structural. Routing
-   can't move to the GPU without a mid-command-buffer host->GPU signal, and
-   Metal doesn't make host writes visible there (probe: handoff_latency.mm).
-4. **Drafting** ~13 ms/step: mostly real GPU work (~2 ms a guess, half of it
-   the 318 MB draft output layer). Merging its two round trips per guess
-   would save ~1 ms/step; shrinking the draft vocabulary would cost more in
-   acceptance than it saves.
-5. Expert quantization: group-32 and range-search simulated *worse* than the
-   current format despite lower weight error - unexplained, worth a look.
-6. 27B regression check needs a 4-bit 27B package.
+## Where decode time goes now (10-prompt suite, ~81 ms a step, 3.08 tokens a step)
+
+| Part | ms/step | Notes |
+|---|---|---|
+| GPU busy | ~45 | ~1,200 small dependent kernels; hyper-connection mix ~5.6 of it |
+| Waiting on SSD reads | ~17 | 3.6% of expert uses miss the cache |
+| Draft head | ~8.5 | was 12.3 |
+| Other host work | ~10 | hand-offs, staging |
+
+## What's left (measured today, largest first)
+
+1. **SSD misses (~17 ms).** Eviction is already frequency+recency; the
+   prefetch is tuned. Splitting slots unevenly across layers (offline replay
+   of real routing, `SPLASH_ROUTE_LOG`) would cut misses ~9% (~1.5 ms). Not done.
+2. **Hyper-connection kernels (~5.6 ms)** run at ~40% of memory speed because
+   each reads only 3.3 MB. Paired outputs, skipping dead rows and deduplicated
+   scale loads were all no faster. The real fix, merging down + up into one
+   launch with a grid-wide wait, risks a GPU deadlock; not attempted.
+3. **More tokens per step** is the only lever big enough for 50 tok/s
+   (needs ~4.1 tokens a step at today's step time). Confidence cutoff and
+   guess limit are already at the balance point (0.2-0.4, 4-6 all within
+   0.2 tok/s). Would need tree drafting or a better draft head.
+4. Draft head still processes 8 rows when 1 is live (~0.5 ms).
+5. Earlier measured and still true: 8-bit linear kernels at the bandwidth
+   floor; per-layer GPU<->host hand-offs ~8 ms are structural
+   (probe `dev/benchmarks/qwen4exp/probes/handoff_latency.mm`).
 
 ## Running it day to day
 
 - Server: `~/models/bin/splash-flashnext-server.sh` (port 8090, context pinned
   at 131,072, ready in ~15 s, logs in `~/models/logs/`). Stop llama.cpp first.
+  It now sets the GPU memory limit to 58 GiB (`sudo`, once per boot): macOS
+  resets it on reboot, and at the default ~52 GiB the server refuses to start
+  ("kv_pool_does_not_fit").
 - omp: provider `splash-flashnext` in `~/.omp/agent/models.yml` (window 126,976):
   `omp --model splash-flashnext/local/qwen3.8-flash-next-splash`.
 - Thinking: the model's template defaults to xhigh. omp sends a level only
@@ -94,6 +116,11 @@ Agent-style server check: `dev/benchmarks/qwen4exp/agent_turn.py`.
   0.1%).
 - `SPLASH_STEP_TIMING=1`, `SPLASH_PROFILE_STEPS=N`, `SPLASH_LOG_ALLOCATIONS=1`,
   `SPLASH_MTP_DRAFTS=1..7`, `SPLASH_PREFILL_ROW_SLICES`, `SPLASH_PROMPT_KEEP`.
+- `dev/benchmarks/guarded.py -- <cmd>`: run any engine experiment safely
+  (refuses beside another engine, kills under 4 GiB free or after a time limit).
+- `SPLASH_DRAFT_VOCAB=N` (0 = all tokens), `SPLASH_DECODE_WAVES=0`,
+  `SPLASH_ROUTE_LOG=path` (routing for offline cache replay),
+  `SPLASH_HC_REPEAT=n` / `_PARTS` (price the hyper-connection kernels).
 
 ## Do not touch
 

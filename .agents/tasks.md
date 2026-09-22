@@ -50,6 +50,14 @@
 - [x] Decode at ≥ 30 tok/s consistently (33–45 measured 2026-09-22)
 - [x] Server end to end incl. tool calls with MTP drafting
 - [x] Prompt path: no fallback to mapped expert files (row ranges)
+- [x] Crash guard: loader refuses a cache that does not fit; guarded.py (2026-09-22)
+- [x] Waves default + 64K draft vocabulary: 37.6/37.5 tok/s greedy/sampled (2026-09-22)
+- [ ] 50 tok/s: needs ~4.1 tokens a step (tree drafting / better draft head)
+- [ ] Uneven cache slots per layer (~9% fewer misses in replay)
+- [ ] Draft head: process only live rows (~0.5 ms)
+- [ ] Resume the paused quality round: Splash vs llama.cpp V3 vs 27B HQ
+      (benchmarking/model-quality-bench, run_splash_vs_llamacpp.sh then run_27b_hq.sh;
+      re-run Splash suites since the engine changed)
 - [ ] Code-prompt drift: 79% same pick vs llama.cpp 89%
 - [ ] Short-prompt reading speed (87 vs ~110 tok/s)
 - [ ] Sparse indexer for >2K context
