@@ -259,19 +259,27 @@ void readMissedExperts(const Qwen4ExpExpertSource &source, const Miss *misses,
                        char *down) {
   if (!count)
     return;
-  dispatch_apply(count * 3,
+  // One read per matrix. Splitting each into 4 smaller reads in flight
+  // together was measured slower (staging 30 -> 39 ms a step).
+  constexpr uint32_t kPieces = 1;
+  const uint64_t piece = (stride + kPieces - 1) / kPieces;
+  dispatch_apply(count * 3 * kPieces,
                  dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
                  ^(size_t index) {
-    const Miss &miss = misses[index / 3];
-    const uint32_t matrix = static_cast<uint32_t>(index % 3);
+    const Miss &miss = misses[index / (3 * kPieces)];
+    const uint32_t matrix = static_cast<uint32_t>(index / kPieces % 3);
+    const uint64_t begin = uint64_t(index % kPieces) * piece;
+    const uint64_t length = std::min(piece, stride - std::min(stride, begin));
+    if (!length)
+      return;
     char *slot = (matrix == 0 ? gate : matrix == 1 ? up : down) +
-                 uint64_t{miss.slot} * stride;
+                 uint64_t{miss.slot} * stride + begin;
     const uint64_t offset =
         (matrix == 0 ? source.gate : matrix == 1 ? source.up : source.down) +
-        uint64_t{miss.expert} * stride;
+        uint64_t{miss.expert} * stride + begin;
     uint64_t done = 0;
-    while (done < stride) {
-      const ssize_t got = ::pread(source.fd, slot + done, stride - done,
+    while (done < length) {
+      const ssize_t got = ::pread(source.fd, slot + done, length - done,
                                   static_cast<off_t>(offset + done));
       if (got <= 0)
         break; // Leaves the slot short; the file was validated at load.
@@ -328,6 +336,34 @@ float sharedExpertGate(const ops::Q8Projection &gate, const uint16_t *input,
 uint16_t toBf16(float value) {
   const uint32_t bits = std::bit_cast<uint32_t>(value);
   return static_cast<uint16_t>((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16);
+}
+
+constexpr uint32_t kFrequencyHalfLife = 512;
+
+// Counts a use of `expert`, halving every count each kFrequencyHalfLife steps.
+void countExpertUse(Qwen4ExpLayerExpertCache &cache, uint32_t expert) {
+  if (cache.frequency.empty())
+    cache.frequency.assign(cache.expertToSlot.size(), 0);
+  if (cache.clock >= cache.nextHalving) {
+    for (auto &count : cache.frequency) count >>= 1;
+    cache.nextHalving = cache.clock + kFrequencyHalfLife;
+  }
+  cache.frequency[expert] += 16;
+}
+
+// The slot to evict: least used, then least recent, never one this step uses.
+int32_t pickVictim(const Qwen4ExpLayerExpertCache &cache) {
+  int32_t best = -1;
+  uint64_t bestKey = UINT64_MAX;
+  for (uint32_t s = 0; s < cache.capacity; ++s) {
+    if (cache.lruTime[s] == cache.clock) continue;
+    const int16_t expert = cache.slotToExpert[s];
+    const uint64_t count = expert >= 0 && !cache.frequency.empty()
+                               ? cache.frequency[expert] : 0;
+    const uint64_t key = (count << 32) | cache.lruTime[s];
+    if (key < bestKey) { bestKey = key; best = static_cast<int32_t>(s); }
+  }
+  return best;
 }
 
 // One sequence's gate, convolution and residual update. `normalized` holds
@@ -1445,6 +1481,8 @@ void Qwen4ExpTarget::addVerify(
     int16_t expertToAssignedSlot[kMaxExperts];
     std::fill_n(expertToAssignedSlot, kMaxExperts, -1);
 
+    for (uint32_t exp : uniqueExperts)
+      countExpertUse(cache, exp);
     for (uint32_t exp : uniqueExperts) {
       int16_t slot = cache.expertToSlot[exp];
       if (slot != -1) {
@@ -1457,17 +1495,9 @@ void Qwen4ExpTarget::addVerify(
         if (cache.numCached < cache.capacity) {
           assignSlot = cache.numCached++;
         } else {
-          // Evict LRU slot not in active step
-          uint32_t oldest = UINT32_MAX;
-          uint32_t best = 0;
-          for (uint32_t s = 0; s < cache.capacity; ++s) {
-            if (cache.lruTime[s] == cache.clock) continue;
-            if (cache.lruTime[s] < oldest) {
-              oldest = cache.lruTime[s];
-              best = s;
-            }
-          }
-          assignSlot = best;
+          // Evict the least-used slot this step does not need.
+          const int32_t victim = pickVictim(cache);
+          assignSlot = victim >= 0 ? static_cast<uint32_t>(victim) : 0;
           int16_t evicted = cache.slotToExpert[assignSlot];
           if (evicted != -1) {
             cache.expertToSlot[evicted] = -1;
@@ -1527,10 +1557,18 @@ void Qwen4ExpTarget::addVerify(
     for (uint32_t r = 0; r < rows; ++r) {
       if (r % ExecutionLimits::targetVerifyRows >= buffers.liveRowsPerLane)
         continue;
+      // The router's own top-k. Prefetching 14 instead cut misses 23 -> 20
+      // a step but raised staging 15.6 -> 19.8 ms: the extra reads compete
+      // with the ones that matter. SPLASH_LOOKAHEAD_EXPERTS overrides.
+      static const uint32_t widened = [] {
+        const char *value = std::getenv("SPLASH_LOOKAHEAD_EXPERTS");
+        return value ? static_cast<uint32_t>(std::atoi(value)) : 10u;
+      }();
+      const uint32_t guesses = std::clamp(widened, perToken, 16u);
       uint32_t ids[16];
       topExperts(predictedScores + uint64_t{r} * width, weights.layout.experts,
-                 perToken, ids, nullptr);
-      for (uint32_t k = 0; k < perToken; ++k) {
+                 guesses, ids, nullptr);
+      for (uint32_t k = 0; k < guesses; ++k) {
         const uint32_t expert = ids[k];
         if (expert >= weights.layout.experts)
           continue;
@@ -1543,14 +1581,10 @@ void Qwen4ExpTarget::addVerify(
         if (cache.numCached < cache.capacity) {
           slot = cache.numCached++;
         } else {
-          uint32_t oldest = UINT32_MAX;
-          for (uint32_t s = 0; s < cache.capacity; ++s)
-            if (cache.lruTime[s] != cache.clock && cache.lruTime[s] < oldest) {
-              oldest = cache.lruTime[s];
-              slot = s;
-            }
-          if (oldest == UINT32_MAX)
+          const int32_t victim = pickVictim(cache);
+          if (victim < 0)
             break;
+          slot = static_cast<uint32_t>(victim);
           if (cache.slotToExpert[slot] >= 0)
             cache.expertToSlot[cache.slotToExpert[slot]] = -1;
         }
@@ -1875,8 +1909,12 @@ void Qwen4ExpTarget::addVerify(
     return drafts;
   };
 
+  double mtpMs = 0.0;
   if (buffers.mtpEnabled && weights.mtpLayer && lanes == 1 && buffers.mtp[0].rows) {
+    const auto mtpStart = std::chrono::steady_clock::now();
     const auto drafts = runMtpDraft();
+    mtpMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - mtpStart).count();
     if (!buffers.mtpShadow) {
       // The verify rows are the anchor then these proposals. Past the third
       // the proposals repeat it: the retained-row cap keeps them from counting.
@@ -2087,9 +2125,10 @@ void Qwen4ExpTarget::addVerify(
   encodeHead(graph);
 
   static uint32_t verifyStepCount = 0;
-  if (++verifyStepCount <= 10) {
+  static const bool everyStep = std::getenv("SPLASH_STEP_TIMING") != nullptr;
+  if (++verifyStepCount <= 10 || everyStep) {
     std::cerr << "[Verify Timing] Resident 0.." << R << ": " << residentMs << " ms | Staging: "
-              << totalStageMs << " ms (misses: " << totalMisses << ") | GPU Wall: " << totalGpuMs << " ms (pure GPU: " << totalPureGpuMs << " ms)\n";
+              << totalStageMs << " ms (misses: " << totalMisses << ") | GPU Wall: " << totalGpuMs << " ms (pure GPU: " << totalPureGpuMs << " ms) | MTP: " << mtpMs << " ms\n";
   }
 }
 
