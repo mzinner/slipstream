@@ -90,8 +90,13 @@ std::string runtimeStatusJson(
   // Warning pressure pauses growth but permits serving; only the governor's
   // critical verdict makes host pressure a readiness failure.
   const bool hostSafe = memoryGovernor.pressure != MemoryPressure::Critical;
+  // Streamed weights are file-backed mappings the kernel can drop and reread,
+  // not budgeted memory; the startup audit excludes them the same way.
+  const uint64_t streamable = plan.model().footprint.streamableWeightsBytes;
+  const uint64_t budgetedBytes =
+      currentBytes > streamable ? currentBytes - streamable : currentBytes;
   const bool ready = warmup.ready() && memoryAudit.valid && metalHealthy &&
-                     hostSafe && currentBytes <= plan.breakdown().hardBudgetBytes;
+                     hostSafe && budgetedBytes <= plan.breakdown().hardBudgetBytes;
   const double hitRate =
       core.cacheHits + core.coldMisses
           ? double(core.cacheHits) / double(core.cacheHits + core.coldMisses)
