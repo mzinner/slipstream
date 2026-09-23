@@ -15,34 +15,10 @@ uint64_t mix(uint64_t hash, uint64_t value) noexcept {
 
 } // namespace
 
-ImageIdentity blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
-                                 std::span<const ImageSpan> spans) noexcept {
-  ImageIdentity identity;
-  const uint64_t blockEnd = blockBegin + blockTokens;
-  for (const ImageSpan &span : spans) {
-    if (span.end() <= blockBegin || span.offset >= blockEnd)
-      continue;
-    // Two independently seeded chains fold the content digest, the grid, and
-    // the block's alignment inside the span into 128 bits.
-    uint64_t lo = identity.lo ? identity.lo : 0x243f6a8885a308d3ULL;
-    uint64_t hi = identity.hi ? identity.hi : 0x13198a2e03707344ULL;
-    for (uint64_t value :
-         {span.digestLo, span.digestHi,
-          (uint64_t{span.gridHeight} << 32) | span.gridWidth,
-          (uint64_t{span.offset} << 32) | span.tokens, blockBegin}) {
-      lo = mix(lo, value);
-      hi = mix(hi, ~value);
-    }
-    identity = {lo, hi};
-  }
-  return identity;
-}
-
 bool exactKvBlockKeyMatch(const KvBlockKeyView &stored,
                           const KvBlockKeyView &query) noexcept {
   return stored.indexHash == query.indexHash &&
          stored.parentBlock == query.parentBlock &&
-         stored.images == query.images &&
          stored.tokens.size() == query.tokens.size() &&
          std::equal(stored.tokens.begin(), stored.tokens.end(),
                     query.tokens.begin());
@@ -59,33 +35,28 @@ KvCache::~KvCache() noexcept {
 }
 
 uint64_t KvCache::indexHash(uint64_t parentBlock,
-                            std::span<const uint32_t> tokens,
-                            ImageIdentity images) const noexcept {
+                            std::span<const uint32_t> tokens) const noexcept {
   uint64_t hash = mix(0x6a09e667f3bcc909ULL, parentBlock);
   for (uint8_t byte : cacheNamespace_.digest)
     hash = mix(hash, byte);
   for (uint32_t token : tokens)
     hash = mix(hash, token);
-  hash = mix(hash, images.lo);
-  hash = mix(hash, images.hi);
   return hash;
 }
 
 std::optional<KvCache::BlockMatch>
-KvCache::find(uint64_t parentBlock, std::span<const uint32_t> tokens,
-              ImageIdentity images) const {
+KvCache::find(uint64_t parentBlock, std::span<const uint32_t> tokens) const {
   if (tokens.size() != pageTokens) {
     return std::nullopt;
   }
   if (parentBlock && !blocks_.contains(parentBlock))
     return std::nullopt;
-  const uint64_t hash = indexHash(parentBlock, tokens, images);
-  const KvBlockKeyView query{parentBlock, hash, tokens, images};
+  const uint64_t hash = indexHash(parentBlock, tokens);
+  const KvBlockKeyView query{parentBlock, hash, tokens};
   const auto [first, last] = index_.equal_range(hash);
   for (auto candidate = first; candidate != last; ++candidate) {
     const Block &entry = block(candidate->second);
-    const KvBlockKeyView stored{entry.parent, entry.indexHash, entry.tokens,
-                                entry.images};
+    const KvBlockKeyView stored{entry.parent, entry.indexHash, entry.tokens};
     if (exactKvBlockKeyMatch(stored, query)) {
       return BlockMatch{entry.id, entry.physicalPage};
     }
@@ -95,15 +66,14 @@ KvCache::find(uint64_t parentBlock, std::span<const uint32_t> tokens,
 
 KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
                                       std::span<const uint32_t> tokens,
-                                      uint32_t physicalPage,
-                                      ImageIdentity images) {
+                                      uint32_t physicalPage) {
   if (tokens.size() != pageTokens) {
     throw std::invalid_argument("KV cache block must contain one full page");
   }
   if (physicalPage >= pool_.pageCount()) {
     throw std::out_of_range("KV cache physical page is out of range");
   }
-  if (auto existing = find(parentBlock, tokens, images)) {
+  if (auto existing = find(parentBlock, tokens)) {
     InsertResult result;
     result.id = existing->id;
     result.physicalPage = existing->physicalPage;
@@ -123,9 +93,8 @@ KvCache::InsertResult KvCache::insert(uint64_t parentBlock,
   Block entry;
   entry.id = nextBlockId_;
   entry.parent = parentBlock;
-  entry.indexHash = indexHash(parentBlock, tokens, images);
+  entry.indexHash = indexHash(parentBlock, tokens);
   std::copy(tokens.begin(), tokens.end(), entry.tokens.begin());
-  entry.images = images;
   entry.physicalPage = physicalPage;
   entry.depth = parentBlock ? block(parentBlock).depth + 1 : 1;
   entry.evictionNode = evictionOrder_.extract(

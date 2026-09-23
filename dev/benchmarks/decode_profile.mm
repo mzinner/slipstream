@@ -239,7 +239,7 @@ int main(int argc, char **argv) {
                                       model.stateLayout());
       model::RuntimeContext context{
           backend, governor.allocationAdmission(), model, pages, states, operators,
-          16384, executorPlan.pipelineReserveBytes,
+          executorPlan.pipelineReserveBytes,
           executorPlan.runtimeOverheadReserveBytes};
       model::Runtime executor(context);
 

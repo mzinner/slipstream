@@ -242,9 +242,6 @@ std::string runtimeStatusJson(
       << executorTelemetry.lastConstrainedMaskWaitSeconds * 1000.0
       << ",\"total_residual_wait_ms\":"
       << executorTelemetry.totalConstrainedMaskWaitSeconds * 1000.0 << "}"
-      << ",\"images\":{\"encodes\":" << executorTelemetry.imageEncodes
-      << ",\"embedding_reuses\":" << executorTelemetry.imageEmbeddingReuses
-      << "}"
       << ",\"scheduler\":{\"queued\":" << scheduler.queued
       << ",\"waiting_resources\":" << scheduler.waitingResources
       << ",\"prefilling\":" << scheduler.prefilling

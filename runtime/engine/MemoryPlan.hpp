@@ -23,7 +23,6 @@ inline constexpr uint64_t kGiB = 1024ULL * 1024 * 1024;
 struct ModelMemoryFootprint final {
   uint64_t targetWeightsBytes = 0;
   uint64_t draftWeightsBytes = 0;
-  uint64_t visionWeightsBytes = 0;
   uint64_t activeStateCellBytes = 0;
   uint64_t sharedPrefillBytes = 0;
   uint64_t sharedDecodeBytes = 0;
@@ -127,7 +126,6 @@ struct EngineMemoryBreakdown {
 
   uint64_t targetWeightsBytes = 0;
   uint64_t draftWeightsBytes = 0;
-  uint64_t visionWeightsBytes = 0;
   uint32_t maximumBatchWidth = model::ExecutionLimits::maximumBatchWidth;
   uint64_t activeStateCellBytes = 0;
   uint64_t sharedPrefillBytes = 0;

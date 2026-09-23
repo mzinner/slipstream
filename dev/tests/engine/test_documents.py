@@ -1,14 +1,12 @@
 import base64
-import io
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
-from PIL import Image
 
-from server import documents, images
+from server import documents
 from server.errors import APIError
 
 
@@ -94,7 +92,7 @@ class DocumentTests(unittest.TestCase):
             documents._cache.clear()
             documents._cache_bytes = 0
 
-    def test_pdf_keeps_page_text_images_and_document_context(self):
+    def test_pdf_keeps_page_text_and_document_context(self):
         parts = documents.document_content(
             document_block(pdf_bytes(pages=2), title="Report", context="Local fixture")
         )
@@ -105,45 +103,10 @@ class DocumentTests(unittest.TestCase):
                 {"type": "text", "text": "Local fixture\n"},
             ],
         )
+        self.assertEqual(len(parts), 4)
+        self.assertTrue(all(part["type"] == "text" for part in parts))
         self.assertIn("ALPHA 42 page 1", parts[2]["text"])
-        self.assertIn("ALPHA 42 page 2", parts[4]["text"])
-        for part in (parts[3], parts[5]):
-            payload = images.decode_data_url(part["image_url"]["url"])
-            with Image.open(io.BytesIO(payload)) as page:
-                self.assertLessEqual(
-                    page.width * page.height, documents.MAX_PAGE_PIXELS
-                )
-                self.assertEqual(
-                    page.getpixel((page.width // 4, page.height * 3 // 4))[:3],
-                    (255, 0, 0),
-                )
-                self.assertEqual(
-                    page.getpixel((page.width * 3 // 4, page.height * 3 // 4))[:3],
-                    (0, 0, 255),
-                )
-            self.assertGreater(images.prepare(payload).tokens, 0)
-
-    def test_large_page_is_bounded_before_bitmap_allocation(self):
-        import pypdfium2 as pdfium
-
-        sizes = []
-        create_bitmap = pdfium.PdfBitmap.new_native
-
-        def bounded_bitmap(width, height, **kwargs):
-            sizes.append((width, height))
-            self.assertLessEqual(width * height, documents.MAX_PAGE_PIXELS)
-            return create_bitmap(width, height, **kwargs)
-
-        original = pdfium.PdfPage.render
-
-        def render(page, **kwargs):
-            return original(page, bitmap_maker=bounded_bitmap, **kwargs)
-
-        with mock.patch.object(pdfium.PdfPage, "render", render):
-            documents.render_pages(
-                pdf_bytes(width=14400, height=14400), documents.DocumentBudget()
-            )
-        self.assertEqual(len(sizes), 1)
+        self.assertIn("ALPHA 42 page 2", parts[3]["text"])
 
     def test_input_types_invalid_pdf_and_encryption_are_rejected(self):
         invalid = [
@@ -209,13 +172,8 @@ class DocumentTests(unittest.TestCase):
                 results = list(executor.map(documents.document_content, [block] * 8))
         self.assertEqual(render.call_count, 1)
         self.assertIs(results[0][0]["text"], results[1][0]["text"])
-        self.assertIs(
-            results[0][1]["image_url"]["url"], results[1][1]["image_url"]["url"]
-        )
         results[0][0]["text"] = "changed"
-        results[0][1]["image_url"]["url"] = "changed"
         self.assertIn("ALPHA 42", results[1][0]["text"])
-        self.assertTrue(results[1][1]["image_url"]["url"].startswith("data:image/png"))
         self.assertIn("ALPHA 42", documents.document_content(block)[0]["text"])
 
     def test_request_budget_counts_repeated_pdfs_with_and_without_cache(self):
@@ -256,16 +214,16 @@ class DocumentTests(unittest.TestCase):
         import pypdfium2 as pdfium
 
         budget = documents.DocumentBudget(deadline=time.monotonic() + 10)
-        original = pdfium.PdfPage.render
+        original = pdfium.PdfPage.get_textpage
         handles = []
 
-        def render(page, **kwargs):
-            bitmap = original(page, **kwargs)
-            handles.extend((page, page.pdf, bitmap))
+        def get_textpage(page, **kwargs):
+            text_page = original(page, **kwargs)
+            handles.extend((page, page.pdf, text_page))
             budget.deadline = time.monotonic() - 1
-            return bitmap
+            return text_page
 
-        with mock.patch.object(pdfium.PdfPage, "render", render):
+        with mock.patch.object(pdfium.PdfPage, "get_textpage", get_textpage):
             with self.assertRaises(APIError) as raised:
                 documents.render_pages(pdf_bytes(pages=2), budget)
         self.assertEqual(raised.exception.code, "request_timeout")
@@ -279,7 +237,7 @@ class DocumentTests(unittest.TestCase):
         )
 
     def test_cache_evicts_by_bytes_and_entry_count(self):
-        page = documents.Page("text", "image")
+        page = documents.Page("text")
         for budget, entries in ((page.size, 16), (documents.CACHE_BYTES, 1)):
             self.setUp()
             with (

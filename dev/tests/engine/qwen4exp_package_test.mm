@@ -231,8 +231,6 @@ int main(int argc, const char *argv[]) {
     draft.attentionSize = 2048;
     draft.intermediateSize = 8704;
     draft.targetHiddenSize = layout.capturedHiddenSize();
-    ops::VisionLayout vision;
-    vision.outputHiddenSize = layout.hiddenSize;
 
     uint64_t targetBytes = 0, draftBytes = 0;
     for (uint32_t layer = 0; layer < layout.layers && !supplied; ++layer) {

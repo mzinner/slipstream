@@ -461,32 +461,3 @@ class ProtocolRecoveryTests(unittest.TestCase):
                 else:
                     model_output.validate_tool_calls(calls, policy)
 
-    def test_anthropic_overflow_has_actual_counts_for_text_and_image_precheck(self):
-        harness = self.harness(FakeRuntime(), max_context=2)
-        status, _, raw = harness.request("POST", "/v1/messages", request_body())
-        self.assertEqual(status, 400)
-        self.assertEqual(
-            json.loads(raw)["error"]["message"],
-            "prompt is too long: 2 tokens > 1 maximum input tokens",
-        )
-        with mock.patch.object(
-            harness.app,
-            "_prepare_images",
-            side_effect=api_errors.ContextLengthError(100, 2, image_tokens_only=True),
-        ):
-            status, _, raw = harness.request("POST", "/v1/messages", request_body())
-        self.assertEqual(status, 400)
-        self.assertIn("100 tokens > 1", json.loads(raw)["error"]["message"])
-        self.assertIn("image tokens alone", json.loads(raw)["error"]["message"])
-        with self.assertRaises(api_errors.ContextLengthError) as caught:
-            harness.app._check_image_request_size(100, 1, 4)
-        self.assertEqual(caught.exception.input_tokens, 100)
-        status, _, raw = harness.request("POST", "/v1/chat/completions", request_body())
-        self.assertEqual(status, 400)
-        self.assertEqual(
-            json.loads(raw)["error"]["message"], "prompt exceeds the context window"
-        )
-
-
-if __name__ == "__main__":
-    unittest.main()

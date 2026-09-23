@@ -1,4 +1,3 @@
-import io
 import json
 import tempfile
 import unittest
@@ -6,10 +5,9 @@ from email.message import Message
 from pathlib import Path
 from unittest import mock
 
-from PIL import Image
 
 from dev.tests.test_server import FakeRuntime, Harness
-from server import crash_trace, http_security, images
+from server import crash_trace, http_security
 from server.errors import APIError
 
 
@@ -98,17 +96,6 @@ class HttpBoundaryTests(unittest.TestCase):
             (first.public_id, second.public_id), ("first-random-id", "second-random-id")
         )
         self.assertNotEqual(first.request_id, second.request_id)
-
-    def test_image_formats_are_explicit(self):
-        for format_name in ("PNG", "JPEG", "WEBP", "GIF", "BMP"):
-            with self.subTest(format=format_name):
-                data = io.BytesIO()
-                Image.new("RGB", (32, 32), "red").save(data, format=format_name)
-                if format_name in images.IMAGE_FORMATS:
-                    self.assertGreater(images.prepare(data.getvalue()).tokens, 0)
-                else:
-                    with self.assertRaises(images.ImageError):
-                        images.prepare(data.getvalue())
 
     def test_crash_content_is_disabled_without_explicit_opt_in(self):
         with tempfile.TemporaryDirectory() as temporary:

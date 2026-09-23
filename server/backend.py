@@ -100,9 +100,6 @@ class Job:
     cache: CacheInfo = field(default_factory=CacheInfo)
     # Image placeholder spans with their grids and digests, plus the
     # concatenated resized pixels the engine encodes during prefill.
-    image_spans: tuple = ()
-    image_pixels: bytes = b""
-    image_owner: object | None = None
     public_id: str = ""
     created_at: int = field(default_factory=lambda: int(time.time()))
     response_store: bool = False
@@ -459,9 +456,6 @@ class NativeBackend:
             cohort=cohort,
             constraint=constraint,
             mask_provider=self._mask_provider(job),
-            image_spans=job.image_spans,
-            image_pixels=job.image_pixels,
-            image_owner=job.image_owner,
             return_progress=job.return_progress,
         )
 
@@ -635,8 +629,7 @@ class NativeBackend:
             state, call = item
             self._finalize(state, call)
             # Do not keep the finished request alive while waiting for the
-            # next terminal: its image batch returns the request budget only
-            # once nothing references it.
+            # next terminal.
             del item, state, call
 
     def _finalize(self, state, call):

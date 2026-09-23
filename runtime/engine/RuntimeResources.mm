@@ -87,7 +87,7 @@ uint64_t checkedAdd(uint64_t left, uint64_t right, std::string_view label) {
 
 uint64_t packedModelFileBytes(const std::filesystem::path &root) {
   uint64_t bytes = 0;
-  for (std::string_view directory : {"target", "draft", "vision"}) {
+  for (std::string_view directory : {"target", "draft"}) {
     const std::filesystem::path package = root / directory;
     for (const auto &entry :
          std::filesystem::recursive_directory_iterator(package)) {
@@ -193,7 +193,6 @@ canonicalRuntimeCacheNamespace(const RuntimeCacheIdentity &identity) {
 void requireLoadedModel(const model::ModelPackage &package) {
   if (!package.targetActualAllocatedBytes() ||
       !package.draft.actualAllocatedBytes ||
-      !package.vision.actualAllocatedBytes ||
       package.manifestFingerprintSha256.empty() ||
       package.targetManifestFingerprint().empty()) {
     throw std::invalid_argument(
@@ -272,8 +271,7 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<MemoryGovernor> memoryGovernor,
     std::unique_ptr<kv::Q8PageStorage> kvPages,
     std::unique_ptr<model::StateStorage> stateStorage,
-    std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
-    uint32_t maximumImagePatches)
+    std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache)
     : backend_(std::move(backend)), model_(std::move(model)),
       operators_(std::move(operators)),
       memoryPlan_(std::move(memoryPlan)),
@@ -281,18 +279,16 @@ RuntimeResources::RuntimeResources(
       cacheIdentity_(std::move(cacheIdentity)),
       memoryGovernor_(std::move(memoryGovernor)), kvPages_(std::move(kvPages)),
       stateStorage_(std::move(stateStorage)), kvPool_(std::move(kvPool)),
-      cache_(std::move(cache)), maximumImagePatches_(maximumImagePatches) {}
+      cache_(std::move(cache)) {}
 
 std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config) {
   if (config.metallibPath.empty() || config.modelRoot.empty() ||
       !config.model.valid() ||
-      config.buildId.empty() || !config.maximumImagePatches ||
-      config.maximumImagePatches % 4) {
+      config.buildId.empty()) {
     throw RuntimeResourcesError(
         RuntimeResourceStage::Configuration,
-        "metallib path, model root, build id, and a merge-aligned image "
-        "patch limit are required");
+        "metallib path, model root and build id are required");
   }
   std::unique_ptr<metal::MetalBackend> backend;
   try {
@@ -381,7 +377,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     ModelMemoryFootprint footprint{
         package.targetActualAllocatedBytes(),
         package.draft.actualAllocatedBytes,
-        package.vision.actualAllocatedBytes,
         modelMemoryPlan.activeStateCellPlannedAllocatedBytes,
         modelMemoryPlan.sharedPrefillPlannedAllocatedBytes,
         modelMemoryPlan.sharedDecodePlannedAllocatedBytes,
@@ -538,7 +533,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         std::move(memoryPlan),
         std::move(modelMemoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
-        std::move(kvPool), std::move(cache), config.maximumImagePatches));
+        std::move(kvPool), std::move(cache)));
     return result;
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::StorageAllocation,
@@ -561,7 +556,6 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       *kvPages_,
       *stateStorage_,
       operators_,
-      maximumImagePatches_,
       budget.pipelineReserveBytes,
       budget.runtimeOverheadReserveBytes,
   };
@@ -573,7 +567,6 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   ActualMemoryReport report;
   report.targetWeightsBytes = model_.targetActualAllocatedBytes();
   report.draftWeightsBytes = model_.draft.actualAllocatedBytes;
-  report.visionWeightsBytes = model_.vision.actualAllocatedBytes;
   report.stateResidentBytes = modelMemory.stateActualAllocatedBytes;
   report.sharedPrefillBytes = modelMemory.sharedPrefillActualAllocatedBytes;
   report.sharedDecodeBytes = modelMemory.sharedDecodeActualAllocatedBytes;

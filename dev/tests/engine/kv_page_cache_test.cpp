@@ -39,49 +39,6 @@ std::array<uint32_t, KvCache::pageTokens> page(uint32_t token) {
   return result;
 }
 
-void testImageIdentityKeysBlocks() {
-  test::TestKvBacking backing(8, 100);
-  KvPool pool(backing);
-  CacheRecency recency;
-  KvCache cache(pool, cacheNamespace(), recency);
-  auto acquired = pool.acquirePages(2, false);
-  require(acquired.granted() && acquired.pages.size() == 2,
-          "test pages were not acquired");
-
-  // Two images with the same grid and placeholder tokens differ only by
-  // content digest; text-only lookups carry the zero identity.
-  const ImageSpan red{8, 16, 8, 8, 0x1111, 0x2222};
-  const ImageSpan blue{8, 16, 8, 8, 0x3333, 0x4444};
-  const std::array<ImageSpan, 1> redSpans{red};
-  const std::array<ImageSpan, 1> blueSpans{blue};
-  require(blockImageIdentity(0, 32, {}) == ImageIdentity{},
-          "text-only block identity must be zero");
-  require(blockImageIdentity(32, 32, redSpans) == ImageIdentity{},
-          "a block after the image must not carry image identity");
-  const ImageIdentity redIdentity = blockImageIdentity(0, 32, redSpans);
-  const ImageIdentity blueIdentity = blockImageIdentity(0, 32, blueSpans);
-  require(redIdentity != ImageIdentity{} && redIdentity != blueIdentity,
-          "image identity does not depend on the content digest");
-  const ImageSpan redLater{40, 16, 8, 8, 0x1111, 0x2222};
-  const std::array<ImageSpan, 1> laterSpans{redLater};
-  require(blockImageIdentity(32, 32, laterSpans) != redIdentity,
-          "image identity ignores the block's alignment inside the image");
-
-  const auto tokens = page(248056);
-  auto redBlock = cache.insert(0, tokens, acquired.pages[0], redIdentity);
-  require(redBlock.inserted, "image block was not inserted");
-  require(!cache.find(0, tokens), "text-only lookup matched an image block");
-  require(!cache.find(0, tokens, blueIdentity),
-          "a different image matched a token-identical block");
-  auto found = cache.find(0, tokens, redIdentity);
-  require(found && found->id == redBlock.id,
-          "identical image content did not match its block");
-  auto blueBlock = cache.insert(0, tokens, acquired.pages[1], blueIdentity);
-  require(blueBlock.inserted && blueBlock.id != redBlock.id,
-          "token-identical blocks with different images were merged");
-  for (uint32_t physical : acquired.pages) pool.releasePage(physical, false);
-  std::cout << "KV image identity ok\n";
-}
 
 void testExactChainedBlocksAndPhysicalOwnership() {
   test::TestKvBacking backing(8, 100);
@@ -315,9 +272,9 @@ void testHashCollisionStillRequiresExactTokens() {
   auto right = left;
   right.back() = 8;
   constexpr uint64_t forcedCollision = 0x12345678;
-  const KvBlockKeyView stored{11, forcedCollision, left, {}};
-  const KvBlockKeyView colliding{11, forcedCollision, right, {}};
-  const KvBlockKeyView exact{11, forcedCollision, left, {}};
+  const KvBlockKeyView stored{11, forcedCollision, left};
+  const KvBlockKeyView colliding{11, forcedCollision, right};
+  const KvBlockKeyView exact{11, forcedCollision, left};
   require(!exactKvBlockKeyMatch(stored, colliding) &&
               exactKvBlockKeyMatch(stored, exact),
           "KV block matching trusted a colliding index hash");
@@ -328,7 +285,6 @@ void testHashCollisionStillRequiresExactTokens() {
 int main() {
   try {
     testExactChainedBlocksAndPhysicalOwnership();
-    testImageIdentityKeysBlocks();
     testErasedLeafParentInheritsRecency();
     testInputValidation();
     testCandidateOrderThroughChurn();

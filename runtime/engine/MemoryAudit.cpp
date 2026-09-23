@@ -45,7 +45,7 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
                                     ActualMemoryReport actual) {
   const EngineMemoryBreakdown &budget = plan.breakdown();
   if (!actual.targetWeightsBytes || !actual.draftWeightsBytes ||
-      !actual.visionWeightsBytes || !actual.stateResidentBytes ||
+      !actual.stateResidentBytes ||
       !actual.sharedPrefillBytes || !actual.sharedDecodeBytes ||
       !actual.kvResidentBytes || !actual.backendAllocatedBytes ||
       !actual.deviceCurrentAllocatedBytes || !actual.devicePeakAllocatedBytes ||
@@ -64,7 +64,6 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
       {"target weights", actual.targetWeightsBytes, budget.targetWeightsBytes},
       {"stream cache", actual.streamCacheBytes, plannedStreamCache},
       {"draft weights", actual.draftWeightsBytes, budget.draftWeightsBytes},
-      {"vision weights", actual.visionWeightsBytes, budget.visionWeightsBytes},
       {"shared prefill", actual.sharedPrefillBytes, budget.sharedPrefillBytes},
       {"shared decode", actual.sharedDecodeBytes, budget.sharedDecodeBytes},
       {"Q8 virtual storage", actual.kvResidentBytes, budget.kvVirtualBytes},
@@ -139,7 +138,7 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
             << backendUnclassified << ", device untracked " << deviceUntracked
             << ", reserve " << reserves << "; target " << actual.targetWeightsBytes
             << ", stream cache " << actual.streamCacheBytes << ", draft "
-            << actual.draftWeightsBytes << ", vision " << actual.visionWeightsBytes
+            << actual.draftWeightsBytes
             << ", prefill " << actual.sharedPrefillBytes << ", decode "
             << actual.sharedDecodeBytes << ", kv " << actual.kvResidentBytes
             << ", state " << actual.stateResidentBytes << ", backend "

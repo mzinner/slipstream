@@ -25,7 +25,7 @@ public:
     path = std::filesystem::temp_directory_path() /
            ("splash-budget-" +
             std::string([NSUUID UUID].UUIDString.UTF8String));
-    for (const char *component : {"target", "draft", "vision"}) {
+    for (const char *component : {"target", "draft"}) {
       std::filesystem::create_directories(path / component);
       const auto file = path / component / "placeholder.bin";
       std::ofstream(file).put('\0');
@@ -39,7 +39,7 @@ public:
   }
 
   static constexpr uint64_t fileBytes = 16 * 1024;
-  static constexpr uint64_t packageBytes = 3 * fileBytes;
+  static constexpr uint64_t packageBytes = 2 * fileBytes;
   std::filesystem::path path;
 };
 
@@ -57,10 +57,8 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
   draft.attentionSize = 2048;
   draft.intermediateSize = 8704;
   draft.targetHiddenSize = model::Qwen4ExpLayout{}.capturedHiddenSize();
-  ops::VisionLayout vision;
-  vision.outputHiddenSize = draft.hiddenSize;
   config.model = model::makeModelDescriptor(
-      "budget-test", model::Qwen4ExpLayout{}, draft, vision);
+      "budget-test", model::Qwen4ExpLayout{}, draft);
   config.buildId = "budget-test";
 
   // Each low ceiling fits two components, so every directory must be counted.
@@ -78,10 +76,12 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
                 "hard weight budget lost its engine-capacity classification");
         require(std::string(error.what()).find("[memory_planning]") !=
                     std::string::npos &&
-                    error.message().find("model weights require 49152 bytes") !=
-                        std::string::npos &&
-                    error.message().find("budget is 49151 bytes") !=
-                        std::string::npos,
+                    error.message().find("model weights require " +
+                                         std::to_string(root.packageBytes) +
+                                         " bytes") != std::string::npos &&
+                    error.message().find("budget is " +
+                                         std::to_string(root.packageBytes - 1) +
+                                         " bytes") != std::string::npos,
                 "weight loading began before checking the memory ceiling");
       } else {
         require(error.failure() == RuntimeResourceFailure::Other,

@@ -42,7 +42,6 @@ SERVER_FILES = (
     "errors.py",
     "runtime.py",
     "protocol.py",
-    "images.py",
     "documents.py",
     "document_worker.py",
     "http_security.py",

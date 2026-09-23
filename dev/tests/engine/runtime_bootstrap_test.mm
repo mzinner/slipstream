@@ -247,7 +247,7 @@ DeviceCapabilities device() {
 
 EngineMemoryPlan memoryPlan() {
   return requireEngineMemoryPlan(
-      device(), test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB));
+      device(), test::modelMemoryProfile(2 * kGiB, 1 * kGiB));
 }
 
 ActualMemoryReport validActual(const EngineMemoryPlan &plan) {
@@ -255,14 +255,12 @@ ActualMemoryReport validActual(const EngineMemoryPlan &plan) {
   ActualMemoryReport actual;
   actual.targetWeightsBytes = budget.targetWeightsBytes;
   actual.draftWeightsBytes = budget.draftWeightsBytes;
-  actual.visionWeightsBytes = budget.visionWeightsBytes;
   actual.stateResidentBytes = budget.activeStateCellBytes;
   actual.sharedPrefillBytes = budget.sharedPrefillBytes;
   actual.sharedDecodeBytes = budget.sharedDecodeBytes;
   actual.kvResidentBytes = budget.kvExtentBytes;
   actual.backendAllocatedBytes =
       actual.targetWeightsBytes + actual.draftWeightsBytes +
-      actual.visionWeightsBytes +
       actual.stateResidentBytes + actual.sharedPrefillBytes +
       actual.sharedDecodeBytes + actual.kvResidentBytes;
   actual.deviceCurrentAllocatedBytes = actual.backendAllocatedBytes;
@@ -488,7 +486,7 @@ void testBudgetLimitedWarmupKeepsRuntimeConcurrency() {
                             (width - 1) * complete.activeStateCellBytes +
                             complete.activeStateCellBytes / 2;
     const EngineMemoryPlan plan = requireEngineMemoryPlan(
-        device(), test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB),
+        device(), test::modelMemoryProfile(2 * kGiB, 1 * kGiB),
         ceiling);
     Harness harness(plan);
     const auto report = warmup(harness, plan);

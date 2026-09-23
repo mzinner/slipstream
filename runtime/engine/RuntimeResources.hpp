@@ -1,6 +1,5 @@
 #pragma once
 
-#include "ops/Vision.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/Cache.hpp"
 #include "engine/MemoryGovernor.hpp"
@@ -72,9 +71,6 @@ struct RuntimeResourcesConfig {
   model::ModelDescriptor model;
   std::string buildId;
   uint64_t maximumMemoryBytes = 0;
-  // Patches per image the vision scratch covers; the protocol limit and the
-  // engine's request validation use the same value.
-  uint32_t maximumImagePatches = ops::kMaximumImagePatches;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Creation seeds the memory governor with it
   // once; after Ready the transport control handler keeps it current.
@@ -188,8 +184,7 @@ private:
                    std::unique_ptr<kv::Q8PageStorage> kvPages,
                    std::unique_ptr<model::StateStorage> stateStorage,
                    std::unique_ptr<KvPool> kvPool,
-                   std::unique_ptr<engine::Cache> cache,
-                   uint32_t maximumImagePatches);
+                   std::unique_ptr<engine::Cache> cache);
 
   std::unique_ptr<metal::MetalBackend> backend_;
   model::ModelPackage model_;
@@ -202,7 +197,6 @@ private:
   std::unique_ptr<model::StateStorage> stateStorage_;
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
-  uint32_t maximumImagePatches_ = 0;
 };
 
 } // namespace splash::engine

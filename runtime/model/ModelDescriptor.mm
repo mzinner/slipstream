@@ -1,5 +1,4 @@
 #include "ModelDescriptor.hpp"
-#include "QwenVision.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -165,8 +164,6 @@ void validateCommonFormat(NSDictionary *format, std::string_view targetMagic) {
   requireEqual(requireString(format, @"draft_layer_magic",
                              "draft_layer_magic"),
                kDFlashLayerMagic, "draft_layer_magic");
-  requireEqual(requireString(format, @"vision_magic", "vision_magic"),
-               kVisionMagic, "vision_magic");
 }
 
 // Provisional, like Qwen4ExpLayout::hiddenCaptureLayers: no DFlash 2 draft
@@ -186,10 +183,7 @@ DFlashDraftLayout qwen4expDraftLayout() {
 
 ModelDescriptor qwen4expDescriptor(std::string name) {
   constexpr Qwen4ExpLayout target;
-  ops::VisionLayout vision;
-  vision.outputHiddenSize = target.hiddenSize;
-  return makeModelDescriptor(std::move(name), target, qwen4expDraftLayout(),
-                             vision);
+  return makeModelDescriptor(std::move(name), target, qwen4expDraftLayout());
 }
 
 void validateTokenizer(const std::filesystem::path &root,
@@ -325,13 +319,11 @@ void validateQwen4Exp(NSDictionary *manifest,
 } // namespace
 
 ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
-                                    DFlashDraftLayout draft,
-                                    ops::VisionLayout vision) {
+                                    DFlashDraftLayout draft) {
   ModelDescriptor result;
   result.name = std::move(name);
   result.target = target;
   result.draft = draft;
-  result.vision = vision;
   std::visit(
       [&](const auto &layout) {
         result.capabilities = {
@@ -362,8 +354,7 @@ bool ModelDescriptor::valid() const noexcept {
       capabilities.targetVerifyRows != ExecutionLimits::targetVerifyRows ||
       capabilities.draftContextTokens != ExecutionLimits::draftContextTokens ||
       !targetKvLayout.valid() || !stateLayout.valid() ||
-      stateLayout.draft != draft.stateLayout() ||
-      vision.outputHiddenSize != draft.hiddenSize) {
+      stateLayout.draft != draft.stateLayout()) {
     return false;
   }
   return std::visit(

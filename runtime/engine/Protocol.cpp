@@ -21,8 +21,7 @@ std::string_view failureClassName(FailureClass failureClass);
 
 constexpr std::array<uint8_t, 4> kMagic{'S', 'P', 'L', 'H'};
 
-constexpr uint64_t kRequestFixedBytes = 60;
-constexpr uint64_t kImageSpanBytes = 32;
+constexpr uint64_t kRequestFixedBytes = 56;
 constexpr uint64_t kCancelFixedBytes = 8;
 constexpr uint64_t kMaskResponseFixedBytes = 20;
 constexpr uint64_t kStatusRequestFixedBytes = 8;
@@ -72,11 +71,9 @@ std::optional<ProtocolIssue> validateLimits(const ProtocolLimits &limits) {
   }
   if (!limits.maxPromptTokens || !limits.maxLogicalOutputTokens ||
       !limits.maxTokenBatch || !limits.maxSimulationTokens ||
-      !limits.maxMaskWords || !limits.maxImageSpans ||
-      !limits.maxImagePatches) {
+      !limits.maxMaskWords) {
     return makeIssue(FailureClass::ProtocolFatal, IssueCode::LimitExceeded, 0,
-                     "all configured token, mask, and image limits must be "
-                     "non-zero");
+                     "all configured token and mask limits must be non-zero");
   }
   return std::nullopt;
 }
@@ -93,7 +90,6 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
   };
   switch (type) {
   case FrameType::Request:
-    // Image pixels dominate prompt tokens; the frame limit is the bound.
     return bounded(kRequestFixedBytes, limits.maxFramePayloadBytes);
   case FrameType::Cancel:
     return bounded(kCancelFixedBytes, kCancelFixedBytes);
@@ -378,37 +374,6 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
     return invalid(IssueCode::LimitExceeded,
                    "prompt token count exceeds its limit");
   }
-  if (request.imageSpans.size() > limits.maxImageSpans) {
-    return invalid(IssueCode::LimitExceeded,
-                   "image span count exceeds its limit");
-  }
-  uint64_t previousSpanEnd = 0;
-  uint64_t pixelBytes = 0;
-  for (const ImageSpanFrame &span : request.imageSpans) {
-    const uint64_t patches = uint64_t{span.gridHeight} * span.gridWidth;
-    if (span.gridHeight < 2 || span.gridWidth < 2 || span.gridHeight % 2 ||
-        span.gridWidth % 2 || patches > limits.maxImagePatches) {
-      return invalid(IssueCode::InvalidCount,
-                     "image grid must be even-sided and within the patch "
-                     "limit");
-    }
-    if (span.tokens != (span.gridHeight / 2) * (span.gridWidth / 2)) {
-      return invalid(IssueCode::InvalidCount,
-                     "image span tokens must equal the merged grid size");
-    }
-    const uint64_t end = uint64_t{span.offset} + span.tokens;
-    if (span.offset < previousSpanEnd || end > request.promptTokens.size()) {
-      return invalid(IssueCode::InvalidCount,
-                     "image spans must be sorted, non-overlapping runs inside "
-                     "the prompt");
-    }
-    previousSpanEnd = end;
-    pixelBytes += span.pixelBytes();
-  }
-  if (request.imagePixels.size() != pixelBytes) {
-    return invalid(IssueCode::InvalidCount,
-                   "image pixels do not match the image grids");
-  }
   const SamplingParameters &sampling = request.sampling;
   if (!std::isfinite(sampling.temperature) || sampling.temperature < 0.0f ||
       !std::isfinite(sampling.topP) || sampling.topP <= 0.0f ||
@@ -605,13 +570,9 @@ ProtocolResult<Frame> encodeRequest(const RequestFrame &request,
   }
   uint64_t payloadBytes = 0;
   uint64_t tokenBytes = 0;
-  uint64_t spanBytes = 0;
   if (!checkedMultiply(request.promptTokens.size(), sizeof(uint32_t),
                        tokenBytes) ||
-      !checkedMultiply(request.imageSpans.size(), kImageSpanBytes, spanBytes) ||
       !checkedAdd(kRequestFixedBytes, tokenBytes, payloadBytes) ||
-      !checkedAdd(payloadBytes, spanBytes, payloadBytes) ||
-      !checkedAdd(payloadBytes, request.imagePixels.size(), payloadBytes) ||
       payloadBytes > std::numeric_limits<size_t>::max()) {
     return failure<Frame>(
         makeIssue(FailureClass::RequestError, IssueCode::IntegerOverflow,
@@ -626,7 +587,6 @@ ProtocolResult<Frame> encodeRequest(const RequestFrame &request,
   writer.u64(request.remainingDeadlineMicros);
   writer.u32(request.logicalMaxOutputTokens);
   writer.u32(static_cast<uint32_t>(request.promptTokens.size()));
-  writer.u32(static_cast<uint32_t>(request.imageSpans.size()));
   writer.f32(request.sampling.temperature);
   writer.f32(request.sampling.topP);
   writer.u32(request.sampling.topK);
@@ -634,15 +594,6 @@ ProtocolResult<Frame> encodeRequest(const RequestFrame &request,
   writer.u8(request.returnProgress);
   for (uint32_t token : request.promptTokens)
     writer.u32(token);
-  for (const ImageSpanFrame &span : request.imageSpans) {
-    writer.u32(span.offset);
-    writer.u32(span.tokens);
-    writer.u32(span.gridHeight);
-    writer.u32(span.gridWidth);
-    writer.u64(span.digestLo);
-    writer.u64(span.digestHi);
-  }
-  writer.raw(request.imagePixels);
   return success(Frame{FrameType::Request, writer.take()});
 }
 
@@ -823,13 +774,11 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
   uint8_t constraint = 0;
   uint8_t returnProgress = 0;
   uint32_t promptCount = 0;
-  uint32_t imageSpanCount = 0;
   if (!reader.u64(request.requestId) || !reader.u8(priority) ||
       !reader.u8(cohort) || !reader.u8(constraint) ||
       !reader.u64(request.absoluteDeadlineUnixMicros) ||
       !reader.u64(request.remainingDeadlineMicros) ||
       !reader.u32(request.logicalMaxOutputTokens) || !reader.u32(promptCount) ||
-      !reader.u32(imageSpanCount) ||
       !reader.f32(request.sampling.temperature) ||
       !reader.f32(request.sampling.topP) ||
       !reader.u32(request.sampling.topK) || !reader.u64(request.seed) ||
@@ -852,35 +801,16 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
         makeIssue(FailureClass::RequestError, IssueCode::LimitExceeded,
                   request.requestId, "prompt token count exceeds its limit"));
   }
-  if (imageSpanCount > limits.maxImageSpans) {
-    return failure<Message>(
-        makeIssue(FailureClass::RequestError, IssueCode::LimitExceeded,
-                  request.requestId, "image span count exceeds its limit"));
-  }
   if (!reader.words(promptCount, request.promptTokens)) {
     return failure<Message>(
         makeIssue(FailureClass::RequestError, IssueCode::InvalidPayloadLength,
                   request.requestId,
                   "prompt count does not match the binary token payload"));
   }
-  request.imageSpans.resize(imageSpanCount);
-  uint64_t pixelBytes = 0;
-  for (ImageSpanFrame &span : request.imageSpans) {
-    if (!reader.u32(span.offset) || !reader.u32(span.tokens) ||
-        !reader.u32(span.gridHeight) || !reader.u32(span.gridWidth) ||
-        !reader.u64(span.digestLo) || !reader.u64(span.digestHi) ||
-        !checkedAdd(pixelBytes, span.pixelBytes(), pixelBytes)) {
-      return failure<Message>(
-          makeIssue(FailureClass::RequestError, IssueCode::InvalidPayloadLength,
-                    request.requestId, "image span payload is malformed"));
-    }
-  }
-  if (reader.remaining() != pixelBytes ||
-      !reader.bytes(pixelBytes, request.imagePixels)) {
+  if (reader.remaining()) {
     return failure<Message>(
         makeIssue(FailureClass::RequestError, IssueCode::InvalidPayloadLength,
-                  request.requestId,
-                  "image pixel payload does not match the image grids"));
+                  request.requestId, "request payload has trailing bytes"));
   }
   if (auto issue = validateRequest(request, limits)) {
     return failure<Message>(std::move(*issue));

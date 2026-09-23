@@ -263,7 +263,7 @@ class CompileConfigurationTests(unittest.TestCase):
 
             outputs = (
                 "splash",
-                "engine-tests/vision-encoder",
+                "engine-tests/qwen4exp-package",
                 "engine-tests/attention-sweep",
                 "engine-tests/metal-backend.metallib",
                 "sanitizers/native-fd-asan-ubsan",

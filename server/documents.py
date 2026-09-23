@@ -1,8 +1,7 @@
-"""Prepare PDF pages as text and images for the existing vision prompt path."""
+"""Prepare PDF pages as text (the model reads text only)."""
 
 import base64
 import hashlib
-import io
 import math
 import threading
 import time
@@ -17,7 +16,6 @@ else:
 
 MAX_PDF_BYTES = 10 * 1024 * 1024
 MAX_PAGES = 20
-MAX_PAGE_PIXELS = 1024 * 1024
 MAX_TEXT_CHARACTERS = 1_000_000
 MAX_RENDERED_BYTES = 32 * 1024 * 1024
 MAX_REQUEST_DOCUMENT_BYTES = 64 * 1024 * 1024
@@ -48,25 +46,21 @@ class DocumentBudget:
 @dataclass(frozen=True, slots=True)
 class Page:
     text: str
-    image_url: str
 
     @property
     def size(self):
-        return len(self.text) * 4 + len(self.image_url)
+        return len(self.text) * 4
 
 
 @dataclass(frozen=True, slots=True)
 class RenderLimits:
     pages: int
-    page_pixels: int
     text_characters: int
     rendered_bytes: int
 
 
 def _render_limits():
-    return RenderLimits(
-        MAX_PAGES, MAX_PAGE_PIXELS, MAX_TEXT_CHARACTERS, MAX_RENDERED_BYTES
-    )
+    return RenderLimits(MAX_PAGES, MAX_TEXT_CHARACTERS, MAX_RENDERED_BYTES)
 
 
 # Serialize cache misses so only one bounded PDF worker is active at a time.
@@ -117,26 +111,7 @@ def render_pages(payload, budget, limits=None):
                         if total_characters > limits.text_characters:
                             raise APIError(400, "PDF text exceeds the size limit")
                         text = text_page.get_text_bounded().strip()
-                    scale = min(2.0, math.sqrt(limits.page_pixels / width / height))
-                    while (
-                        math.ceil(width * scale) * math.ceil(height * scale)
-                        > limits.page_pixels
-                    ):
-                        scale *= 0.99
-                    with (
-                        closing(
-                            page.render(
-                                scale=scale, rev_byteorder=True, limit_image_cache=True
-                            )
-                        ) as bitmap,
-                        bitmap.to_pil() as image,
-                    ):
-                        buffer = io.BytesIO()
-                        image.save(buffer, format="PNG")
-                    image_url = "data:image/png;base64," + base64.b64encode(
-                        buffer.getvalue()
-                    ).decode("ascii")
-                    prepared = Page(f"PDF page {index + 1}:\n{text}\n", image_url)
+                    prepared = Page(f"PDF page {index + 1}:\n{text}\n")
                     total_bytes += prepared.size
                     if total_bytes > limits.rendered_bytes:
                         raise APIError(400, "rendered PDF exceeds the size limit")
@@ -154,7 +129,7 @@ def render_pages(payload, budget, limits=None):
             raise APIError(400, "PDF security handler is not supported") from error
         raise APIError(400, "PDF document could not be decoded") from error
     except (ValueError, OverflowError) as error:
-        raise APIError(400, "PDF document could not be rendered") from error
+        raise APIError(400, "PDF document could not be read") from error
 
 
 def _pages(encoded, budget):
@@ -191,7 +166,7 @@ def _pages(encoded, budget):
 
 
 def document_content(block, *, budget=None):
-    """Translate an inline PDF into canonical text/image parts, preserving pages."""
+    """Translate an inline PDF into canonical text parts, one per page."""
     if budget is None:
         budget = DocumentBudget()
     source = block.get("source")
@@ -230,12 +205,11 @@ def pdf_content(encoded, *, budget=None):
     parts = []
     for page in _pages(encoded, budget):
         parts.append({"type": "text", "text": page.text})
-        parts.append({"type": "image_url", "image_url": {"url": page.image_url}})
     return parts
 
 
 def file_content(file, *, budget):
-    """Translate OpenAI inline PDFs into canonical text/image parts."""
+    """Translate OpenAI inline PDFs into canonical text parts."""
     if not isinstance(file, dict):
         raise APIError(400, "file must be an object")
     if file.get("file_id") is not None or file.get("file_url") is not None:

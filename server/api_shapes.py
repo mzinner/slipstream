@@ -43,18 +43,14 @@ def _text_content(content):
 
 
 def _image_part(url):
-    if not isinstance(url, str):
-        raise APIError(400, "invalid image content part")
-    return {"type": "image_url", "image_url": {"url": url}}
+    raise APIError(400, "image input is not supported: this model reads text only")
 
 
 def _user_content(content, document_budget=None):
-    """Text for plain user content; a canonical parts list when it carries
-    images, so the chat template places each image where the author put it."""
+    """User content as one text string; image parts are rejected."""
     if not isinstance(content, list):
         return _text_content(content)
     parts = []
-    images = 0
     for part in content:
         if not isinstance(part, dict):
             raise APIError(400, "message content parts must be objects")
@@ -63,7 +59,6 @@ def _user_content(content, document_budget=None):
             image_url = part.get("image_url")
             url = image_url.get("url") if isinstance(image_url, dict) else image_url
             parts.append(_image_part(url))
-            images += 1
         elif kind in ("text", "input_text"):
             text = part.get("text", "")
             if not isinstance(text, str):
@@ -72,14 +67,11 @@ def _user_content(content, document_budget=None):
         elif kind == "file":
             rendered = file_content(part.get("file"), budget=document_budget)
             parts.extend(rendered)
-            images += sum(p["type"] == "image_url" for p in rendered)
         elif kind in ("video", "video_url", "input_audio"):
             raise APIError(400, f"{kind} content is not supported")
         else:
             raise APIError(400, "unsupported message content part")
-    if not images:
-        return "".join(part["text"] for part in parts)
-    return parts
+    return "".join(part["text"] for part in parts)
 
 
 _JSON_NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")

@@ -223,7 +223,6 @@ def request(
     cohort=wire.Cohort.GREEDY,
     constraint=wire.ConstraintMode.NONE,
     mask_provider=None,
-    image_owner=None,
 ):
     return engine_runtime.GenerationRequest(
         prompt_tokens=(token, token + 1),
@@ -235,7 +234,6 @@ def request(
         cohort=cohort,
         constraint=constraint,
         mask_provider=mask_provider,
-        image_owner=image_owner,
     )
 
 
@@ -1024,19 +1022,19 @@ class RuntimeTests(unittest.TestCase):
         runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
         self.addCleanup(runtime.close)
 
-        class ImageOwner:
-            """Stands in for the frontend's byte-budgeted image batch."""
+        class Probe:
+            """An object only the request holds, to see when it is released."""
 
-        owner = ImageOwner()
+        owner = Probe()
         released = weakref.ref(owner)
-        call = runtime.submit(request(160, image_owner=owner))
+        call = runtime.submit(request(160, mask_provider=owner))
         del owner
         factory.processes[0].close_stdout()
 
         def finalize(call):
             # The frontend finalizer raises the failure and returns. Whatever
             # the runtime keeps of that failure must not keep this frame, and
-            # with it the request's image owner, alive.
+            # with it the request's probe object, alive.
             try:
                 call.result(1.0)
             except engine_runtime.EngineUnhealthy as failure:

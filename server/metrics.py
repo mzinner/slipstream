@@ -141,8 +141,6 @@ def prometheus_metrics(status):
             "constraint_masks",
             "last_residual_wait_ms",
         ),
-        "splash_image_encodes_total": ("images", "encodes"),
-        "splash_image_embedding_reuses_total": ("images", "embedding_reuses"),
         "splash_memory_current_bytes": ("memory_actual", "current_bytes"),
         "splash_memory_peak_bytes": ("memory_actual", "peak_bytes"),
         "splash_memory_denied_reservations_total": (

@@ -3,7 +3,6 @@
 #include "DFlashDraft.hpp"
 #include "Model.hpp"
 #include "Qwen4Exp.hpp"
-#include "ops/Vision.hpp"
 
 #include <array>
 #include <cstdint>
@@ -22,7 +21,6 @@ struct ModelDescriptor final {
   std::string name;
   TargetLayout target;
   DFlashDraftLayout draft;
-  ops::VisionLayout vision;
   ModelCapabilities capabilities;
   kv::Q8Layout targetKvLayout;
   CompositeStateLayout stateLayout;
@@ -41,8 +39,7 @@ struct ModelDescriptor final {
 // concrete target and draft layouts.
 [[nodiscard]] ModelDescriptor makeModelDescriptor(std::string name,
                                                   TargetLayout target,
-                                                  DFlashDraftLayout draft,
-                                                  ops::VisionLayout vision);
+                                                  DFlashDraftLayout draft);
 [[nodiscard]] ModelDescriptor
 inspectModelPackage(const std::filesystem::path &root);
 

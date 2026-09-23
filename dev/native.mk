@@ -27,7 +27,6 @@ BACKEND_CONTROL_SOURCES := \
 MODEL_SOURCES := \
 	runtime/model/WeightStore.cpp \
 	runtime/model/Qwen4Exp.cpp \
-	runtime/model/QwenVision.cpp \
 	runtime/model/QwenTarget.cpp \
 	runtime/model/Qwen4ExpTarget.cpp \
 	runtime/model/DFlashDraft.cpp \
@@ -99,8 +98,6 @@ TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
 TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
 TEST_GENERATE_SAMPLE := $(ENGINE_TEST_BUILD)/generate-sample
 TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
-TEST_MODEL_RUNTIME_ORACLE := $(ENGINE_TEST_BUILD)/model-runtime-oracle
-TEST_VISION_ENCODER_TEST := $(ENGINE_TEST_BUILD)/vision-encoder
 TEST_Q8_AIR := $(ENGINE_TEST_BUILD)/q8-paged-kv.air
 TEST_Q8_LIB := $(ENGINE_TEST_BUILD)/q8-paged-kv.metallib
 # Both Q8 tests share the attention and store kernels of both phases.
@@ -171,7 +168,6 @@ TEST_UNIT_TEST_TARGETS := $(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))
 # Keep every output that uses a flag set together, including standalone
 # benchmarks, real-model tests and intermediate test AIRs/metallibs.
 TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(TEST_UNIT_TEST_TARGETS)) \
-	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) \
 	$(TEST_DECODE_PROFILE) $(TEST_GENERATE_SAMPLE) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_METAL_BACKEND_AIR)
 PRODUCTION_CONFIG_TARGETS += $(TEST_Q4_PREFILL_PROFILE) \
@@ -519,20 +515,7 @@ $(TEST_METAL_BACKEND_TEST): runtime/metal/DeviceCapabilities.cpp \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_VISION_ENCODER_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm \
-		$(MODEL_SOURCES) \
-		$(MODEL_OPERATOR_SOURCES) \
-		runtime/ops/Vision.mm \
-		dev/tests/engine/vision_encoder_test.mm | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
-		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_MODEL_RUNTIME_ORACLE): dev/tests/engine/model_runtime_oracle_test.mm \
-		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
-		$(ENGINE_LIBRARY) \
-		$(ENGINE_LINKFLAGS) -o $@
 
 
 $(TEST_DECODE_PROFILE): dev/benchmarks/decode_profile.mm \
@@ -625,17 +608,10 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_DRAFT_SELECTOR_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_METAL_BACKEND_TEST) $(TEST_METAL_BACKEND_LIB)
 
-.PHONY: test-real
 VISION_FIXTURE_incoai/Qwen3.8-27B-Splash := qwen3.8-27b
 VISION_FIXTURE_incoai/Qwen3.6-35B-A3B-Splash := qwen3.6-35b-a3b
 VISION_FIXTURE_incoai/Qwen3.8-27B-Splash := qwen3.8-27b
 VISION_FIXTURE_incoai/Qwen3.6-35B-A3B-Splash := qwen3.6-35b-a3b
-test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
-		$(TEST_VISION_ENCODER_TEST) $(LIB)
-	$(METAL_TEST_ENV) $(TEST_VISION_ENCODER_TEST) $(LIB) $(MODEL_ROOT) \
-		dev/tests/fixtures/vision-parity/$(VISION_FIXTURE_$(MODEL))
-	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) $(MODEL_ROOT)
-
 .PHONY: benchmark-prefill benchmark-decode benchmark-backend \
 	benchmark-decode-profile benchmark-attention-sweep
 benchmark-prefill: all $(TEST_Q4_PREFILL_PROFILE)

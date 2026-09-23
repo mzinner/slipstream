@@ -39,15 +39,11 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
       result.descriptor.target);
   result.draft = loadDFlashDraftWeights(
       backend, root / "draft", result.descriptor.draft);
-  result.vision = loadQwenVisionWeights(
-      backend, root / "vision", result.descriptor.vision);
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),
                                         result.targetFiles().end());
   records.insert(records.end(), result.draft.files.begin(),
                  result.draft.files.end());
-  records.insert(records.end(), result.vision.files.begin(),
-                 result.vision.files.end());
   result.manifestFingerprintSha256 = weightManifestFingerprint(records);
   requireCompatibleModelPackage(result);
   return result;

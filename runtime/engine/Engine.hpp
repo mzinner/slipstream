@@ -1,6 +1,5 @@
 #pragma once
 
-#include "ops/Vision.hpp"
 #include "engine/Cache.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/Scheduler.hpp"
@@ -23,8 +22,6 @@ struct EngineConfig final {
   // Zero disables progress checkpoints without changing reusable end states.
   uint32_t prefillCheckpointTokens =
       2 * model::ExecutionLimits::draftContextTokens;
-  // Patches per image the model's vision scratch covers.
-  uint32_t maxImagePatches = ops::kMaximumImagePatches;
   // Rows per prompt command: the package's chunk, at most the built maximum.
   uint32_t prefillChunkTokens = model::ExecutionLimits::defaultPrefillChunkTokens;
   double resourceWaitTimeoutMilliseconds = 30000.0;

@@ -25,22 +25,10 @@ struct CacheNamespace final {
   bool operator==(const CacheNamespace &) const = default;
 };
 
-struct ImageIdentity final {
-  uint64_t lo = 0;
-  uint64_t hi = 0;
-
-  bool operator==(const ImageIdentity &) const = default;
-};
-
-[[nodiscard]] ImageIdentity
-blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
-                   std::span<const ImageSpan> spans) noexcept;
-
 struct KvBlockKeyView final {
   uint64_t parentBlock = 0;
   uint64_t indexHash = 0;
   std::span<const uint32_t> tokens;
-  ImageIdentity images;
 };
 
 // Hashes filter candidates; equality still requires the complete key.
@@ -79,15 +67,12 @@ public:
   KvCache &operator=(const KvCache &) = delete;
   ~KvCache() noexcept;
 
-  // Keys are the parent block, the exact tokens, and the identity of any
-  // image content the rows depend on (zero for text-only blocks).
+  // Keys are the parent block and the exact tokens.
   [[nodiscard]] std::optional<BlockMatch> find(uint64_t parentBlock,
-                                               std::span<const uint32_t> tokens,
-                                               ImageIdentity images = {}) const;
+                                               std::span<const uint32_t> tokens) const;
   [[nodiscard]] InsertResult insert(uint64_t parentBlock,
                                     std::span<const uint32_t> tokens,
-                                    uint32_t physicalPage,
-                                    ImageIdentity images = {});
+                                    uint32_t physicalPage);
 
   void retainActive(uint64_t blockId);
   void releaseActive(uint64_t blockId) noexcept;
@@ -115,7 +100,6 @@ private:
     uint64_t parent = 0;
     uint64_t indexHash = 0;
     std::array<uint32_t, pageTokens> tokens{};
-    ImageIdentity images;
     uint32_t physicalPage = 0;
     uint32_t children = 0;
     uint32_t activeUsers = 0;
@@ -128,8 +112,7 @@ private:
   };
 
   [[nodiscard]] uint64_t indexHash(uint64_t parentBlock,
-                                   std::span<const uint32_t> tokens,
-                                   ImageIdentity images) const noexcept;
+                                   std::span<const uint32_t> tokens) const noexcept;
   [[nodiscard]] Block &block(uint64_t blockId);
   [[nodiscard]] const Block &block(uint64_t blockId) const;
   void touchEvictable(uint64_t blockId) noexcept;

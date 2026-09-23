@@ -250,8 +250,8 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
     return true;
   }
 
-  // The frame dies with this handler, so its large payloads (prompt
-  // tokens, image pixels) move into the engine request. Error paths below
+  // The frame dies with this handler, so its large payload (prompt
+  // tokens) moves into the engine request. Error paths below
   // only read the request id.
   try {
     EngineRequest engineRequest;
@@ -259,13 +259,6 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
     engineRequest.priority = mapPriority(request.priority);
     engineRequest.cohort = mapCohort(request.cohort);
     engineRequest.prompt = std::move(request.promptTokens);
-    engineRequest.images.reserve(request.imageSpans.size());
-    for (const protocol::ImageSpanFrame &span : request.imageSpans) {
-      engineRequest.images.push_back({span.offset, span.tokens, span.gridHeight,
-                                      span.gridWidth, span.digestLo,
-                                      span.digestHi});
-    }
-    engineRequest.imagePixels = std::move(request.imagePixels);
     engineRequest.maxNewTokens = request.logicalMaxOutputTokens;
     engineRequest.sampling = {request.sampling.temperature,
                               request.sampling.topP, request.sampling.topK,

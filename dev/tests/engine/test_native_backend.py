@@ -12,7 +12,7 @@ from server import backend as backend_api
 from server import constraints as generation_constraints
 from server import errors as api_errors
 from server import frontend as request_frontend
-from server import images, runtime
+from server import runtime
 from server import protocol as wire
 
 
@@ -410,39 +410,6 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(result.request_wall_ms, 4.0)
         self.assertEqual(constraint.consumed, [(7, 8)])
         self.assertFalse(transport.active)
-
-    def test_finalized_request_returns_its_image_budget(self):
-        factory = FakeFactory()
-        transport, _runtime = self.make_transport(
-            runtime.MultiplexedRuntime(process_factory=factory, pending_limit=4)
-        )
-        cache = images.ImageCache(budget_bytes=0, request_budget_bytes=4)
-        job = make_job()
-        job.image_owner = cache.request_batch()
-        job.image_owner.append(images.PreparedImage(2, 2, b"abcd", 0, 0))
-        self.assertEqual(cache.stats()["request_bytes"], 4)
-
-        self.assertTrue(transport.submit(job))
-        process = factory.processes[0]
-        frame = process.stdin.wait_for(wire.RequestFrame)[0]
-        process.send(
-            wire.StartEvent(frame.request_id, wire.CacheDisposition.MISS, 0, 0, 4096)
-        )
-        process.send(
-            wire.DoneEvent(
-                frame.request_id, wire.FinishReason.STOP, 4, 0, 100, 200, 350
-            )
-        )
-        self.assertEqual(self.terminal(job)[0], "done")
-        del job
-
-        # The done event precedes the finalizer dropping the request; the
-        # batch then hangs only on the state/call callback cycle.
-        deadline = time.monotonic() + 1.0
-        while cache.stats()["request_bytes"] and time.monotonic() < deadline:
-            gc.collect()
-            time.sleep(0.001)
-        self.assertEqual(cache.stats()["request_bytes"], 0)
 
     def test_inline_completion_cannot_leave_stale_active_job(self):
         transport, _runtime = self.make_transport(FakeRuntime("complete_inline"))

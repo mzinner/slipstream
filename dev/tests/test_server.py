@@ -1184,420 +1184,6 @@ class ServerTest(unittest.TestCase):
             ],
         }
 
-    def test_image_parts_expand_placeholders_and_carry_spans_and_pixels(self):
-        runtime = FakeRuntime(Plan([[4]]))
-        harness = self.harness(runtime, tokenizer=self.ImagePadTokenizer())
-        status, _, _ = harness.request(
-            "POST", "/v1/chat/completions", self.body(messages=[self._image_message()])
-        )
-        self.assertEqual(status, 200)
-        request = runtime.requests[0]
-        # 64x64 upscales to the 256x256 minimum: a 16x16 patch grid, 64 tokens.
-        self.assertEqual(request.prompt_tokens, (101, *([50] * 64), 102))
-        (span,) = request.image_spans
-        self.assertEqual(
-            (span.offset, span.tokens, span.grid_height, span.grid_width),
-            (1, 64, 16, 16),
-        )
-        self.assertEqual(len(request.image_pixels), 256 * 256 * 3)
-        self.assertEqual(request.image_pixels[:3], bytes((200, 30, 30)))
-        digest = hashlib.sha256(
-            struct.pack("<II", 16, 16) + request.image_pixels
-        ).digest()
-        self.assertEqual(
-            (span.digest_lo, span.digest_hi), struct.unpack_from("<QQ", digest)
-        )
-        rendered, _ = harness.tokenizer.templates[-1]
-        self.assertEqual(
-            [part["type"] for part in rendered[0]["content"]], ["text", "image_url"]
-        )
-        # Repeats reuse the prepared image instead of decoding again.
-        harness.request(
-            "POST", "/v1/chat/completions", self.body(messages=[self._image_message()])
-        )
-        self.assertEqual(harness.app.images.stats()["entries"], 1)
-        self.assertEqual(runtime.requests[1].image_spans, request.image_spans)
-
-    def test_image_positions_ignore_quoted_vision_tokens(self):
-        from tokenizers import pre_tokenizers
-        from transformers import PreTrainedTokenizerFast
-
-        backend = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
-        backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
-        tokenizer = PreTrainedTokenizerFast(
-            tokenizer_object=backend,
-            additional_special_tokens=[
-                api_shapes.IMAGE_PAD_TOKEN,
-                "<|vision_start|>",
-                "<|vision_end|>",
-            ],
-        )
-        tokenizer.chat_template = (
-            "{% for message in messages %}{{ message.role }}: "
-            "{% if message.content is string %}{{ message.content }}"
-            "{% else %}{% for part in message.content %}"
-            "{% if part.type == 'image_url' %}"
-            "{{ '<|vision_start|><|image_pad|><|vision_end|>' }}"
-            "{% else %}{{ part.text }}{% endif %}{% endfor %}{% endif %}"
-            "{{ '\\n' }}{% endfor %}"
-        )
-        app = object.__new__(request_frontend.Frontend)
-        app.tokenizer = tokenizer
-        app.max_context = 1024
-        quoted = "中文 📷 <|vision_start|><|image_pad|><|vision_end|>"
-        messages = [
-            {"role": "system", "content": "Document: " + api_shapes.IMAGE_PAD_TOKEN},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": "unused"}},
-                    {"type": "text", "text": quoted},
-                ],
-            },
-            {
-                "role": "tool",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": "unused"}},
-                    {"type": "text", "text": quoted},
-                ],
-            },
-        ]
-        template = {"tokenize": True, "return_dict": False}
-        baseline = tokenizer.apply_chat_template(messages, **template)
-        pad_id = tokenizer.convert_tokens_to_ids(api_shapes.IMAGE_PAD_TOKEN)
-        all_pads = [i for i, token in enumerate(baseline) if token == pad_id]
-        self.assertEqual(len(all_pads), 5)
-        tokens, positions, rendered = app._render_image_tokens(messages, template)
-        self.assertEqual(tokens, baseline)
-        self.assertEqual(
-            rendered, tokenizer.apply_chat_template(messages, tokenize=False)
-        )
-        self.assertEqual(positions, [all_pads[1], all_pads[3]])
-        # Render markers must not change prompt/cache identity on a repeat.
-        self.assertEqual(
-            app._render_image_tokens(messages, template), (tokens, positions, rendered)
-        )
-        prepared = [
-            SimpleNamespace(
-                tokens=4,
-                grid_height=4,
-                grid_width=4,
-                digest_lo=i,
-                digest_hi=0,
-                pixels=bytes([i]),
-            )
-            for i in (1, 2)
-        ]
-        expanded, spans, pixels = app._expand_image_pads(tokens, prepared, positions)
-        expected = list(baseline)
-        for position in reversed(positions):
-            expected[position : position + 1] = [pad_id] * 4
-        self.assertEqual(expanded, expected)
-        self.assertEqual(
-            [span.offset for span in spans], [positions[0], positions[1] + 3]
-        )
-        self.assertEqual(pixels, b"\x01\x02")
-        with self.assertRaisesRegex(api.APIError, "image count"):
-            app._expand_image_pads(tokens, prepared[:1], positions)
-
-    def test_image_size_is_checked_before_pixel_concatenation(self):
-        app = self.harness(FakeRuntime(), tokenizer=self.ImagePadTokenizer()).app
-
-        class UnmaterializedPixels:
-            def __len__(self):
-                return native_wire.ABSOLUTE_MAX_FRAME_PAYLOAD_BYTES
-
-        # No huge buffer: trying to concatenate this sentinel raises TypeError.
-        # The size guard must reject using lengths alone, before any copy.
-        image = SimpleNamespace(
-            tokens=4,
-            pixels=UnmaterializedPixels(),
-            grid_height=4,
-            grid_width=4,
-            digest_lo=0,
-            digest_hi=0,
-        )
-        pad = app.tokenizer.convert_tokens_to_ids(api_shapes.IMAGE_PAD_TOKEN)
-        with self.assertRaisesRegex(api.APIError, "request size limit"):
-            app._expand_image_pads([pad], [image], [0])
-
-    def test_image_count_is_checked_before_decoding(self):
-        app = self.harness(FakeRuntime(), tokenizer=self.ImagePadTokenizer()).app
-        part = self._image_message()["content"][1]
-        limit = native_wire.ProtocolLimits().max_image_spans
-        messages = [
-            {"role": "user", "content": [part] * limit},
-            {"role": "tool", "content": [part]},
-        ]
-        with mock.patch.object(api.image_input, "decode_data_url") as decode:
-            with self.assertRaisesRegex(api.APIError, f"at most {limit} images"):
-                app._prepare_images(messages, check_context=False)
-            decode.assert_not_called()
-        self.assertEqual(app.images.stats()["request_bytes"], 0)
-        prepared = app._prepare_images(messages[:1], check_context=False)
-        self.assertEqual(len(prepared), limit)
-        del prepared
-        self.assertEqual(app.images.stats()["request_bytes"], 0)
-
-    def test_image_context_is_checked_before_expanding_placeholders(self):
-        app = self.harness(FakeRuntime(), tokenizer=self.ImagePadTokenizer()).app
-        image = SimpleNamespace(
-            tokens=app.max_context,
-            pixels=b"",
-            grid_height=16,
-            grid_width=32,
-            digest_lo=0,
-            digest_hi=0,
-        )
-        pad = app.tokenizer.convert_tokens_to_ids(api_shapes.IMAGE_PAD_TOKEN)
-        with self.assertRaisesRegex(api.APIError, "context window"):
-            app._expand_image_pads([pad], [image], [0])
-
-    def test_image_preparation_stops_at_aggregate_budget(self):
-        app = self.harness(FakeRuntime()).app
-        image = SimpleNamespace(tokens=1, pixels=b"x" * 512)
-        messages = [
-            {
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": "data:image/png;base64,AA=="},
-                    }
-                ]
-                * 3
-            }
-        ]
-        with (
-            mock.patch.object(native_wire, "ABSOLUTE_MAX_FRAME_PAYLOAD_BYTES", 1024),
-            mock.patch.object(app.images, "prepare", return_value=image) as prepare,
-            self.assertRaisesRegex(api.APIError, "request size limit"),
-        ):
-            app._prepare_images(messages)
-        self.assertEqual(prepare.call_count, 2)
-
-    def test_image_request_budget_survives_native_owner_and_recovers(self):
-        app = self.harness(
-            FakeRuntime(), tokenizer=self.ImagePadTokenizer(), max_context=1024
-        ).app
-        app.images = api.image_input.ImageCache(request_budget_bytes=256 * 256 * 3)
-        job, _, _ = app.prepare(self.body(messages=[self._image_message()]))
-        native_request = app.backend._generation_request(job)
-        self.assertIs(native_request.image_owner, job.image_owner)
-        del job
-        with self.assertRaisesRegex(api.APIError, "image memory budget") as failure:
-            app.prepare(self.body(messages=[self._image_message()]))
-        self.assertEqual(failure.exception.status, 503)
-        del native_request
-        self.assertEqual(app.images.stats()["request_bytes"], 0)
-        job, _, _ = app.prepare(self.body(messages=[self._image_message()]))
-        self.assertGreater(app.images.stats()["request_bytes"], 0)
-        del job
-        self.assertEqual(app.images.stats()["request_bytes"], 0)
-
-    def test_anthropic_and_responses_images_reach_the_same_pipeline(self):
-        runtime = FakeRuntime(Plan([[4]]), Plan([[4]]))
-        harness = self.harness(runtime, tokenizer=self.ImagePadTokenizer())
-        url = self._png_data_url((30, 30, 200))
-        media_type, _, data = url.partition(";base64,")
-        status, _, _ = harness.request(
-            "POST",
-            "/v1/messages",
-            self.anthropic_body(
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "before"},
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": media_type.removeprefix("data:"),
-                                    "data": data,
-                                },
-                            },
-                            {"type": "text", "text": "after"},
-                        ],
-                    }
-                ]
-            ),
-        )
-        self.assertEqual(status, 200)
-        rendered, _ = harness.tokenizer.templates[-1]
-        self.assertEqual(
-            [part["type"] for part in rendered[0]["content"]],
-            ["text", "image_url", "text"],
-        )
-        self.assertEqual(len(runtime.requests[0].image_spans), 1)
-
-        status, _, _ = harness.request(
-            "POST",
-            "/v1/responses",
-            self.responses_body(
-                input=[
-                    {
-                        "type": "message",
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": "look"},
-                            {"type": "input_image", "image_url": url},
-                        ],
-                    }
-                ]
-            ),
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(len(runtime.requests[1].image_spans), 1)
-        self.assertEqual(
-            runtime.requests[1].image_spans, runtime.requests[0].image_spans
-        )
-
-    def test_tool_results_carry_images_like_user_content(self):
-        runtime = FakeRuntime(Plan([[4]]), Plan([[4]]))
-        harness = self.harness(runtime, tokenizer=self.ImagePadTokenizer())
-        url = self._png_data_url((30, 200, 30))
-        media_type, _, data = url.partition(";base64,")
-        status, _, _ = harness.request(
-            "POST",
-            "/v1/messages",
-            self.anthropic_body(
-                messages=[
-                    {"role": "user", "content": "screenshot it"},
-                    {
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "tool_use",
-                                "id": "toolu_1",
-                                "name": "screenshot",
-                                "input": {},
-                            }
-                        ],
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": "toolu_1",
-                                "content": [
-                                    {"type": "text", "text": "captured"},
-                                    {
-                                        "type": "image",
-                                        "source": {
-                                            "type": "base64",
-                                            "media_type": media_type.removeprefix(
-                                                "data:"
-                                            ),
-                                            "data": data,
-                                        },
-                                    },
-                                ],
-                            }
-                        ],
-                    },
-                ]
-            ),
-        )
-        self.assertEqual(status, 200)
-        rendered, _ = harness.tokenizer.templates[-1]
-        self.assertEqual(rendered[-1]["role"], "tool")
-        self.assertEqual(
-            [part["type"] for part in rendered[-1]["content"]], ["text", "image_url"]
-        )
-        request = runtime.requests[0]
-        self.assertEqual(request.prompt_tokens, (101, *([50] * 64), 102))
-        (span,) = request.image_spans
-        self.assertEqual((span.offset, span.tokens), (1, 64))
-
-        status, _, _ = harness.request(
-            "POST",
-            "/v1/chat/completions",
-            self.body(
-                messages=[
-                    {"role": "user", "content": "screenshot it"},
-                    {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "type": "function",
-                                "function": {"name": "screenshot", "arguments": "{}"},
-                            }
-                        ],
-                    },
-                    {
-                        "role": "tool",
-                        "tool_call_id": "call_1",
-                        "content": [
-                            {"type": "text", "text": "captured"},
-                            {"type": "image_url", "image_url": {"url": url}},
-                        ],
-                    },
-                ]
-            ),
-        )
-        self.assertEqual(status, 200)
-        rendered, _ = harness.tokenizer.templates[-1]
-        self.assertEqual(rendered[-1]["role"], "tool")
-        self.assertEqual(
-            [part["type"] for part in rendered[-1]["content"]], ["text", "image_url"]
-        )
-        self.assertEqual(runtime.requests[1].image_spans, request.image_spans)
-
-        # Responses tool outputs use the same image pixels and span geometry,
-        # including when the tool result is replayed from stored history.
-        for stream in (False, True):
-            status, _, payload = harness.request(
-                "POST",
-                "/v1/responses",
-                self.responses_body(
-                    stream=stream,
-                    reasoning={"effort": "none"},
-                    input=[
-                        {"role": "user", "content": "screenshot it"},
-                        {
-                            "type": "function_call",
-                            "call_id": "call_1",
-                            "name": "screenshot",
-                            "arguments": "{}",
-                        },
-                        {
-                            "type": "function_call_output",
-                            "call_id": "call_1",
-                            "output": [
-                                {"type": "input_text", "text": "captured"},
-                                {"type": "input_image", "image_url": url},
-                            ],
-                        },
-                    ],
-                ),
-            )
-            self.assertEqual(status, 200, payload)
-            response = (
-                self.response_events(payload)[-1]["response"]
-                if stream
-                else json.loads(payload)
-            )
-            rendered, _ = harness.tokenizer.templates[-1]
-            self.assertEqual(rendered[-1]["role"], "tool")
-            self.assertEqual(rendered[-1]["tool_call_id"], "call_1")
-            self.assertEqual(
-                [part["type"] for part in rendered[-1]["content"]],
-                ["text", "image_url"],
-            )
-            self.assertEqual(runtime.requests[-1].image_spans, request.image_spans)
-            self.assertEqual(runtime.requests[-1].image_pixels, request.image_pixels)
-            status, _, payload = harness.request(
-                "POST",
-                "/v1/responses",
-                self.responses_body(
-                    previous_response_id=response["id"], input="look again"
-                ),
-            )
-            self.assertEqual(status, 200, payload)
-            self.assertEqual(runtime.requests[-1].image_spans, request.image_spans)
-
     def test_responses_tool_images_reject_invalid_content_before_inference(self):
         runtime = FakeRuntime()
         harness = self.harness(runtime, tokenizer=self.ImagePadTokenizer())
@@ -1626,19 +1212,17 @@ class ServerTest(unittest.TestCase):
     def test_image_inputs_are_validated_before_inference(self):
         runtime = FakeRuntime()
         harness = self.harness(runtime, tokenizer=self.ImagePadTokenizer())
+        text_only = "this model reads text only"
         cases = (
-            (
-                [self._image_message("https://example.com/x.png")],
-                "only data: image URLs",
-            ),
-            ([self._image_message("data:image/png;base64,@@@")], "not valid base64"),
+            ([self._image_message("https://example.com/x.png")], text_only),
+            ([self._image_message("data:image/png;base64,@@@")], text_only),
             (
                 [{"role": "user", "content": [{"type": "video", "video": "x"}]}],
                 "video content is not supported",
             ),
             (
                 [{"role": "user", "content": [{"type": "image_url", "image_url": 5}]}],
-                "invalid image content part",
+                text_only,
             ),
             (
                 [
@@ -1658,16 +1242,6 @@ class ServerTest(unittest.TestCase):
                 self.assertEqual(status, 400)
                 self.assertIn(message, json.loads(payload)["error"]["message"])
         self.assertEqual(runtime.requests, [])
-
-        # A template that drops the placeholder cannot carry the image.
-        plain = self.harness(runtime)
-        status, _, payload = plain.request(
-            "POST", "/v1/chat/completions", self.body(messages=[self._image_message()])
-        )
-        self.assertEqual(status, 400)
-        self.assertIn(
-            "does not define the image pad", json.loads(payload)["error"]["message"]
-        )
 
     def test_anthropic_messages_nonstream_stream_and_errors(self):
         runtime = FakeRuntime(Plan([[4]]), Plan([[4]]))
@@ -1829,43 +1403,6 @@ class ServerTest(unittest.TestCase):
         self.assertGreater(len(set(counts)), 2)
         self.assertEqual(runtime.requests, [])
         self._wait_for_http_active(harness.server.requests, 0)
-
-    def test_anthropic_count_tokens_can_measure_over_context_images(self):
-        harness = self.harness(
-            FakeRuntime(), tokenizer=self.ImagePadTokenizer(), max_context=16
-        )
-        data = self._png_data_url().partition(";base64,")[2]
-        image = {
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/png",
-                "data": data,
-            },
-        }
-        body = self.anthropic_body(
-            messages=[{"role": "user", "content": [image, image]}]
-        )
-        del body["max_tokens"]
-        with mock.patch.object(
-            harness.app, "_expand_image_pads", side_effect=AssertionError("expansion")
-        ):
-            status, _, payload = harness.request(
-                "POST", "/v1/messages/count_tokens", body
-            )
-        self.assertEqual(status, 200, payload)
-        self.assertEqual(json.loads(payload), {"input_tokens": 130})
-        self.assertEqual(harness.app.images.stats()["request_bytes"], 0)
-        with self.assertRaisesRegex(api.APIError, "context window"):
-            harness.app.prepare(api.anthropic_to_chat_body({**body, "max_tokens": 1}))
-        harness.app.max_context = 256
-        job, *_ = harness.app.prepare(
-            api.anthropic_to_chat_body({**body, "max_tokens": 1})
-        )
-        self.assertEqual(len(job.prompt_tokens), 130)
-        del job
-        self.assertEqual(harness.app.images.stats()["request_bytes"], 0)
-        self.assertEqual(harness.backend.runtime.requests, [])
 
     def test_anthropic_count_tokens_validates_input_and_releases_capacity(self):
         harness = self.harness(FakeRuntime())
@@ -2601,7 +2138,6 @@ class ServerTest(unittest.TestCase):
             model="test-model",
             max_context=None,
             max_memory=None,
-            max_image_pixels=api.image_input.MAX_PIXELS,
             max_new_tokens=16,
             request_timeout=2,
             queue_size=1,
@@ -2746,7 +2282,6 @@ class ServerTest(unittest.TestCase):
             model="test-model",
             max_context=None,
             max_memory=None,
-            max_image_pixels=api.image_input.MAX_PIXELS,
             max_new_tokens=16,
             request_timeout=2,
             queue_size=1,
@@ -5255,7 +4790,7 @@ class ServerTest(unittest.TestCase):
         app = request_frontend.Frontend(
             FakeTokenizer(), None, "test-model", 128, 16, 10, 1
         )
-        for stage in ("grammar", "images"):
+        for stage in ("grammar",):
             clock = [100.0]
 
             def expire(*_args, **_kwargs):
@@ -5267,28 +4802,19 @@ class ServerTest(unittest.TestCase):
             with (
                 self.subTest(stage=stage),
                 mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]),
-                mock.patch.object(app, "_prepare_images", return_value=[]) as images,
                 mock.patch.object(
                     app.tokenizer,
                     "apply_chat_template",
                     return_value="<|im_start|>assistant\n<think>\n",
                 ) as tokenize,
             ):
-                if stage == "grammar":
-                    factory.create.side_effect = expire
-                else:
-                    images.side_effect = expire
+                factory.create.side_effect = expire
                 with self.assertRaises(api.APIError) as error:
                     app.prepare(
                         self.body(timeout=1, response_format={"type": "json_object"})
                     )
                 self.assertEqual(error.exception.status, 504)
-                if stage == "grammar":
-                    images.assert_called_once()
-                    tokenize.assert_called_once()
-                else:
-                    tokenize.assert_not_called()
-                    factory.create.assert_not_called()
+                tokenize.assert_called_once()
                 self.assertEqual(app.preparation_active, 0)
 
     def test_http_body_time_is_included_before_native_admission(self):
@@ -7070,7 +6596,7 @@ class ServerTest(unittest.TestCase):
                         }
                     ]
                 },
-                "only data: image URLs",
+                "this model reads text only",
             ),
         )
         for extra, message in cases:

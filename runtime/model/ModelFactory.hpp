@@ -1,10 +1,8 @@
 #pragma once
 
-#include "ops/Vision.hpp"
 #include "DFlashDraft.hpp"
 #include "ModelDescriptor.hpp"
 #include "Qwen4Exp.hpp"
-#include "QwenVision.hpp"
 #include "ops/Q8PageStorage.hpp"
 #include "ops/ExecutionPlans.hpp"
 
@@ -21,7 +19,6 @@ struct ModelPackage final {
   ModelDescriptor descriptor;
   TargetWeights target;
   DFlashDraftWeights draft;
-  QwenVisionWeights vision;
   std::string manifestFingerprintSha256;
 
   [[nodiscard]] const std::string &name() const noexcept {
@@ -83,7 +80,6 @@ struct RuntimeContext final {
   kv::Q8PageStorage &kvPages;
   StateStorage &stateStorage;
   const ops::ExecutionPlans &operators;
-  uint32_t maximumImagePatches = ops::kMaximumImagePatches;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
 };

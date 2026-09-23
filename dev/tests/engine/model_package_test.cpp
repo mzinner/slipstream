@@ -32,7 +32,6 @@ using splash::model::WeightFileRecord;
 using splash::model::WeightStoreError;
 using splash::model::QwenAttentionWeights;
 using splash::model::QwenGdnWeights;
-using splash::ops::VisionLayout;
 using splash::model::kWeightFileAlignment;
 using splash::model::loadModelPackage;
 using splash::model::makeModelDescriptor;
@@ -314,14 +313,12 @@ void validateRealPackage(MetalBackend &backend,
     uint64_t actualTrackedBytes = 0;
     uint64_t targetBytes = 0;
     uint64_t draftBytes = 0;
-    uint64_t visionBytes = 0;
     std::string fingerprint;
     std::string name;
     {
         auto package = loadModelPackage(backend, root);
         targetBytes = declaredBytes(package.targetFiles());
         draftBytes = declaredBytes(package.draft.files);
-        visionBytes = declaredBytes(package.vision.files);
         const uint32_t targetLayers = std::visit(
             [](const auto &weights) { return weights.layout.layers; },
             package.target);
@@ -329,13 +326,11 @@ void validateRealPackage(MetalBackend &backend,
                 "real target file set is incomplete");
         require(package.draft.files.size() == package.draft.layout.layers + 1,
                 "real draft file set is incomplete");
-        require(package.vision.files.size() == 1,
-                "real vision file set is incomplete");
-        require(targetBytes && draftBytes && visionBytes,
+        require(targetBytes && draftBytes,
                 "real package has an empty role");
         actualTrackedBytes =
             backend.memoryStats().allocatedBytes - baseline;
-        require(actualTrackedBytes >= targetBytes + draftBytes + visionBytes,
+        require(actualTrackedBytes >= targetBytes + draftBytes,
                 "real package allocation accounting is below declared bytes");
         fingerprint = package.manifestFingerprintSha256;
         name = package.name();
@@ -345,7 +340,6 @@ void validateRealPackage(MetalBackend &backend,
     std::cout << "real model=\"" << name << "\""
               << " declared_target=" << targetBytes
               << " declared_draft=" << draftBytes
-              << " declared_vision=" << visionBytes
               << " actual_tracked=" << actualTrackedBytes
               << " manifest_sha256=" << fingerprint << '\n';
 }

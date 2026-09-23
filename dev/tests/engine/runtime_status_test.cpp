@@ -30,7 +30,7 @@ EngineMemoryPlan plan() {
   device.hasUnifiedMemory = true;
   device.supportsPlacementSparse = true;
   return requireEngineMemoryPlan(
-      device, test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB));
+      device, test::modelMemoryProfile(2 * kGiB, 1 * kGiB));
 }
 
 MemoryAuditResult audit(const EngineMemoryPlan &memoryPlan) {
@@ -38,14 +38,12 @@ MemoryAuditResult audit(const EngineMemoryPlan &memoryPlan) {
   ActualMemoryReport actual;
   actual.targetWeightsBytes = b.targetWeightsBytes;
   actual.draftWeightsBytes = b.draftWeightsBytes;
-  actual.visionWeightsBytes = b.visionWeightsBytes;
   actual.stateResidentBytes = b.activeStateCellBytes;
   actual.sharedPrefillBytes = b.sharedPrefillBytes;
   actual.sharedDecodeBytes = b.sharedDecodeBytes;
   actual.kvResidentBytes = b.kvExtentBytes;
   actual.backendAllocatedBytes =
-      actual.targetWeightsBytes + actual.draftWeightsBytes +
-      actual.visionWeightsBytes + actual.stateResidentBytes +
+      actual.targetWeightsBytes + actual.draftWeightsBytes + actual.stateResidentBytes +
       actual.sharedPrefillBytes + actual.sharedDecodeBytes +
       actual.kvResidentBytes;
   actual.deviceCurrentAllocatedBytes = actual.backendAllocatedBytes;
@@ -162,8 +160,6 @@ void testCleanRuntimeStatus() {
   executorTelemetry.lastDecodeWallSeconds = 0.083;
   executorTelemetry.totalDecodeGpuSeconds = 1.125;
   executorTelemetry.totalDecodeWallSeconds = 1.5;
-  executorTelemetry.imageEncodes = 3;
-  executorTelemetry.imageEmbeddingReuses = 4;
   const std::string json =
       runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
                         metrics, executorTelemetry, identity, governor, true);
@@ -173,9 +169,6 @@ void testCleanRuntimeStatus() {
   require(json.find("\"ready\":true,\"maximum_context_tokens\":102400,") !=
               std::string::npos,
           "status advertised model capacity instead of the active engine limit");
-  require(json.find("\"images\":{\"encodes\":3,\"embedding_reuses\":4}") !=
-              std::string::npos,
-          "image telemetry is missing from status");
   require(json.find("\"model_timing\":{\"scope\":\"model_lifetime\","
                     "\"prefill\":{\"last_gpu_ms\":5250,\"last_wall_ms\":116921.479,"
                     "\"total_gpu_ms\":500500,\"total_wall_ms\":700250},"

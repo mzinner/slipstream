@@ -1,7 +1,7 @@
 #pragma once
 
+#include "metal/MetalBackend.hpp"
 #include "metal/abi/ExecutionGeometry.h"
-#include "ops/Vision.hpp"
 
 #include <array>
 #include <atomic>
@@ -43,27 +43,11 @@ struct ModelRequest final {
   uint64_t id = 0;
   BatchCohort cohort = BatchCohort::Greedy;
   std::span<const uint32_t> prompt;
-  std::span<const struct ImageSpan> images;
-  std::span<const uint8_t> imagePixels;
   uint32_t maxNewTokens = 0;
   SamplingParameters sampling;
   ConstraintMode constraint = ConstraintMode::None;
 };
 
-struct ImageSpan final {
-  uint32_t offset = 0;
-  uint32_t tokens = 0;
-  uint32_t gridHeight = 0;
-  uint32_t gridWidth = 0;
-  uint64_t digestLo = 0;
-  uint64_t digestHi = 0;
-
-  [[nodiscard]] uint32_t end() const noexcept { return offset + tokens; }
-  [[nodiscard]] uint64_t pixelBytes() const noexcept {
-    return ops::imagePixelBytes(gridHeight, gridWidth);
-  }
-  bool operator==(const ImageSpan &) const = default;
-};
 
 // Immutable target-recurrent plus draft-context state.  Concrete model
 // implementations own its buffers; the engine only pins and accounts it.
@@ -326,8 +310,6 @@ struct ModelTelemetry final {
   uint64_t draftContextRowsAvoided = 0;
   uint64_t draftStateRestoreSkipped = 0;
   uint64_t draftStateResets = 0;
-  uint64_t imageEncodes = 0;
-  uint64_t imageEmbeddingReuses = 0;
   uint32_t lastDecodeWidth = 0;
   uint64_t lastDecodeFusedOperations = 0;
   uint64_t lastDecodeM16Dispatches = 0;

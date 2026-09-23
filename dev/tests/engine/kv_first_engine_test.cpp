@@ -485,64 +485,6 @@ void testConcurrentDuplicateStateSkipsSnapshotCapture() {
           "duplicate state publication was not reused and accounted");
 }
 
-void testImageSpansKeyPrefixIdentity() {
-  Backing backing(32);
-  KvPool pool(backing);
-  engine::Cache resources(pool, CacheNamespace{});
-  Executor executor;
-  Events events;
-  engine::Engine engine({}, resources, executor, events);
-  // Image runs render as one placeholder id, so two prompts with different
-  // images are token-identical; only the span digests differ.
-  std::vector<uint32_t> prompt(65, 248056);
-  auto withImage = [&](uint64_t id, uint64_t digest) {
-    EngineRequest result = request(id, prompt);
-    result.images = {{8, 16, 8, 8, digest, digest ^ 0xabcdULL}};
-    result.imagePixels.assign(result.images[0].pixelBytes(), 1);
-    return result;
-  };
-
-  engine.submit(withImage(1, 0x1111));
-  runUntilIdle(engine);
-  require(events.starts.size() == 1 &&
-              events.starts[0].first == EngineCacheStatus::Miss,
-          "image producer unexpectedly hit the cache");
-  engine.submit(withImage(2, 0x2222));
-  runUntilIdle(engine);
-  require(events.starts.size() == 2 &&
-              events.starts[1] ==
-                  std::pair<EngineCacheStatus, uint32_t>{
-                      EngineCacheStatus::Miss, 0},
-          "a different image falsely matched the cached prefix");
-  engine.submit(withImage(3, 0x1111));
-  runUntilIdle(engine);
-  require(events.starts.size() == 3 &&
-              events.starts[2] ==
-                  std::pair<EngineCacheStatus, uint32_t>{
-                      EngineCacheStatus::PrefixHit, 64},
-          "an identical image did not reuse the cached prefix");
-  engine.submit(request(4, prompt));
-  runUntilIdle(engine);
-  require(events.starts.size() == 4 &&
-              events.starts[3] ==
-                  std::pair<EngineCacheStatus, uint32_t>{
-                      EngineCacheStatus::Miss, 0},
-          "a text-only prompt matched an image-keyed prefix");
-
-  EngineRequest malformed = withImage(5, 0x1111);
-  malformed.images[0].tokens = 15;
-  bool rejected = false;
-  try {
-    engine.submit(std::move(malformed));
-  } catch (const std::invalid_argument &) {
-    rejected = true;
-  }
-  require(rejected,
-          "image span with the wrong merged token count was admitted");
-  require(events.completedCount == 4 && events.failedCount == 0,
-          "image request lifecycle did not complete cleanly");
-}
-
 void testOneRequestPublishesJunctionAndLatestReplayState() {
   Backing backing(64);
   KvPool pool(backing);
@@ -2853,7 +2795,6 @@ int main() {
     testCheckpointIntervalValidationAndDisable();
     testColdPublishesReplayStateAndLazyJunctionCanRebuildIt();
     testConcurrentDuplicateStateSkipsSnapshotCapture();
-    testImageSpansKeyPrefixIdentity();
     testOneRequestPublishesJunctionAndLatestReplayState();
     testLatestReplayDenialRecyclesOlderStateNotTheJunction();
     testCancellationAfterJunctionDiscardsLaterState();

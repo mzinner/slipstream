@@ -29,7 +29,7 @@ EngineMemoryPlan plan() {
   device.hasUnifiedMemory = true;
   device.supportsPlacementSparse = true;
   return requireEngineMemoryPlan(
-      device, test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB));
+      device, test::modelMemoryProfile(2 * kGiB, 1 * kGiB));
 }
 
 ActualMemoryReport report(const EngineMemoryPlan &memoryPlan) {
@@ -37,14 +37,12 @@ ActualMemoryReport report(const EngineMemoryPlan &memoryPlan) {
   ActualMemoryReport result;
   result.targetWeightsBytes = b.targetWeightsBytes;
   result.draftWeightsBytes = b.draftWeightsBytes;
-  result.visionWeightsBytes = b.visionWeightsBytes;
   result.stateResidentBytes = b.activeStateCellBytes * 3;
   result.sharedPrefillBytes = b.sharedPrefillBytes;
   result.sharedDecodeBytes = b.sharedDecodeBytes;
   result.kvResidentBytes = b.kvExtentBytes;
   result.backendAllocatedBytes =
-      result.targetWeightsBytes + result.draftWeightsBytes +
-      result.visionWeightsBytes + result.stateResidentBytes +
+      result.targetWeightsBytes + result.draftWeightsBytes + result.stateResidentBytes +
       result.sharedPrefillBytes + result.sharedDecodeBytes +
       result.kvResidentBytes;
   result.deviceCurrentAllocatedBytes = result.backendAllocatedBytes;

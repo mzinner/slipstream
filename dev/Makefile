@@ -37,7 +37,7 @@ HTTP_SMOKE_ARGS ?=
 	check-native-engine check-native-cpu check-native-metal check-python-engine \
 	install-development release-check test test-agent-real test-http-real \
 	test-performance-real test-release-real \
-	test-models test-python test-real \
+	test-models test-python \
 	test-engine test-engine-cpu test-engine-metal test-sanitizers
 
 install-development: install-environment $(DEV_STAMP)
@@ -129,7 +129,6 @@ release-check: check preflight
 	$(MAKE) --no-print-directory verify-models
 	$(MAKE) --no-print-directory verify-build-identity
 	$(MAKE) --no-print-directory test-sanitizers
-	$(MAKE) --no-print-directory test-real
 	$(MAKE) --no-print-directory test-release-real
 	$(MAKE) --no-print-directory test-performance-real
 	@test -z "$$(git status --porcelain)" || { \

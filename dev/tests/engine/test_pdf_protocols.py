@@ -33,7 +33,10 @@ class PdfProtocolTests(unittest.TestCase):
         )
 
     def test_protocols_share_rendered_pages_and_preserve_order(self):
-        expected = documents.document_content(document_block(pdf_bytes(pages=2)))
+        expected = "".join(
+            part["text"]
+            for part in documents.document_content(document_block(pdf_bytes(pages=2)))
+        )
         chat = self.chat()[0]["content"]
         self.assertEqual(chat, expected)
         response = api_shapes.responses_to_chat_body(
@@ -51,17 +54,12 @@ class PdfProtocolTests(unittest.TestCase):
             }
         )
         actual = api_shapes.normalize_messages(response["messages"])[0]["content"]
-        self.assertEqual(
-            actual,
-            [
-                {"type": "text", "text": "before"},
-                *expected,
-                {"type": "text", "text": "after"},
-            ],
-        )
-        self.assertEqual(sum(p["type"] == "image_url" for p in actual), 2)
+        if not isinstance(actual, str):
+            self.assertTrue(all(p["type"] == "text" for p in actual))
+            actual = "".join(p["text"] for p in actual)
+        self.assertEqual(actual, "before" + expected + "after")
 
-    def test_http_generation_prepares_page_images_in_both_protocols(self):
+    def test_http_generation_reads_pdf_text_in_both_protocols(self):
         for dialect in ("chat", "responses"):
             for stream in (False, True):
                 with self.subTest(dialect=dialect, stream=stream):
@@ -103,7 +101,7 @@ class PdfProtocolTests(unittest.TestCase):
                         status, _, payload = harness.request("POST", path, body)
                         self.assertEqual(status, 200, payload)
                         self.assertEqual(len(runtime.requests), 1)
-                        self.assertEqual(len(runtime.requests[0].image_spans), 2)
+                        self.assertTrue(runtime.requests[0].prompt_tokens)
                         if stream:
                             self.assertIn(b"data:", payload)
                         else:
@@ -142,7 +140,7 @@ class PdfProtocolTests(unittest.TestCase):
             },
         )
         self.assertEqual(status, 200, payload)
-        self.assertEqual([len(r.image_spans) for r in runtime.requests], [2, 2])
+        self.assertEqual(len(runtime.requests), 2)
 
     def test_unsupported_file_rejected_before_stream_or_runtime(self):
         runtime = FakeRuntime()
@@ -217,7 +215,7 @@ class PdfProtocolTests(unittest.TestCase):
     def test_user_and_tool_files_share_one_request_budget(self):
         parts = documents.file_content(self.file, budget=documents.DocumentBudget())
         size = sum(
-            len(p.get("text", "")) * 4 + len(p.get("image_url", {}).get("url", ""))
+            len(p.get("text", "")) * 4
             for p in parts
         )
         for dialect in ("chat", "responses"):

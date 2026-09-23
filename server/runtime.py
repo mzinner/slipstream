@@ -47,7 +47,7 @@ class EngineRuntimeError(RuntimeError):
         """Copy this failure without retaining a traceback.
 
         Stored failures are shared across calls. Re-raising one exception
-        retains each traceback's requests and prepared images; store and raise
+        retains each traceback's requests; store and raise
         fresh copies instead.
         """
         return type(self)(*self.args)
@@ -164,12 +164,6 @@ class GenerationRequest:
     cohort: wire.Cohort = wire.Cohort.GREEDY
     constraint: wire.ConstraintMode = wire.ConstraintMode.NONE
     mask_provider: MaskProvider | None = None
-    # Image spans in prompt order with their concatenated resized pixels.
-    image_spans: tuple[wire.ImageSpan, ...] = ()
-    image_pixels: bytes = b""
-    # Keeps the frontend's byte reservation alive across cancellation and CPU
-    # mask work. It is ownership only and is never serialized to the engine.
-    image_owner: object | None = None
     return_progress: bool = False
 
 
@@ -568,7 +562,7 @@ class MultiplexedRuntime:
 
         call: RuntimeCall | None = None
         try:
-            # Admission must precede serialization, which copies image payloads.
+            # Admission must precede serialization.
             _remaining(deadline)
             protocol_request = wire.RequestFrame(
                 request_id=request_id,
@@ -581,8 +575,6 @@ class MultiplexedRuntime:
                 seed=request.seed,
                 cohort=request.cohort,
                 constraint=request.constraint,
-                image_spans=request.image_spans,
-                image_pixels=request.image_pixels,
                 return_progress=request.return_progress,
             )
             try:

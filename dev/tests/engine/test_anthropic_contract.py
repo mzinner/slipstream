@@ -335,7 +335,7 @@ class AnthropicHTTPContractTest(unittest.TestCase):
             self.assertEqual(status, 200, payload)
         self.assertEqual(len(runtime.requests), 3)
 
-    def test_pdf_user_and_tool_result_count_the_prepared_image(self):
+    def test_pdf_user_and_tool_result_are_read_as_text(self):
         runtime = FakeRuntime()
         harness = self.harness(
             runtime,
@@ -368,9 +368,13 @@ class AnthropicHTTPContractTest(unittest.TestCase):
             with self.subTest(tool_result=len(messages) > 1):
                 body = request_body(messages=messages)
                 translated = anthropic_to_chat_body(body)
-                parts = translated["messages"][-1]["content"]
-                self.assertIn("ALPHA 42", parts[0]["text"])
-                self.assertEqual(parts[1]["type"], "image_url")
+                content = translated["messages"][-1]["content"]
+                text = (
+                    content
+                    if isinstance(content, str)
+                    else "".join(part["text"] for part in content)
+                )
+                self.assertIn("ALPHA 42", text)
                 status, _, payload = harness.request(
                     "POST", "/v1/messages/count_tokens?beta=true", body
                 )
@@ -378,8 +382,6 @@ class AnthropicHTTPContractTest(unittest.TestCase):
                 counted = json.loads(payload)["input_tokens"]
                 job, *_ = harness.app.prepare(translated)
                 self.assertEqual(len(job.prompt_tokens), counted)
-                self.assertGreater(counted, 2)
-                self.assertEqual(len(job.image_spans), 1)
                 del job
         self.assertEqual(runtime.requests, [])
 

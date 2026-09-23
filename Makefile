@@ -226,7 +226,6 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/Status.cpp \
 	runtime/model/WeightStore.cpp \
 	runtime/model/Qwen4Exp.cpp \
-	runtime/model/QwenVision.cpp \
 	runtime/model/QwenTarget.cpp \
 	runtime/model/Qwen4ExpTarget.cpp \
 	runtime/model/DFlashDraft.cpp \
@@ -236,7 +235,6 @@ ENGINE_MM_SOURCES := \
 	runtime/model/ModelDescriptor.mm \
 	runtime/model/Runtime.mm \
 	runtime/model/RuntimeArenas.mm \
-	runtime/ops/Vision.mm \
 	runtime/ops/Q8PageStorage.mm \
 	runtime/engine/RuntimeResources.mm \
 	runtime/engine/Bootstrap.mm
