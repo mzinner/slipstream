@@ -1,141 +1,64 @@
-# Splash
+# Slipstream
 
-[![CI](https://github.com/incoai/splash/actions/workflows/ci.yml/badge.svg)](https://github.com/incoai/splash/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Apple%20silicon-black.svg)](#quick-start)
+**A lean inference engine for running one big model very fast on one Mac, and a
+playbook for doing it again with the next model.**
 
-**A local inference engine for Apple silicon, built around the model.**
+Slipstream serves Qwen3.8-Flash-Next (the `qwen4exp` architecture: 48 layers, 512
+experts per layer, ~100 GB of weights) on a 64 GB Apple M5 Pro. The weights do not
+fit in memory, so the experts stream from the SSD while a small draft head guesses
+tokens ahead. That is the name: a slipstream is the low-drag wake a racing car rides
+in ("drafting"); here the model drafts ahead and the weights stream behind.
 
-Splash serves a small set of models to coding agents and to any OpenAI or
-Anthropic compatible client, on one Mac. On a 48 GB M5 Pro it decodes
-Qwen3.8-27B at 2× the speed of the next-fastest engine and, with a 32K context
-cached, returns the first token in 282 ms. Its kernels, draft model, and memory
-plan are specialized for each model it serves. That is why it is fast, and why
-there is nothing to configure.
+It began as a copy of [Splash](../splash) (Apache-2.0, see LICENSE) and keeps only
+what this model needs.
 
-## Quick start
+---
 
-Apple M3 or newer, macOS 26.4 or later, [Homebrew](https://brew.sh), and 36 GB
-of unified memory (48 GB or more recommended).
+## Where it stands (2026-09-22)
 
-```bash
-brew install incoai/tap/splash
-splash serve --model incoai/Qwen3.8-27B-Splash
+| | |
+|---|---|
+| **Model** | Qwen3.8-Flash-Next, package `~/models/qwen38-flash-next-splash` (shared with Splash, unchanged) |
+| **Speed** | ~39 tok/s greedy on the 10-prompt suite (Splash: 36.4 at the start of the day); 45 tok/s on short answers |
+| **Quality** | Greedy output identical to Splash token for token; 91% same top pick as the bf16 reference |
+| **Removed from Splash** | two other models, the kernel tuner, the vision encoder (~14,100 lines) |
+| **Next** | remove the placeholder DFlash draft; move model code into `models/qwen4exp/` |
+
+## Words we can't avoid
+
+| Term | Meaning here |
+|---|---|
+| **expert** | One of 512 small feed-forward blocks per layer; each token uses 10 |
+| **expert cache** | The experts kept in memory (272 per layer, 34 GiB); the rest are read from the SSD when needed |
+| **draft head (MTP)** | A small extra layer in the model that guesses the next few tokens; the full model then checks them all in one step |
+| **step** | One pass of the full model that checks the guesses and keeps the right ones |
+| **package** | The converted model on disk: 4-bit experts, 8-bit everything else |
+
+---
+
+## Run it
+
+```zsh
+# Server on :8090 (OpenAI and Anthropic APIs). Asks for your password once per boot
+# to raise macOS's GPU memory limit to 58 GiB.
+REPO=~/Documents/shared-with-google-drive/model-serving/slipstream \
+  ~/models/bin/splash-flashnext-server.sh
 ```
 
-The first run downloads and verifies the model package, checks available
-memory, and starts serving on `127.0.0.1:8000`.
+Build: `make` (engine), `make build/engine-tests/generate-sample` (test tool).
+Tests: `make check-native-cpu check-native-metal test-python`.
 
-Once it prints `Ready`, leave this terminal open. Open <http://127.0.0.1:8000>
-in your browser, or run an installed coding agent from another terminal:
+**Safety rule:** run every engine experiment through `dev/benchmarks/guarded.py -- <cmd>`.
+Two engines at once pin more memory than the Mac has and freeze it until its
+watchdog restarts it (this happened twice on 2026-09-22).
 
-```bash
-splash opencode    # or: splash claude / splash codex / splash hermes
-```
+---
 
-Press Ctrl+C in the server terminal to stop Splash.
+## Read next
 
-## Use the API
-
-Splash speaks OpenAI Chat Completions (`/v1/chat/completions`), OpenAI Responses
-(`/v1/responses`), and Anthropic Messages (`/v1/messages`), all with streaming,
-tool calls, JSON Schema output, images, and inline PDFs. `/tokenize` and
-`/apply-template` return token IDs and the rendered prompt without running the
-model.
-
-```bash
-curl http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "incoai/Qwen3.8-27B-Splash",
-    "messages": [{"role": "user", "content": "Explain speculative decoding in one sentence."}]
-  }'
-```
-
-`model` is optional. If you set it, it must match the package you served.
-Reasoning is on by default. `"reasoning_effort": "none"` turns it off, and
-Qwen3.8-27B also takes `low`, `medium`, and `xhigh`.
-
-## Models
-
-| Package (`--model`) | Contents | Download |
-| --- | --- | ---: |
-| [`incoai/Qwen3.8-27B-Splash`](https://huggingface.co/incoai/Qwen3.8-27B-Splash) | Qwen3.8-27B, 4-bit, with its DFlash 2 draft | 17.4 GB |
-| [`incoai/Qwen3.6-35B-A3B-Splash`](https://huggingface.co/incoai/Qwen3.6-35B-A3B-Splash) | Qwen3.6-35B-A3B, 4-bit, with its DFlash 2 draft | 20.9 GB |
-
-`--model` takes any `owner/repo` that holds a Splash package, a format
-[DEVELOPMENT.md](DEVELOPMENT.md#model-packages) describes. Plain MLX or
-Transformers checkpoints do not work. Private repositories need `HF_TOKEN`.
-Packages download into the Hugging Face cache, and `brew upgrade splash` keeps
-them, along with model links and agent sessions.
-
-## Settings
-
-There is no config file. The server binds `127.0.0.1:8000`, one server at a
-time. Context supports up to the model’s native 256K window; usable capacity
-depends on available memory.
-
-`splash serve` accepts these optional flags:
-
-- `--max-memory`: ceiling on Metal allocations, e.g. `28G`. Default: auto.
-- `--max-context`: context limit, up to `256K`, e.g. `100K`. Default: auto.
-- `--max-image-pixels`: maximum resized pixels per image. Default: 4,194,304.
-- `--allowed-host`: extra HTTP `Host` name to accept, for a proxy. Repeatable.
-- `--api-key`: require this key on API requests, as a bearer token or
-  `x-api-key`. Defaults to `SPLASH_API_KEY`.
-- `--no-webui`: turn off the chat page.
-
-If the model does not fit in the memory available, startup prints a memory
-budget breakdown and stops.
-
-Authentication is off by default. Set `SPLASH_API_KEY` in the shell that runs
-`splash serve` and in the shell that runs an agent, and both sides use it.
-Health and readiness probes stay public.
-
-- Experimental cache offloading: [PR #3](https://github.com/incoai/splash/pull/3)
-  adds SSD offloading for KV cache and GDN states. Build from that branch and
-  set `--max-cache-disk 8G` to enable it. This helps preserve reusable prefixes
-  when RAM is limited, reducing repeated prefill.
-
-## Performance
-
-Measured on an M5 Pro (16-core GPU, 48 GB): selected SPEED-Bench coding prompts
-over HTTP, a 1,024-token output limit, reasoning on (medium for the 27B). The
-ratio in each cell is against the next-fastest engine we measured.
-
-| Metric | Qwen3.6-35B-A3B | Qwen3.8-27B |
-| --- | ---: | ---: |
-| Decode · short prompt | 210 tok/s (1.7×) | 74 tok/s (2.0×) |
-| Prefill · 32K prompt | 2,011 tok/s (1.3×) | 363 tok/s (1.2×) |
-| Cached time to first token · 32K replay | 123 ms (6.6×) | 282 ms (7.3×) |
-| Aggregate decode · 4 concurrent short prompts | 357 tok/s (2.0×) | 170 tok/s (3.9×) |
-
-Splash led on every measure at every prompt length we tested, and the lead
-grows with load: 3.8× at four concurrent 32K requests on the 35B. The
-[launch post](https://inco.ai/blog/splash/) has the method and the full
-comparison against oMLX, Lily, uzu, and Ollama.
-
-## Design
-
-The runtime, scheduler, cache, and API are shared. Everything else is rebuilt
-per model:
-
-- **A draft trained for the model.** Speculative decoding is the decode path in
-  Splash, not an option. Every model ships with its own [DFlash
-  2](https://inco.ai/blog/dflash2/) draft, and one pass of the target verifies a
-  block of tokens in parallel.
-- **Kernels compiled for exact shapes.** Fused Metal kernels, written and tuned
-  by our in-house kernel agents for the model's dimensions, read weights packed
-  for them and mapped zero-copy from disk. They ship precompiled: no Xcode, no
-  compiler toolchain, nothing tuned on your machine.
-- **A memory plan computed for this machine.** Context, KV capacity, and batch
-  limits are worked out at startup from the memory Metal recommends, less the
-  weights, the draft, and each request's state.
-
-The [launch post](https://inco.ai/blog/splash/) covers the design in depth.
-
-## More
-
-- [DEVELOPMENT.md](DEVELOPMENT.md): building from source, tests, model packages,
-  and release packaging.
-- Apache-2.0, see [LICENSE](LICENSE). Model weights keep their own licenses.
+| Document | For |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | How the pieces fit: Metal backend, kernels, model, engine, server |
+| [docs/new-model-playbook.md](docs/new-model-playbook.md) | Bringing up the next model, step by step, with the checks that catch mistakes |
+| [docs/profiling.md](docs/profiling.md) | Every measurement tool: what it tells you and how to read it |
+| [.agents/status.md](.agents/status.md) | Current state and next steps (shared with other coding agents) |

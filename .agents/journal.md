@@ -1,5 +1,13 @@
 # Journal — qwen4exp port
 
+## 2026-09-22 20:00 PDT — claude-code
+
+Created Slipstream from Splash (local clone, origin removed). Phase 1 dropped two
+models and the tuner; phase 2 made it text only (protocol v6, PDFs as text). Each
+phase: all gates green, 10/10 identical outputs vs Splash, server smoke test.
+Wrote README and docs/ (architecture, new-model playbook, profiling). Phase 3
+(DFlash placeholder) is next; see status.md for its full reach.
+
 ## 2026-09-22 16:50 PDT — claude-code
 
 The Mac crashed twice (kernel watchdog, 90 s freeze). 1st: a hung read-split
