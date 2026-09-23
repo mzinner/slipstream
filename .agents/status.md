@@ -23,6 +23,17 @@ Checks after each phase: native CPU and Metal gates, Python 383 + 168 + 41, lint
 architecture check, 10/10 identical greedy outputs vs Splash on the real model
 (phase 4: 39.9 tok/s), server smoke test (17×23 → 391, sampled haiku, image refused).
 
+## Running now (2026-09-23 07:03)
+
+Benchmark round 2 (Nitin chose it after the speed work): Slipstream, then
+llama.cpp V3, then Qwen3.8-27B HQ, 9 suites each, seed 1234, unattended:
+`benchmarking/model-quality-bench/run_round_2.sh`, log
+`runs/round2-orchestrator.log`. Every server runs under guarded.py; llama.cpp
+keeps the 58 GiB GPU limit (no sudo) with the guard as its safety. No server is
+left running at the end. Then: compare (bench.compare), judge sessions
+(bench.judge), check Slipstream's answers equal Splash's where both ran,
+update BENCHMARKS.md and the hub.
+
 ## Next
 
 1. **Cheaper check steps (Nitin chose this, 2026-09-23).** Done so far:
