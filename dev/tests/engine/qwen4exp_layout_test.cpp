@@ -182,13 +182,6 @@ void stateLayoutsAreConsistent() {
           "GDN conv channel count mismatch");
   require(gdn.convolutionHistory == kGdnConvolutionTaps - 1,
           "GDN conv history must be taps minus one");
-
-  require(layout.capturedHiddenSize() ==
-              layout.hiddenSize * Qwen4ExpLayout::hiddenCaptureLayers.size(),
-          "captured hidden size must follow the capture layer count");
-  for (uint32_t index : Qwen4ExpLayout::hiddenCaptureLayers) {
-    require(index < layout.layers, "a capture layer is out of range");
-  }
 }
 
 } // namespace

@@ -26,7 +26,6 @@
 
 namespace {
 
-using splash::model::DFlashDraftLayout;
 using splash::model::WeightFile;
 using splash::model::WeightFileRecord;
 using splash::model::WeightStoreError;
@@ -312,25 +311,21 @@ void validateRealPackage(MetalBackend &backend,
     uint64_t baseline = backend.memoryStats().allocatedBytes;
     uint64_t actualTrackedBytes = 0;
     uint64_t targetBytes = 0;
-    uint64_t draftBytes = 0;
     std::string fingerprint;
     std::string name;
     {
         auto package = loadModelPackage(backend, root);
         targetBytes = declaredBytes(package.targetFiles());
-        draftBytes = declaredBytes(package.draft.files);
         const uint32_t targetLayers = std::visit(
             [](const auto &weights) { return weights.layout.layers; },
             package.target);
         require(package.targetFiles().size() == targetLayers + 2,
                 "real target file set is incomplete");
-        require(package.draft.files.size() == package.draft.layout.layers + 1,
-                "real draft file set is incomplete");
-        require(targetBytes && draftBytes,
+        require(targetBytes,
                 "real package has an empty role");
         actualTrackedBytes =
             backend.memoryStats().allocatedBytes - baseline;
-        require(actualTrackedBytes >= targetBytes + draftBytes,
+        require(actualTrackedBytes >= targetBytes,
                 "real package allocation accounting is below declared bytes");
         fingerprint = package.manifestFingerprintSha256;
         name = package.name();
@@ -339,7 +334,6 @@ void validateRealPackage(MetalBackend &backend,
             "real model mappings survived package destruction");
     std::cout << "real model=\"" << name << "\""
               << " declared_target=" << targetBytes
-              << " declared_draft=" << draftBytes
               << " actual_tracked=" << actualTrackedBytes
               << " manifest_sha256=" << fingerprint << '\n';
 }
@@ -381,7 +375,6 @@ void testRealPackageMetadata(const std::filesystem::path &root) {
                         "unknown model format was accepted");
                 require(descriptor.name == name &&
                             descriptor.target == expected.target &&
-                            descriptor.draft == expected.draft &&
                             descriptor.valid(),
                         "model metadata changed the loaded layout or display name");
             } catch (const std::invalid_argument &error) {

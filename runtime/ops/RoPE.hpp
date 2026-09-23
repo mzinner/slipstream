@@ -6,21 +6,13 @@
 
 namespace splash::ops {
 
-struct RoPETableShape final {
-  uint32_t targetRows = 0;
-  uint32_t draftRows = 0;
-};
-
 class RoPE final {
 public:
-  static void addTables(
-      metal::CommandGraph &graph, metal::MetalBuffer targetPositions,
-      metal::MetalBuffer draftPositions,
-      metal::MetalBuffer targetInverseFrequencies,
-      metal::MetalBuffer draftInverseFrequencies,
-      metal::MetalBuffer targetCosine, metal::MetalBuffer targetSine,
-      metal::MetalBuffer draftCosine, metal::MetalBuffer draftSine,
-      RoPETableShape shape, uint32_t maximumRows);
+  // Cosine and sine tables for `rows` target rows of (t, h, w) positions.
+  static void addTables(metal::CommandGraph &graph, metal::MetalBuffer positions,
+                        metal::MetalBuffer inverseFrequencies,
+                        metal::MetalBuffer cosine, metal::MetalBuffer sine,
+                        uint32_t rows, uint32_t maximumRows);
 };
 
 } // namespace splash::ops

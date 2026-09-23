@@ -80,7 +80,6 @@ void requireLayout(const Qwen4ExpLayout &layout) {
       layout.ngramLayer >= layout.layers ||
       // The history kernels keep exactly two tokens: a window of three.
       layout.ngramSize != 3 ||
-      layout.hiddenCaptureLayers.back() >= layout.layers ||
       !layout.q8Layout().valid() || !layout.gdnStateLayout().valid()) {
     throw WeightStoreError("qwen4exp layout is inconsistent");
   }

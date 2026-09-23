@@ -87,7 +87,7 @@ uint64_t checkedAdd(uint64_t left, uint64_t right, std::string_view label) {
 
 uint64_t packedModelFileBytes(const std::filesystem::path &root) {
   uint64_t bytes = 0;
-  for (std::string_view directory : {"target", "draft"}) {
+  for (std::string_view directory : {"target"}) {
     const std::filesystem::path package = root / directory;
     for (const auto &entry :
          std::filesystem::recursive_directory_iterator(package)) {
@@ -192,7 +192,6 @@ canonicalRuntimeCacheNamespace(const RuntimeCacheIdentity &identity) {
 
 void requireLoadedModel(const model::ModelPackage &package) {
   if (!package.targetActualAllocatedBytes() ||
-      !package.draft.actualAllocatedBytes ||
       package.manifestFingerprintSha256.empty() ||
       package.targetManifestFingerprint().empty()) {
     throw std::invalid_argument(
@@ -376,7 +375,6 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
 
     ModelMemoryFootprint footprint{
         package.targetActualAllocatedBytes(),
-        package.draft.actualAllocatedBytes,
         modelMemoryPlan.activeStateCellPlannedAllocatedBytes,
         modelMemoryPlan.sharedPrefillPlannedAllocatedBytes,
         modelMemoryPlan.sharedDecodePlannedAllocatedBytes,
@@ -566,7 +564,6 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
     uint64_t estimatedWarmupPeakBytes) const {
   ActualMemoryReport report;
   report.targetWeightsBytes = model_.targetActualAllocatedBytes();
-  report.draftWeightsBytes = model_.draft.actualAllocatedBytes;
   report.stateResidentBytes = modelMemory.stateActualAllocatedBytes;
   report.sharedPrefillBytes = modelMemory.sharedPrefillActualAllocatedBytes;
   report.sharedDecodeBytes = modelMemory.sharedDecodeActualAllocatedBytes;

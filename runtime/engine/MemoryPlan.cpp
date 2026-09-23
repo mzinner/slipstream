@@ -72,7 +72,6 @@ std::optional<std::string> ModelMemoryProfile::validationError() const {
   }
   if (!targetKvLayout.valid()) return "invalid_target_kv_layout";
   if (!footprint.targetWeightsBytes) return "target_weight_bytes_required";
-  if (!footprint.draftWeightsBytes) return "draft_weight_bytes_required";
   if (!footprint.activeStateCellBytes) {
     return "active_state_cell_bytes_required";
   }
@@ -115,7 +114,7 @@ uint64_t ModelMemoryProfile::residentWeightBytes() const {
 uint64_t ModelMemoryProfile::fixedRuntimeBytes() const {
   uint64_t result = 0;
   for (uint64_t value : {
-           residentWeightBytes(), footprint.draftWeightsBytes,
+           residentWeightBytes(),
            footprint.sharedPrefillBytes,
            footprint.sharedDecodeBytes, footprint.pipelineReserveBytes,
            footprint.runtimeOverheadReserveBytes}) {
@@ -142,7 +141,6 @@ std::string modelStatusJson(const ModelMemoryProfile &model) {
       << ','
       << "\"memory\":{" << "\"target_weights_bytes\":"
       << model.footprint.targetWeightsBytes << ','
-      << "\"draft_weights_bytes\":" << model.footprint.draftWeightsBytes << ','
       << "\"active_state_cell_bytes\":"
       << model.footprint.activeStateCellBytes << ','
       << "\"shared_prefill_bytes\":" << model.footprint.sharedPrefillBytes << ','
@@ -162,7 +160,6 @@ std::string EngineMemoryBreakdown::toStatusJson() const {
       << ',' << "\"headroom_bytes\":" << headroomBytes << ','
       << "\"hard_budget_bytes\":" << hardBudgetBytes << ','
       << "\"target_weights_bytes\":" << targetWeightsBytes << ','
-      << "\"draft_weights_bytes\":" << draftWeightsBytes << ','
       << "\"maximum_batch_width\":" << maximumBatchWidth << ','
       << "\"active_state_cell_bytes\":" << activeStateCellBytes << ','
       << "\"shared_prefill_bytes\":" << sharedPrefillBytes << ','
@@ -200,7 +197,6 @@ std::string EngineMemoryBreakdown::describe() const {
       << bytesAndMiB(headroomBytes) << '\n'
       << "hard budget: " << bytesAndMiB(hardBudgetBytes) << '\n'
       << "target weights: " << bytesAndMiB(targetWeightsBytes) << '\n'
-      << "draft weights: " << bytesAndMiB(draftWeightsBytes) << '\n'
       << "maximum DFlash batch width: " << maximumBatchWidth << '\n'
       << "active state cell: " << bytesAndMiB(activeStateCellBytes) << '\n'
       << "shared prefill: " << bytesAndMiB(sharedPrefillBytes) << '\n'
@@ -281,7 +277,6 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   breakdown.recommendedWorkingSetBytes = device.recommendedMaxWorkingSetBytes;
   breakdown.configuredMemoryLimitBytes = maximumMemoryBytes;
   breakdown.targetWeightsBytes = model.footprint.targetWeightsBytes;
-  breakdown.draftWeightsBytes = model.footprint.draftWeightsBytes;
   breakdown.activeStateCellBytes = model.footprint.activeStateCellBytes;
   breakdown.sharedPrefillBytes = model.footprint.sharedPrefillBytes;
   breakdown.sharedDecodeBytes = model.footprint.sharedDecodeBytes;

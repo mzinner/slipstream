@@ -22,9 +22,6 @@ template <typename Function> void rejects(Function function) {
 
 constexpr std::array attentionShapes{
     AttentionShape{24, 4, 256}, AttentionShape{16, 2, 256}};
-constexpr std::array draftShapes{
-    DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128},
-    DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128}};
 constexpr MoeShape routedShape{2048, 256, 8, 512};
 constexpr std::array moeShapes{
     routedShape, MoeShape{768, 7, 3, 256}, MoeShape{256, 1, 1, 256}};
@@ -34,12 +31,6 @@ constexpr std::array matrices{
     LinearMatrix{768, 768}};
 constexpr std::array attentionFields{
     &AttentionWorkspace::partialsBytes, &AttentionWorkspace::statisticsBytes};
-constexpr std::array draftFields{
-    &DraftAttentionWorkspace::convolutionBytes,
-    &DraftAttentionWorkspace::qkvBytes,
-    &DraftAttentionWorkspace::groupedQueriesBytes,
-    &DraftAttentionWorkspace::queryKeysBytes,
-    &DraftAttentionWorkspace::queryValuesBytes};
 constexpr std::array moeFields{
     &MoeWorkspace::selectedExpertsBytes, &MoeWorkspace::routingWeightsBytes,
     &MoeWorkspace::tileDescriptorsBytes, &MoeWorkspace::tileCountBytes,
@@ -138,16 +129,6 @@ void baselinePlans() {
         covers(stride, scaled.workspace, 1, attentionFields);
       }
     }
-    for (auto shape : draftShapes) {
-      const auto stride = plans.draftAttentionWorkspacePerLane(shape);
-      equalWorkspace(stride, DraftAttention::plan(shape, 1).workspace(),
-                     draftFields);
-      for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-        const auto selected = plans.draftAttention(shape, lanes);
-        require(selected.configuration() == DraftAttentionConfiguration{}, "draft baseline changed");
-        covers(stride, selected.workspace(), lanes, draftFields);
-      }
-    }
     for (auto shape : moeShapes) {
       const auto stride = plans.moeDecodeWorkspacePerLane(shape);
       equalWorkspace(stride, MoE::decodePlan(shape, 1).workspace(), moeFields);
@@ -229,17 +210,6 @@ void allCandidates() {
       }
     }
   }
-  for (auto shape : draftShapes)
-    for (uint32_t lanes = 1; lanes <= 4; ++lanes)
-      for (auto config : DraftAttention::candidates(shape)) {
-        OperatorChoices choices;
-        choices.draftAttention.push_back({{shape, lanes}, config});
-        plans.install(choices);
-        const auto selected = plans.draftAttention(shape, lanes);
-        require(selected.configuration() == config, "draft candidate not selected");
-        covers(plans.draftAttentionWorkspacePerLane(shape), selected.workspace(),
-               lanes, draftFields);
-      }
   for (auto shape : moeShapes) {
     for (uint32_t rows : {1U, 17U, 2048U})
       for (const auto &candidate : plans.moeCandidates({shape, rows, MoePhase::Prefill})) {
@@ -272,7 +242,6 @@ OperatorChoices mixedChoices() {
                                       {PrefillSplitMultiplier::Two}});
   choices.verifyAttention.push_back({{attentionShapes[0], 3},
                                      {VerifySplitCount::One}});
-  choices.draftAttention.push_back({{draftShapes[0], 3}, {32}});
   choices.moe.push_back({{routedShape, 24, MoePhase::Decode}, {MoeExpertTile::M32}});
   choices.moe.push_back({{routedShape, 9, MoePhase::Prefill}, {MoeExpertTile::M8}});
   return choices;
@@ -290,8 +259,6 @@ void requireMixed(const ExecutionPlans &plans) {
               verify.laneSplits[0] == 1 &&
               verify.laneSplits[2] == kv::q8VerifyAttentionSplits(1, 2049, 8),
           "verify table was partially replaced");
-  require(plans.draftAttention(draftShapes[0], 3).configuration().groups == 32,
-          "draft table was partially replaced");
   require(plans.moeDecode(routedShape, 3).tileRows() == 32 &&
               plans.moePrefill(routedShape, 9).tileRows() == 8,
           "MoE table was partially replaced");
@@ -369,19 +336,8 @@ void policyKeysAndBounds() {
   require(plans.gateUpWorkspace(matrices[0]) == 1114112 &&
               plans.gateUpWorkspace(matrices[1]) == 393216,
           "B1 gate choice hid the B3/B4 baseline requirement");
-  const auto draft = plans.draftAttentionWorkspacePerLane(draftShapes[0]);
-  // Grouped queries per lane plus eight heads x four splits of 32 x 130 fp32
-  // attention partials behind them.
-  require(draft.convolutionBytes == 81920 && draft.qkvBytes == 98304 &&
-              draft.groupedQueriesBytes == 65536 + 8 * 4 * 16640 &&
-              draft.queryKeysBytes == 16384 && draft.queryValuesBytes == 16384,
-          "draft workspace ABI changed");
-  require(plans.draftAttention(draftShapes[0], 2).configuration() == DraftAttentionConfiguration{} &&
-              plans.draftAttention(draftShapes[1], 3).configuration() == DraftAttentionConfiguration{},
-          "draft choice leaked across width or shape");
   plans.install({});
   require(plans.moeDecode(routedShape, 3).tileRows() == 8 &&
-              plans.draftAttention(draftShapes[0], 3).configuration() == DraftAttentionConfiguration{} &&
               plans.prefillAttention(2048, 24, layout(attentionShapes[0]), 0).configuration == PrefillAttentionConfig{},
           "empty install did not reset all tables");
 }
@@ -392,7 +348,6 @@ void atomicInvalidChoices() {
   const auto invalid = [&](auto change) {
     auto pending = mixedChoices();
     pending.linear[0].configuration.groups = 32;
-    pending.draftAttention[0].configuration.groups = 80;
     change(pending);
     rejects([&] { plans.install(pending); });
     requireMixed(plans);
@@ -411,9 +366,6 @@ void atomicInvalidChoices() {
   invalid([](auto &c) { c.verifyAttention[0].configuration.scalePlacement = AttentionScalePlacement(2); });
   invalid([](auto &c) { c.verifyAttention[0].workload.lanes = 5; });
   invalid([](auto &c) { c.verifyAttention[0].workload.lanes = 0; });
-  invalid([](auto &c) { c.draftAttention[0].configuration.groups = 1; });
-  invalid([](auto &c) { c.draftAttention[0].workload.shape.dynamicSize = 256; });
-  invalid([](auto &c) { c.draftAttention[0].workload.lanes = 0; });
   invalid([](auto &c) { c.moe[0].configuration.expertTile = MoeExpertTile(16); });
   invalid([](auto &c) { c.moe[0].workload.rows = 9; });
   invalid([](auto &c) { c.moe[0].workload.rows = 40; });
@@ -422,7 +374,6 @@ void atomicInvalidChoices() {
   invalid([](auto &c) { c.linear.push_back(c.linear[0]); });
   invalid([](auto &c) { c.prefillAttention.push_back(c.prefillAttention[0]); });
   invalid([](auto &c) { c.verifyAttention.push_back(c.verifyAttention[0]); });
-  invalid([](auto &c) { c.draftAttention.push_back(c.draftAttention[0]); });
   invalid([](auto &c) { c.moe.push_back(c.moe[0]); });
 }
 
@@ -442,7 +393,6 @@ void invalidLookupsAndContextEdges() {
   rejects([&] { (void)plans.moeDecode(routedShape, 0); });
   rejects([&] { (void)plans.moePrefillWorkspace(routedShape, 0); });
   rejects([&] { (void)plans.gateUpWorkspace({256, 64}); });
-  rejects([&] { (void)plans.draftAttentionWorkspacePerLane({}); });
   OperatorChoices choices;
   choices.prefillAttention.push_back({{attentionShapes[0]},
                                       {PrefillSplitMultiplier::Two}});

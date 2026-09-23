@@ -24,19 +24,9 @@ template <class Weights>
 model::ModelPackage package() {
   model::ModelPackage result;
   Weights target;
-  model::DFlashDraftLayout draft;
-  // The placeholder draft the qwen4exp package declares.
-  draft.layers = 5;
-  draft.hiddenSize = 2560;
-  draft.dynamicSize = 768;
-  draft.qkvSize = 3072;
-  draft.attentionSize = 2048;
-  draft.intermediateSize = 8704;
-  draft.targetHiddenSize = target.layout.capturedHiddenSize();
-  result.descriptor = model::makeModelDescriptor(
-      "operator workspace test", target.layout, draft);
+  result.descriptor =
+      model::makeModelDescriptor("operator workspace test", target.layout);
   result.target = std::move(target);
-  result.draft.layout = draft;
   return result;
 }
 
@@ -54,8 +44,6 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
   ops::OperatorChoices choices;
   choices.prefillAttention.push_back(
       {{attention}, {ops::PrefillSplitMultiplier::Two}});
-  choices.draftAttention.push_back(
-      {{package.draft.layout.attentionShape(), 3}, {80}});
   if (geometry.ffnKind == model::QwenFfnKind::SparseMoe)
     choices.moe.push_back({{geometry.moe, 24, ops::MoePhase::Decode},
                            {ops::MoeExpertTile::M32}});
@@ -110,9 +98,6 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
               after.pipelineReserveBytes == before.pipelineReserveBytes &&
               after.runtimeOverheadReserveBytes == before.runtimeOverheadReserveBytes,
           "kernel selection changed state or unrelated memory reserves");
-  require(selected.draftAttention(package.draft.layout.attentionShape(), 3)
-                  .configuration().groups == 80,
-          "paired draft did not use the same selection owner");
   selected.install({});
   const auto reset = model::plannedRuntimeMemory(device, package, selected);
   require(reset.sharedPrefillPlannedAllocatedBytes ==

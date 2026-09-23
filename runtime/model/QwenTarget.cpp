@@ -3,7 +3,6 @@
 #include "model/Qwen4Exp.hpp"
 #include "model/Qwen4ExpTarget.hpp"
 
-#include "ops/DraftAttention.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/Normalization.hpp"
 
@@ -39,11 +38,6 @@ QwenTargetGeometry commonGeometry(const Layout &layout) {
   result.stopTokens = layout.stopTokens;
   result.kvLayout = layout.q8Layout();
   result.stateLayout = layout.gdnStateLayout();
-  result.captureLayerCount =
-      static_cast<uint32_t>(layout.hiddenCaptureLayers.size());
-  std::copy(layout.hiddenCaptureLayers.begin(),
-            layout.hiddenCaptureLayers.end(),
-            result.captureLayerValues.begin());
   return result;
 }
 
@@ -164,15 +158,6 @@ QwenTargetGeometry qwenTargetGeometry(const Qwen4ExpWeights &weights) {
   return geometryFor(weights.layout);
 }
 
-const ops::Q4Projection *QwenTarget::vocabularyProjection() const noexcept {
-  return std::visit([](const auto *weights) -> const ops::Q4Projection * {
-    if constexpr (std::is_same_v<decltype(weights->logitsProjection),
-                                 const ops::Q4Projection>)
-      return &weights->logitsProjection;
-    else
-      return nullptr;  // an 8-bit head; only placeholder drafts pair with it
-  }, weights_);
-}
 
 void QwenTarget::addPrefill(
     metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
@@ -204,22 +189,10 @@ void QwenTarget::addHead(metal::CommandGraph &graph,
       normalizedRows > ExecutionLimits::targetVerifyRows) {
     throw std::invalid_argument("invalid Qwen head row count");
   }
-  if (std::holds_alternative<const Qwen4ExpWeights *>(weights_)) {
-    const auto *exp = std::get<const Qwen4ExpWeights *>(weights_);
-    Qwen4ExpTarget::addHead(*exp, geometry_, operators_, graph,
-                            std::move(hidden), std::move(finalHidden),
-                            std::move(logits), headNormalized_, headReduced_,
-                            normalizedRows);
-    return;
-  }
-  const metal::MetalBuffer norm = std::visit(
-      [](const auto *weights) { return weights->finalNorm; }, weights_);
-  ops::Normalization::addRms(graph, std::move(hidden), norm, finalHidden,
-                             geometry_.hiddenSize, normalizedRows);
-  const ops::LinearMatrix head{geometry_.vocabularySize, geometry_.hiddenSize};
-  operators_.linear().addDecode(graph,
-                std::move(finalHidden), *vocabularyProjection(),
-                std::move(logits), head);
+  Qwen4ExpTarget::addHead(*std::get<const Qwen4ExpWeights *>(weights_),
+                          geometry_, operators_, graph, std::move(hidden),
+                          std::move(finalHidden), std::move(logits),
+                          headNormalized_, headReduced_, normalizedRows);
 }
 
 void QwenTarget::addEmbedding(metal::CommandGraph &graph,
@@ -240,18 +213,6 @@ void QwenTarget::addEmbedding(metal::CommandGraph &graph,
       weights_);
 }
 
-void QwenTarget::addDraftEmbedding(metal::CommandGraph &graph,
-                                   metal::MetalBuffer tokens,
-                                   metal::MetalBuffer hidden,
-                                   uint32_t rows) const {
-  if (std::holds_alternative<const Qwen4ExpWeights *>(weights_)) {
-    const auto *exp = std::get<const Qwen4ExpWeights *>(weights_);
-    ops::Embedding::add(graph, std::move(tokens), exp->tokenEmbedding,
-                        std::move(hidden), rows);
-    return;
-  }
-  addEmbedding(graph, std::move(tokens), std::move(hidden), rows);
-}
 
 void QwenTarget::addStateCommit(metal::CommandGraph &graph,
                                 QwenTargetCommitBuffers buffers,

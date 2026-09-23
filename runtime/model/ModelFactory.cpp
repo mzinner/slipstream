@@ -8,16 +8,12 @@ namespace splash::model {
 
 void requireCompatibleModelPackage(const ModelPackage &package) {
   if (!package.descriptor.valid() ||
-      package.descriptor.draft != package.draft.layout ||
       !std::visit(
           [&](const auto &target) {
-            return package.descriptor.target == TargetLayout{target.layout} &&
-                   target.layout.vocabularySize ==
-                       package.draft.layout.vocabularySize;
+            return package.descriptor.target == TargetLayout{target.layout};
           },
           package.target)) {
-    throw std::invalid_argument(
-        "target and draft model interfaces are incompatible");
+    throw std::invalid_argument("model weights do not match the descriptor");
   }
 }
 
@@ -37,13 +33,9 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
         return loadQwen4ExpWeights(backend, root / "target", layout);
       },
       result.descriptor.target);
-  result.draft = loadDFlashDraftWeights(
-      backend, root / "draft", result.descriptor.draft);
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),
                                         result.targetFiles().end());
-  records.insert(records.end(), result.draft.files.begin(),
-                 result.draft.files.end());
   result.manifestFingerprintSha256 = weightManifestFingerprint(records);
   requireCompatibleModelPackage(result);
   return result;

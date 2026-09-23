@@ -7,19 +7,17 @@ namespace splash::test {
 // Synthetic nonzero allocations for planner/status tests. Production obtains
 // these values from the loaded model and plannedRuntimeMemory().
 [[nodiscard]] inline engine::ModelMemoryFootprint
-modelMemoryFootprint(uint64_t targetWeightsBytes,
-                     uint64_t draftWeightsBytes) {
-  return {targetWeightsBytes, draftWeightsBytes,
+modelMemoryFootprint(uint64_t targetWeightsBytes) {
+  return {targetWeightsBytes,
           350'224'384, 734'396'416,
           160'669'696, 256ULL * 1024 * 1024, 512ULL * 1024 * 1024};
 }
 
 [[nodiscard]] inline engine::ModelMemoryProfile
-modelMemoryProfile(uint64_t targetWeightsBytes,
-                   uint64_t draftWeightsBytes) {
+modelMemoryProfile(uint64_t targetWeightsBytes) {
   return {"Qwen3.8-Flash-Next", kv::kMaximumLogicalTokens,
           kv::Q8Layout{16, 4, 256},
-          modelMemoryFootprint(targetWeightsBytes, draftWeightsBytes)};
+          modelMemoryFootprint(targetWeightsBytes)};
 }
 
 } // namespace splash::test

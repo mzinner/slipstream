@@ -6,11 +6,11 @@
 #include "model/RuntimeArenas.hpp"
 
 #include "metal/CommandGraph.hpp"
-#include "ops/DraftAttention.hpp"
 #include "ops/Linear.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/PagedKv.hpp"
 #include "ops/RoPE.hpp"
+#include "ops/Rows.hpp"
 #include "ops/Sampling.hpp"
 
 #include <algorithm>
@@ -207,9 +207,6 @@ struct Runtime::Impl {
     bool verifyMaskInFlight = false;
     uint64_t rngCounter = 0;
     DecodeStage decodeStage = DecodeStage::Regular;
-    bool draftContextValid = false;
-    uint64_t draftContextThrough = 0;
-    std::optional<DraftContextPlan> draftContextPlan;
     // The MTP head's input for the next decode cycle; see QwenMtpLane.
     QwenMtpLane mtp;
   };
@@ -248,7 +245,6 @@ struct Runtime::Impl {
   ModelTelemetry counters;
   ops::Sampling sampling;
   QwenTarget targetModel;
-  DFlashDraft draftModel;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         admitAllocation(std::move(value.admitAllocation)),
@@ -263,8 +259,7 @@ struct Runtime::Impl {
             [&](const auto &weights) -> QwenTarget {
               return QwenTarget(weights, value.backend, operators);
             },
-            value.package.target)),
-        draftModel(value.package.draft, value.backend, operators) {
+            value.package.target)) {
     if (!admitAllocation)
       throw std::invalid_argument(
           "model runtime requires allocation admission");
@@ -317,7 +312,6 @@ struct Runtime::Impl {
       result = checkedAdd(result, bytes, label);
     };
     add(package.targetActualAllocatedBytes(), "warmup target weights");
-    add(package.draft.actualAllocatedBytes, "warmup draft weights");
     add(states.actualAllocatedBytes(), "warmup state slots");
     add(prefillArena->bytes(), "warmup prefill arena");
     add(decodeArena->bytes(), "warmup decode arena");
@@ -354,17 +348,11 @@ struct Runtime::Impl {
     return destination;
   }
 
-  void addRopeTables(CommandGraph &graph, MetalBuffer targetPositions,
-                     uint32_t targetRows, MetalBuffer draftPositions,
-                     uint32_t draftRows, MetalBuffer targetCos,
-                     MetalBuffer targetSin, MetalBuffer draftCos,
-                     MetalBuffer draftSin) const {
-    ops::RoPE::addTables(
-        graph, std::move(targetPositions), std::move(draftPositions),
-        prefillArena->get(PrefillTensor::TargetInverseFrequencies),
-        prefillArena->get(PrefillTensor::DraftInverseFrequencies),
-        std::move(targetCos), std::move(targetSin), std::move(draftCos),
-        std::move(draftSin), {targetRows, draftRows}, kPrefillRows);
+  void addRopeTables(CommandGraph &graph, MetalBuffer positions, uint32_t rows,
+                     MetalBuffer cosine, MetalBuffer sine) const {
+    ops::RoPE::addTables(graph, std::move(positions),
+                         prefillArena->get(PrefillTensor::TargetInverseFrequencies),
+                         std::move(cosine), std::move(sine), rows, kPrefillRows);
   }
 
   void captureFinalHidden(Request &entry, const MetalBuffer &rows,
@@ -377,50 +365,6 @@ struct Runtime::Impl {
     entry.finalTargetHidden.assign(
         source + uint64_t{row} * geometry.target.hiddenSize,
         source + uint64_t{row + 1} * geometry.target.hiddenSize);
-  }
-
-  static DispatchDraftCapturePlan
-  activeDraftCaptures(const Request &entry, const ModelBatchItem &item) {
-    if (!entry.draftContextPlan) {
-      throw std::logic_error("prefill request has no draft context plan");
-    }
-    const uint64_t next = item.logicalPosition + item.tokenCount;
-    return draftCaptureSpansForDispatch(
-        *entry.draftContextPlan, static_cast<uint32_t>(item.logicalPosition),
-        static_cast<uint32_t>(next));
-  }
-
-  static uint32_t captureRows(const DispatchDraftCapturePlan &captures) {
-    uint64_t rows = 0;
-    for (const auto &capture : captures) {
-      rows += capture.absoluteEnd - capture.absoluteBegin;
-    }
-    if (rows > kPrefillRows) {
-      throw std::logic_error("draft capture exceeds packed prefill capacity");
-    }
-    return static_cast<uint32_t>(rows);
-  }
-
-  static QwenLogicalLengths
-  advanceDraftContext(const QwenLogicalLengths &previous, uint64_t targetTokens,
-                      const DispatchDraftCaptureSpan &capture) {
-    QwenLogicalLengths next = previous;
-    next.targetTokens = targetTokens;
-    const uint32_t rows = capture.absoluteEnd - capture.absoluteBegin;
-    if (!rows)
-      return next;
-    const bool continues =
-        !capture.resetDraftState &&
-        previous.draftEnd() == capture.absoluteBegin &&
-        previous.draftCommitCursor == capture.absoluteBegin % kDraftCacheStride;
-    const uint64_t combined =
-        continues ? uint64_t{previous.draftLength} + rows : rows;
-    next.draftLength =
-        static_cast<uint32_t>(std::min<uint64_t>(combined, kDraftCacheStride));
-    next.draftBase = capture.absoluteEnd - next.draftLength;
-    next.draftCommitCursor =
-        static_cast<uint32_t>(capture.absoluteEnd % kDraftCacheStride);
-    return next;
   }
 
   void loadPolicyBuffers(Request &entry, uint32_t lane,
@@ -516,8 +460,8 @@ struct Runtime::Impl {
     return timing;
   }
 
-  // Rows a verify step may keep: the anchor plus accepted proposals. With a
-  // placeholder draft no proposal is worth keeping, so only the anchor.
+  // Rows a verify step may keep: the anchor plus accepted proposals. Without
+  // the MTP head proposing, only the anchor.
   // The package has an MTP head and drafting was not turned off.
   bool mtpDrafting() const noexcept {
     const auto *weights = std::get_if<Qwen4ExpWeights>(&package.target);
@@ -539,8 +483,7 @@ struct Runtime::Impl {
                             const Request *entry = nullptr) const noexcept {
     if (entry && mtpProposing(*entry))
       return std::min(remaining, 1 + mtpProposals());
-    return std::min(remaining,
-                    package.descriptor.draftPlaceholder ? 1u : kDecodeRows);
+    return std::min(remaining, 1u);
   }
 
   Q8ChunkedPrefillParams q8Params(uint64_t logicalPosition,
@@ -558,16 +501,13 @@ struct Runtime::Impl {
     uint32_t attentionStride = 0;
     uint64_t queryOffset = 0;
     uint64_t kvOffset = 0;
-    uint32_t captureBegin = 0;
     Q8ChunkedPrefillParams q8;
     MetalBuffer pageTable;
-    DispatchDraftCapturePlan captures;
   };
 
   struct PackedPrefillBatch final {
     std::vector<PackedPrefillSequence> sequences;
     uint32_t rows = 0;
-    uint32_t capturedRows = 0;
   };
 
   MetalBuffer prefillU16(PrefillTensor tensor, uint32_t begin, uint32_t rows,
@@ -602,11 +542,6 @@ struct Runtime::Impl {
       if (item.tokenCount > kPrefillRows - batch.rows) {
         throw std::invalid_argument("packed prefill exceeds actual-row budget");
       }
-      auto captures = activeDraftCaptures(entry, item);
-      const uint32_t capturedRows = captureRows(captures);
-      if (capturedRows > kPrefillRows - batch.capturedRows) {
-        throw std::invalid_argument("packed draft capture exceeds row budget");
-      }
       const uint32_t attentionStride =
           ((item.tokenCount + kTileRows - 1) / kTileRows) * kTileRows;
       const Q8ChunkedPrefillParams q8 =
@@ -614,12 +549,10 @@ struct Runtime::Impl {
                    item.pageTable);
       MetalBuffer pageTable = synchronizedPageTable(entry, item);
       batch.sequences.push_back({&entry, &item, lane, batch.rows,
-                                 attentionStride, queryOffset, kvOffset,
-                                 batch.capturedRows, q8, std::move(pageTable),
-                                 std::move(captures)});
+                                 attentionStride, queryOffset, kvOffset, q8,
+                                 std::move(pageTable)});
       entries[lane] = &entry;
       batch.rows += item.tokenCount;
-      batch.capturedRows += capturedRows;
       queryOffset += bytesFor<uint16_t>(
           uint64_t{geometry.target.attentionQueryHeads} * attentionStride *
           geometry.target.attentionHeadDimension);
@@ -640,9 +573,6 @@ struct Runtime::Impl {
     auto *targetPositions =
         contents<uint32_t>(prefillArena->get(PrefillTensor::TargetPositions),
                            "target RoPE positions");
-    auto *draftPositions =
-        contents<uint32_t>(prefillArena->get(PrefillTensor::DraftPositions),
-                           "draft RoPE positions");
     for (const PackedPrefillSequence &sequence : batch.sequences) {
       const ModelBatchItem &item = *sequence.item;
       std::copy(item.inputTokens.begin(), item.inputTokens.end(),
@@ -656,46 +586,8 @@ struct Runtime::Impl {
             ropePosition(*sequence.entry, item.logicalPosition + localRow);
         std::copy(rotary.begin(), rotary.end(), targetPositions + row * 3);
       }
-      for (const DispatchDraftCaptureSpan &capture : sequence.captures) {
-        for (uint32_t row = capture.absoluteBegin; row < capture.absoluteEnd;
-             ++row) {
-          const uint32_t compactRow = sequence.captureBegin +
-                                      capture.compactDestinationRow + row -
-                                      capture.absoluteBegin;
-          draftPositions[compactRow] = row;
-        }
-      }
     }
     return batch;
-  }
-
-  void addPackedDraftContext(CommandGraph &graph,
-                             const PackedPrefillBatch &batch) {
-    // A placeholder draft proposes nothing worth keeping; it never runs.
-    if (package.descriptor.draftPlaceholder)
-      return;
-    if (!batch.capturedRows)
-      return;
-    auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor); };
-    std::array<DFlashPrefillSpan, kLaneCount * 2> spans{};
-    uint32_t spanCount = 0;
-    for (const PackedPrefillSequence &sequence : batch.sequences) {
-      const QwenSlotBuffers &slot = states.buffers(sequence.entry->slot);
-      for (const DispatchDraftCaptureSpan &capture : sequence.captures) {
-        DFlashPrefillSpan &span = spans.at(spanCount++);
-        span.compactRow = sequence.captureBegin + capture.compactDestinationRow;
-        span.rows = capture.absoluteEnd - capture.absoluteBegin;
-        span.startPosition = capture.absoluteBegin;
-        span.ring = slot.draft;
-      }
-    }
-    draftModel.addContextPrefill(
-        graph,
-        {p(PrefillTensor::Captured), p(PrefillTensor::ProjectionSums),
-         p(PrefillTensor::ContextProjected), p(PrefillTensor::ContextHidden),
-         p(PrefillTensor::ContextQkv), p(PrefillTensor::DraftRopeCos),
-         p(PrefillTensor::DraftRopeSin)},
-        batch.capturedRows, std::span(spans).first(spanCount));
   }
 
   void encodePackedPrefillGraph(CommandGraph &graph,
@@ -705,10 +597,7 @@ struct Runtime::Impl {
     auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor); };
 
     addRopeTables(graph, p(PrefillTensor::TargetPositions), batch.rows,
-                  p(PrefillTensor::DraftPositions), batch.capturedRows,
-                  p(PrefillTensor::RopeCos), p(PrefillTensor::RopeSin),
-                  p(PrefillTensor::DraftRopeCos),
-                  p(PrefillTensor::DraftRopeSin));
+                  p(PrefillTensor::RopeCos), p(PrefillTensor::RopeSin));
 
     targetModel.addEmbedding(graph, p(PrefillTensor::InputTokens),
                              p(PrefillTensor::Hidden0), batch.rows);
@@ -756,21 +645,10 @@ struct Runtime::Impl {
       }
       destination.auxiliaryIn = slot.gdn[metadata.activeParity].auxiliary;
       destination.auxiliaryOut = slot.gdn[metadata.activeParity ^ 1].auxiliary;
-      destination.captureCount = sequence.captures.size();
-      for (uint32_t index = 0; index < sequence.captures.size(); ++index) {
-        const DispatchDraftCaptureSpan &capture = sequence.captures[index];
-        destination.captures[index] = {
-            sequence.rowBegin +
-                static_cast<uint32_t>(capture.absoluteBegin -
-                                      sequence.item->logicalPosition),
-            sequence.captureBegin + capture.compactDestinationRow,
-            capture.absoluteEnd - capture.absoluteBegin};
-      }
     }
     QwenTargetPrefillBuffers buffers;
     buffers.hidden = {p(PrefillTensor::Hidden0), p(PrefillTensor::Hidden1)};
     buffers.normalized = p(PrefillTensor::Normalized);
-    buffers.captured = p(PrefillTensor::Captured);
     buffers.gdnPacked = p(PrefillTensor::GdnPacked);
     buffers.gdnQueries = p(PrefillTensor::GdnQueries);
     buffers.gdnKeys = p(PrefillTensor::GdnKeys);
@@ -819,7 +697,6 @@ struct Runtime::Impl {
         graph, std::move(buffers),
         std::span(modelSequences).first(batch.sequences.size()), batch.rows,
         kvLayers);
-    addPackedDraftContext(graph, batch);
 
     for (const PackedPrefillSequence &sequence : batch.sequences) {
       Request &entry = *sequence.entry;
@@ -831,7 +708,7 @@ struct Runtime::Impl {
         return decodeArena->get(sequence.lane, tensor);
       };
       const uint32_t lastRows = std::min(item.tokenCount, kDecodeRows);
-      ops::DraftAttention::gatherLastRows(
+      ops::Rows::gatherLast(
           graph,
           prefillU16(PrefillTensor::Hidden0, sequence.rowBegin,
                      item.tokenCount, geometry.target.residualWidth()),
@@ -855,8 +732,7 @@ struct Runtime::Impl {
       throw std::logic_error("decode request is not ready");
     }
     const QwenSlotMetadata &metadata = states.metadata(entry.slot);
-    if (metadata.lengths.targetTokens != item.logicalPosition ||
-        !metadata.lengths.hasCompleteDraftWindow(kDraftCacheStride)) {
+    if (metadata.lengths.targetTokens != item.logicalPosition) {
       throw std::logic_error("decode state length is not exact");
     }
     static_cast<void>(synchronizedPageTable(entry, item));
@@ -870,15 +746,10 @@ struct Runtime::Impl {
     auto *positions =
         contents<uint32_t>(decodeArena->get(lane, DecodeTensor::Positions),
                            "decode RoPE positions");
-    auto *draftPositions =
-        contents<uint32_t>(decodeArena->get(lane, DecodeTensor::DraftPositions),
-                           "decode draft RoPE positions");
     for (uint32_t row = 0; row < kDecodeRows; ++row) {
       const std::array<uint32_t, 3> rotary =
           ropePosition(entry, item.logicalPosition + row);
       std::copy(rotary.begin(), rotary.end(), positions + row * 3);
-      // The draft is a text model over logical positions.
-      draftPositions[row] = static_cast<uint32_t>(item.logicalPosition + row);
     }
     *contents<uint32_t>(decodeArena->get(lane, DecodeTensor::Arrived),
                         "decode arrived") = 0;
@@ -893,88 +764,6 @@ struct Runtime::Impl {
     if (!entry)
       throw std::invalid_argument("empty decode batch lane");
     return *entry;
-  }
-
-  void bindDraftRings(
-      std::span<Request *const> entries,
-      std::vector<std::array<MetalBuffer, kLaneCount>> &keys,
-      std::vector<std::array<MetalBuffer, kLaneCount>> &values) const {
-    keys.resize(geometry.draft.layers);
-    values.resize(geometry.draft.layers);
-    for (uint32_t layer = 0; layer < geometry.draft.layers; ++layer) {
-      for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
-        const auto &ring =
-            states.buffers(laneEntry(entries, lane).slot).draft[layer];
-        keys[layer][lane] = ring.keys;
-        values[layer][lane] = ring.values;
-      }
-    }
-  }
-
-  void encodeDraftBatchGraph(CommandGraph &graph,
-                             std::span<Request *const> entries,
-                             std::span<const uint64_t> logicalPositions,
-                             ops::Q4DispatchStats &stats) {
-    // A placeholder draft proposes nothing worth keeping; it never runs.
-    if (package.descriptor.draftPlaceholder)
-      return;
-    if (entries.empty() || entries.size() > kLaneCount ||
-        entries.size() != logicalPositions.size()) {
-      throw std::invalid_argument("invalid draft decode batch");
-    }
-    const uint32_t lanes = static_cast<uint32_t>(entries.size());
-    auto d = [&](DecodeTensor tensor) {
-      return decodeArena->packed(tensor, lanes);
-    };
-    std::array<uint32_t, kLaneCount> cacheLengths{};
-    for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
-      cacheLengths[lane] =
-          static_cast<uint32_t>(logicalPositions[std::min(lane, lanes - 1)]);
-    }
-
-    DFlashDecodeBuffers buffers;
-    for (uint32_t hidden = 0; hidden < buffers.hidden.size(); ++hidden) {
-      buffers.hidden[hidden] = d(static_cast<DecodeTensor>(
-          static_cast<uint32_t>(DecodeTensor::DraftHidden0) + hidden));
-    }
-    buffers.normalized = d(DecodeTensor::DraftNormalized);
-    buffers.dynamic = d(DecodeTensor::DraftDynamic);
-    buffers.convolved = d(DecodeTensor::DraftConvolved);
-    buffers.proposalQkv = d(DecodeTensor::DraftProposalQkv);
-    buffers.attention = d(DecodeTensor::DraftAttention);
-    buffers.projected = d(DecodeTensor::DraftProjected);
-    buffers.residual = d(DecodeTensor::DraftResidual);
-    buffers.intermediate = d(DecodeTensor::DraftIntermediate);
-    buffers.finalHidden = d(DecodeTensor::DraftFinalHidden);
-    buffers.logits = d(DecodeTensor::Logits);
-    buffers.selectorHidden = d(DecodeTensor::SelectorHidden);
-    buffers.queryKeys = d(DecodeTensor::DraftQueryKeys);
-    buffers.queryValues = d(DecodeTensor::DraftQueryValues);
-    buffers.ropeCos = d(DecodeTensor::DraftRopeCos);
-    buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
-    buffers.gateScratch = decodeArena->gateScratch();
-    bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
-    draftModel.addDecode(graph, std::move(buffers),
-                         *targetModel.vocabularyProjection(), cacheLengths,
-                         lanes, stats);
-    std::array<uint32_t, kLaneCount> anchors{};
-    std::array<ops::SamplingPolicy, kLaneCount> policies{};
-    for (uint32_t lane = 0; lane < lanes; ++lane) {
-      Request &entry = laneEntry(entries, lane);
-      if (!entry.pendingToken)
-        throw std::invalid_argument("draft batch lane has no anchor");
-      anchors[lane] = *entry.pendingToken;
-      policies[lane] = samplingPolicy(entry);
-    }
-    draftModel.addSelection(
-        graph,
-        {d(DecodeTensor::Logits), d(DecodeTensor::TopPartialIds),
-         d(DecodeTensor::TopPartialValues), d(DecodeTensor::Candidates),
-         d(DecodeTensor::Unary), d(DecodeTensor::SelectorHidden),
-         d(DecodeTensor::SamplingUniforms), d(DecodeTensor::ProposedTokens),
-         d(DecodeTensor::ProposalProbs)},
-        std::span(anchors).first(lanes), std::span(policies).first(lanes),
-        kDraftProposalTokens);
   }
 
   // How a verify step treats the MTP head: draft then verify (the usual
@@ -1027,7 +816,6 @@ struct Runtime::Impl {
     buffers.ropeSin = d(DecodeTensor::RopeSin);
     buffers.arrived = d(DecodeTensor::Arrived);
     buffers.generation = d(DecodeTensor::Generation);
-    buffers.capturedTargetHidden = d(DecodeTensor::CapturedTargetHidden);
     buffers.finalHidden = d(DecodeTensor::FinalHidden);
     buffers.logits = d(DecodeTensor::Logits);
     buffers.denseGateScratch = decodeArena->gateScratch();
@@ -1049,7 +837,7 @@ struct Runtime::Impl {
     buffers.hyperReduced = d(DecodeTensor::HyperReduced);
     buffers.hyperInjection = d(DecodeTensor::HyperInjection);
     buffers.hyperMixed = d(DecodeTensor::HyperMixed);
-    buffers.liveRowsPerLane = package.descriptor.draftPlaceholder ? 1u : kDecodeRows;
+    buffers.liveRowsPerLane = 1u;
     if (mtpPhase != MtpPhase::AlreadyDrafted)
       mtpProposed = mtpProposals();
     buffers.mtpProposedOut = &mtpProposed;
@@ -1147,39 +935,6 @@ struct Runtime::Impl {
     addInitialPolicySelection(graph, entry, lane, finalRow);
   }
 
-  void encodeDraftStateCommitBatch(CommandGraph &graph,
-                                   std::span<Request *const> entries,
-                                   std::span<const ModelBatchItem> items,
-                                   ops::Q4DispatchStats &stats) {
-    // A placeholder draft proposes nothing worth keeping; it never runs.
-    if (package.descriptor.draftPlaceholder)
-      return;
-    if (entries.empty() || entries.size() > kLaneCount ||
-        entries.size() != items.size()) {
-      throw std::invalid_argument("invalid draft state commit batch");
-    }
-    const uint32_t lanes = static_cast<uint32_t>(entries.size());
-    auto d = [&](DecodeTensor tensor) {
-      return decodeArena->packed(tensor, lanes);
-    };
-
-    std::array<uint32_t, kLaneCount> startPositions{};
-    for (uint32_t lane = 0; lane < kLaneCount; ++lane)
-      startPositions[lane] = static_cast<uint32_t>(
-          items[std::min(lane, lanes - 1)].logicalPosition);
-    DFlashContextBuffers buffers;
-    buffers.capturedTargetHidden = d(DecodeTensor::CapturedTargetHidden);
-    buffers.projected = d(DecodeTensor::ContextProjected);
-    buffers.hidden = d(DecodeTensor::ContextHidden);
-    buffers.qkv = d(DecodeTensor::ContextQkv);
-    buffers.ropeCos = d(DecodeTensor::DraftRopeCos);
-    buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
-    buffers.retainedCounts = d(DecodeTensor::RetainedCount);
-    bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
-    draftModel.addContextCommit(graph, std::move(buffers), startPositions,
-                                lanes, stats);
-  }
-
   void encodeBatchAcceptance(CommandGraph &graph,
                              std::span<Request *const> lanes,
                              std::span<const uint32_t> maximumRetained) {
@@ -1219,15 +974,6 @@ struct Runtime::Impl {
     const uint32_t rows = lanes * kDecodeRows;
     targetModel.addEmbedding(graph, decodeArena->packed(tokens, lanes),
                              decodeArena->packed(output, lanes), rows);
-  }
-
-  void encodeBatchDraftEmbedding(CommandGraph &graph, DecodeTensor tokens,
-                                 DecodeTensor output, uint32_t lanes) {
-    if (!lanes || lanes > kLaneCount)
-      throw std::invalid_argument("invalid draft embedding batch width");
-    const uint32_t rows = lanes * kDecodeRows;
-    targetModel.addDraftEmbedding(graph, decodeArena->packed(tokens, lanes),
-                                  decodeArena->packed(output, lanes), rows);
   }
 
   void encodeBatchVerifyInput(CommandGraph &graph, uint32_t lanes) {
@@ -1333,12 +1079,7 @@ struct Runtime::Impl {
       states.swapParity(entry.slot);
       const uint64_t nextLength =
           items[lane].logicalPosition + laneResult.retained;
-      const QwenLogicalLengths previous = states.metadata(entry.slot).lengths;
-      states.updateLengths(
-          entry.slot, advanceDraftContext(
-                          previous, nextLength,
-                          {static_cast<uint32_t>(items[lane].logicalPosition),
-                           static_cast<uint32_t>(nextLength), 0, false}));
+      states.updateLengths(entry.slot, {nextLength});
       entry.generatedTokens += laneResult.retained;
       entry.pendingToken = laneResult.nextAnchor;
       // Next cycle the MTP head reads this step's retained rows, each with
@@ -1501,10 +1242,6 @@ struct Runtime::Impl {
           impl_.encodeBatchAcceptance(commit, {entries.data(), lanes_.size()},
                                       {maximumRetained.data(), lanes_.size()});
           impl_.encodeBatchGdnCommit(commit, {entries.data(), lanes_.size()});
-          // Nothing reads the placeholder draft's context when the head drafts.
-          if (!mtpProposes_)
-            impl_.encodeDraftStateCommitBatch(
-                commit, {entries.data(), lanes_.size()}, items_, stats_);
           submit(commit);
           stage_ = Stage::Commit;
         }
@@ -1617,15 +1354,6 @@ void Runtime::beginColdRequest(const ModelRequest &request,
         std::string("unable to allocate sequence state cell: ") +
             metal::allocationFailureName(admission.failure), admission.failure);
   }
-  try {
-    setDraftContextPlan(
-        request.id,
-        planDraftContext(0, static_cast<uint32_t>(request.prompt.size()),
-                         std::nullopt, {}));
-  } catch (...) {
-    end(request.id);
-    throw;
-  }
 }
 
 StateAdmission Runtime::begin(const ModelRequest &request) {
@@ -1640,11 +1368,8 @@ void Runtime::suspend(uint64_t requestId) {
     throw std::logic_error("Qwen request cannot be suspended");
   }
   impl_->states.releaseSlot(entry.slot, requestId);
-  static_cast<void>(impl_->states.releaseIdle(0, 0));
+  static_cast<void>(impl_->states.releaseIdle(0));
   impl_->pageTableBindings[entry.slot] = {};
-  entry.draftContextPlan.reset();
-  entry.draftContextValid = false;
-  entry.draftContextThrough = 0;
   entry.replayingGeneration |= entry.promptComplete;
   entry.promptComplete = false;
   entry.resident = false;
@@ -1718,8 +1443,7 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
 }
 
 void Runtime::restore(uint64_t requestId, uint32_t restoredPrefixLength,
-                      std::shared_ptr<const CompositeState> restoredState,
-                      bool restoreDraftState) {
+                      std::shared_ptr<const CompositeState> restoredState) {
   Impl::Request &entry = impl_->request(requestId);
   if (!entry.resident || !restoredState) {
     throw std::invalid_argument("cannot restore a nonresident request");
@@ -1728,15 +1452,10 @@ void Runtime::restore(uint64_t requestId, uint32_t restoredPrefixLength,
     throw std::invalid_argument(
         "reusable Qwen prefix must leave an input token to replay");
   }
-  impl_->states.restore(entry.slot, *restoredState, restoreDraftState);
-  if (!restoreDraftState)
-    ++impl_->counters.draftStateRestoreSkipped;
+  impl_->states.restore(entry.slot, *restoredState);
   const QwenLogicalLengths &lengths =
       impl_->states.metadata(entry.slot).lengths;
-  if (lengths.targetTokens != restoredPrefixLength ||
-      (restoreDraftState &&
-       !lengths.hasCompleteDraftWindow(kDraftCacheStride)) ||
-      (!restoreDraftState && lengths.draftLength != 0)) {
+  if (lengths.targetTokens != restoredPrefixLength) {
     throw std::invalid_argument("prefix logical length does not match state");
   }
   entry.promptComplete = false;
@@ -1744,25 +1463,6 @@ void Runtime::restore(uint64_t requestId, uint32_t restoredPrefixLength,
     entry.finalTargetHidden.clear();
     entry.pendingToken.reset();
   }
-  entry.draftContextValid = restoreDraftState;
-  entry.draftContextThrough = restoreDraftState ? restoredPrefixLength : 0;
-  entry.draftContextPlan.reset();
-}
-
-void Runtime::setDraftContextPlan(uint64_t requestId, DraftContextPlan plan) {
-  Impl::Request &entry = impl_->request(requestId);
-  if (!entry.resident || plan.replayEnd != entry.promptTokens) {
-    throw std::invalid_argument("draft context plan does not match request");
-  }
-  const uint64_t current =
-      impl_->states.metadata(entry.slot).lengths.targetTokens;
-  if (plan.replayBegin != current ||
-      plan.restoredDraftBoundary !=
-          (current ? std::optional<uint32_t>(static_cast<uint32_t>(current))
-                   : std::nullopt)) {
-    throw std::invalid_argument("draft context plan restore boundary is stale");
-  }
-  entry.draftContextPlan = std::move(plan);
 }
 
 std::vector<ModelStepResult>
@@ -1809,39 +1509,10 @@ Runtime::prefillAsync(const BatchPlan &plan,
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       Impl::Request &entry = *entries[lane];
       const ModelBatchItem &item = items[lane];
-      const auto captures = Impl::activeDraftCaptures(entry, item);
-      const uint32_t capturedRows = Impl::captureRows(captures);
-      uint32_t activeRows = 0;
-      uint32_t materializationRows = 0;
-      for (const auto &capture : captures) {
-        activeRows += capture.activeRows;
-        materializationRows += capture.materializationRows;
-      }
-      if (activeRows + materializationRows != capturedRows) {
-        throw std::logic_error("draft capture telemetry is inconsistent");
-      }
       impl->counters.targetPrefillRows += item.tokenCount;
-      impl->counters.draftContextRowsActive += activeRows;
-      impl->counters.draftContextRowsMaterialization += materializationRows;
-      impl->counters.draftContextRowsAvoided += item.tokenCount - capturedRows;
-      for (const auto &capture : captures) {
-        const bool continues =
-            !capture.resetDraftState && entry.draftContextValid &&
-            entry.draftContextThrough == capture.absoluteBegin;
-        if (!continues) {
-          ++impl->counters.draftStateResets;
-        }
-        entry.draftContextValid = true;
-        entry.draftContextThrough = capture.absoluteEnd;
-      }
       impl->states.swapParity(entry.slot);
       uint64_t nextLength = item.logicalPosition + item.tokenCount;
-      QwenLogicalLengths lengths = impl->states.metadata(entry.slot).lengths;
-      lengths.targetTokens = nextLength;
-      for (const auto &capture : captures) {
-        lengths = Impl::advanceDraftContext(lengths, nextLength, capture);
-      }
-      impl->states.updateLengths(entry.slot, lengths);
+      impl->states.updateLengths(entry.slot, {nextLength});
       entry.promptComplete = nextLength == entry.promptTokens;
       ModelStepResult result{entry.id, item.tokenCount, {}, false,
                              entry.decodeStage, 0, 0};
@@ -2001,29 +1672,11 @@ Runtime::decodeAsync(const BatchPlan &plan,
     impl_->addRopeTables(
         commandGraph,
         impl_->decodeArena->packed(DecodeTensor::Positions, width), ropeRows,
-        impl_->decodeArena->packed(DecodeTensor::DraftPositions, width),
-        ropeRows, impl_->decodeArena->packed(DecodeTensor::RopeCos, width),
-        impl_->decodeArena->packed(DecodeTensor::RopeSin, width),
-        impl_->decodeArena->packed(DecodeTensor::DraftRopeCos, width),
-        impl_->decodeArena->packed(DecodeTensor::DraftRopeSin, width));
+        impl_->decodeArena->packed(DecodeTensor::RopeCos, width),
+        impl_->decodeArena->packed(DecodeTensor::RopeSin, width));
   }
-  // With the MTP head proposing, the placeholder DFlash draft must not run:
-  // its selection would overwrite the head's proposals.
   const bool mtpProposes = lanes.size() == 1 && lanes[0].request &&
                            impl_->mtpProposing(*lanes[0].request);
-  if (draftComputed && !mtpProposes) {
-    std::array<Impl::Request *, kLaneCount> requests{};
-    std::array<uint64_t, kLaneCount> logicalPositions{};
-    for (uint32_t lane = 0; lane < lanes.size(); ++lane) {
-      requests[lane] = lanes[lane].request;
-      logicalPositions[lane] = items[lane].logicalPosition;
-    }
-    impl_->encodeBatchDraftEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
-                                    DecodeTensor::DraftHidden0, width);
-    impl_->encodeDraftBatchGraph(commandGraph, {requests.data(), lanes.size()},
-                                 {logicalPositions.data(), lanes.size()},
-                                 batchStats);
-  }
   if (verified) {
     impl_->encodeBatchVerifyInput(commandGraph, width);
     impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
@@ -2044,11 +1697,6 @@ Runtime::decodeAsync(const BatchPlan &plan,
     impl_->encodeBatchAcceptance(commandGraph, {requests.data(), lanes.size()},
                                  {maximumRetained.data(), lanes.size()});
     impl_->encodeBatchGdnCommit(commandGraph, {requests.data(), lanes.size()});
-    // The placeholder DFlash draft's context is dead weight when the MTP head
-    // drafts: nothing reads it.
-    if (!mtpProposes)
-      impl_->encodeDraftStateCommitBatch(
-          commandGraph, {requests.data(), lanes.size()}, items, batchStats);
   }
 
   const bool overlapConstraintMask =
@@ -2094,9 +1742,8 @@ std::shared_ptr<const CompositeState> Runtime::snapshot(uint64_t requestId) {
   if (!entry.resident)
     throw std::logic_error("request is not resident");
   const QwenSlotMetadata &metadata = impl_->states.metadata(entry.slot);
-  if (!metadata.lengths.hasCompleteDraftWindow(kDraftCacheStride) ||
-      metadata.lengths.targetTokens % kv::kPageTokens) {
-    throw std::logic_error("cannot snapshot uncommitted draft state");
+  if (metadata.lengths.targetTokens % kv::kPageTokens) {
+    throw std::logic_error("cannot snapshot uncommitted state");
   }
   return impl_->states.snapshot(entry.slot);
 }
@@ -2105,11 +1752,8 @@ uint64_t Runtime::reclaimIdleState() noexcept {
   // One idle buffer per call, so a denied allocation frees only what it
   // needs; rebuildable caches go once the pool is empty.
   const uint32_t cells = impl_->states.idleCells();
-  const uint32_t rings = impl_->states.idleRings();
   if (cells)
-    return impl_->states.releaseIdle(cells - 1, rings);
-  if (rings)
-    return impl_->states.releaseIdle(0, rings - 1);
+    return impl_->states.releaseIdle(cells - 1);
   return 0;
 }
 
@@ -2161,7 +1805,7 @@ void Runtime::dumpPrefillLogits(uint32_t rows, const char *path) {
   for (uint32_t begin = 0; begin < rows; begin += kDecodeRows) {
     const uint32_t count = std::min(kDecodeRows, rows - begin);
     CommandGraph graph;
-    ops::DraftAttention::gatherLastRows(
+    ops::Rows::gatherLast(
         graph, impl.prefillU16(PrefillTensor::Hidden0, begin, count, width),
         d(DecodeTensor::Hidden0), count, width);
     impl.targetModel.addHead(graph, d(DecodeTensor::Hidden0),
@@ -2272,7 +1916,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
   }
   auto result = warmupResult(impl_->estimatedWarmupPeak(), wallSeconds,
                             "real " + std::to_string(rows) +
-                                "-row packed Q8 target+draft prefill [M32]");
+                                "-row packed Q8 target prefill [M32]");
   result.lanes = std::move(lanes);
   return result;
 }
@@ -2327,8 +1971,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
                            lengths.targetTokens > 1 &&
                            lengths.targetTokens ==
                                1 + decoded[lane].outputTokens.size() -
-                                   decoded[lane].outputTokensWithoutKv &&
-                           lengths.hasCompleteDraftWindow(kDraftCacheStride);
+                                   decoded[lane].outputTokensWithoutKv;
     }
     const bool fusedWidth =
         width == 1 ||
@@ -2372,7 +2015,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
 }
 
 WarmupStepResult Runtime::warmupDraftVerifyCommit() {
-  // Verify that a further commit preserves equal target and draft lengths.
+  // Verify that a real verify step commits exactly the kept tokens.
   constexpr uint64_t id = std::numeric_limits<uint64_t>::max() - 120;
   double wallSeconds = 0.0;
   std::vector<uint32_t> warmupPrompt{1};
@@ -2399,11 +2042,10 @@ WarmupStepResult Runtime::warmupDraftVerifyCommit() {
         decode(decodePlan, std::span<const ModelBatchItem>(&decodeItem, 1));
     const auto &lengths = impl_->states.metadata(0).lengths;
     if (result.size() != 1 || result[0].outputTokens.empty() ||
-        !lengths.hasCompleteDraftWindow(kDraftCacheStride) ||
         lengths.targetTokens <= 1 ||
         lengths.targetTokens != 1 + result[0].outputTokens.size() -
                                     result[0].outputTokensWithoutKv) {
-      throw std::runtime_error("draft/target commit length mismatch");
+      throw std::runtime_error("verify commit length mismatch");
     }
     wallSeconds = impl_->counters.lastDecodeWallSeconds;
     end(id);
@@ -2412,7 +2054,7 @@ WarmupStepResult Runtime::warmupDraftVerifyCommit() {
     throw;
   }
   return warmupResult(impl_->estimatedWarmupPeak(), wallSeconds,
-                      "real draft verify acceptance and exact commit");
+                      "real verify acceptance and exact commit");
 }
 
 WarmupStepResult Runtime::warmupCompositeStateRestore() {
@@ -2454,12 +2096,9 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     estimatedPeakBytes = impl_->estimatedWarmupPeak();
     end(id);
     beginColdRequest(request, 1);
-    restore(id, prefixTokens, cachedState, true);
-    setDraftContextPlan(
-        id, planDraftContext(prefixTokens, promptTokens, prefixTokens, {}));
+    restore(id, prefixTokens, cachedState);
     const auto &restored = impl_->states.metadata(1).lengths;
-    if (restored.targetTokens != prefixTokens ||
-        !restored.hasCompleteDraftWindow(kDraftCacheStride)) {
+    if (restored.targetTokens != prefixTokens) {
       throw std::runtime_error("prefix restore length mismatch");
     }
 
@@ -2490,7 +2129,6 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     wallSeconds += historicalDecodeWallSeconds;
     const auto &continued = impl_->states.metadata(1).lengths;
     if (decoded.size() != 1 || decoded[0].outputTokens.empty() ||
-        !continued.hasCompleteDraftWindow(kDraftCacheStride) ||
         continued.targetTokens <= promptTokens ||
         continued.targetTokens !=
             promptTokens + decoded[0].outputTokens.size() -

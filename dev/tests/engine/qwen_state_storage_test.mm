@@ -16,8 +16,7 @@ using namespace splash::engine;
 namespace {
 
 constexpr model::GdnStateLayout kTargetState{48, 3, 10'240, 48, 128, 128};
-constexpr model::DraftStateLayout kDraftState{5, 8, 2'048, 128};
-constexpr model::CompositeStateLayout kStateLayout{kTargetState, kDraftState};
+constexpr model::CompositeStateLayout kStateLayout{kTargetState};
 
 void require(bool condition, const char *message) {
   if (!condition)
@@ -52,17 +51,15 @@ void testLayoutFormulas() {
           "GDN recurrent layer formula is wrong");
   require(kTargetState.recurrentBytes() == 150'994'944,
           "GDN recurrent parity formula is wrong");
-  require(kDraftState.tensorBytes() == 4'194'304,
-          "draft tensor formula is wrong");
-  require(kDraftState.ringBytes() == 41'943'040,
-          "draft state formula is wrong");
-  require(kStateLayout.activeCellBytes() == 350'224'384,
+  require(kTargetState.cellBytes() == 154'140'672,
+          "GDN cell formula is wrong");
+  require(kStateLayout.activeCellBytes() == 308'281'344,
           "per-slot byte formula is wrong");
   require(uint64_t{model::ExecutionLimits::maximumBatchWidth} *
                   kStateLayout.activeCellBytes() ==
-              1'400'897'536,
+              1'233'125'376,
           "four-slot byte formula is wrong");
-  require(kStateLayout.cachedBytes() == 196'083'712,
+  require(kStateLayout.cachedBytes() == 154'140'672,
           "prefix byte formula is wrong");
 }
 
@@ -130,8 +127,7 @@ void run(const std::string &metallib) {
     const auto &slot1 = storage.buffers(1);
     void *stableGdnBase = slot0.gdn[0].stateBase.contents();
     void *stableConvBase = slot0.gdn[0].convolutionBase.contents();
-    void *stableDraftBase = slot0.draft[0].keys.contents();
-    require(stableGdnBase && stableConvBase && stableDraftBase,
+    require(stableGdnBase && stableConvBase,
             "stable slot buffers are not CPU-visible");
     require(stableGdnBase != slot1.gdn[0].stateBase.contents(),
             "two slots alias one GDN allocation");
@@ -140,9 +136,7 @@ void run(const std::string &metallib) {
                     kTargetState.convolutionLayerBytes(),
             "GDN layer view offset is wrong");
     require(slot0.gdn[0].stateBase.sizeBytes() ==
-                    kTargetState.cellBytes() &&
-                slot0.draft.size() == kDraftState.layers &&
-                slot0.draft[0].keys.sizeBytes() == kDraftState.tensorBytes(),
+                    kTargetState.cellBytes(),
             "split state-buffer sizes are wrong");
 
     require(storage.metadata(0).assigned &&
@@ -157,17 +151,11 @@ void run(const std::string &metallib) {
     word(slot0.gdn[0].convolutionBase) = 0x10101010;
     word(slot0.gdn[1].convolutionBase) = 0x21212121;
     word(slot0.gdn[1].recurrentBase) = 0x31313131;
-    word(slot0.draft[0].keys) = 0x41414141;
-    word(slot0.draft[4].values,
-         kDraftState.tensorBytes() - sizeof(uint32_t)) = 0x51515151;
-    QwenLogicalLengths lengths{2'048, 0, 2'048, 0};
+    QwenLogicalLengths lengths{2'048};
     storage.updateLengths(0, lengths);
-    require(storage.metadata(0).lengths.draftCommitCursor == 0,
-            "draft ring cursor is wrong");
-    require(storage.metadata(0).lengths.draftLength == 2'048,
-            "draft resident length is wrong");
-    require(word(slot0.gdn[1].convolutionBase) == 0x21212121 &&
-                word(slot0.draft[0].keys) == 0x41414141,
+    require(storage.metadata(0).lengths.targetTokens == 2'048,
+            "logical length is wrong");
+    require(word(slot0.gdn[1].convolutionBase) == 0x21212121,
             "length update copied or cleared hot state");
     storage.swapParity(0);
     require(storage.metadata(0).activeParity == 1,
@@ -176,8 +164,8 @@ void run(const std::string &metallib) {
                 word(slot0.gdn[1].convolutionBase) == 0x21212121,
             "parity swap copied hot state");
 
-    // Publication copies the lane's active-parity GDN cell and its draft
-    // ring into a cache slot the governor admits. The lane keeps its own
+    // Publication copies the lane's active-parity GDN cell into a cache slot
+    // the governor admits. The lane keeps its own
     // cells: no address changes, no aliasing, no parity handoff.
     const uint64_t beforePrefix = backend.memoryStats().allocatedBytes;
     const uint64_t storageBeforePrefix = storage.actualAllocatedBytes();
@@ -192,82 +180,55 @@ void run(const std::string &metallib) {
                     storageBeforePrefix + observedPrefixActual,
             "cache slot allocation is below declared bytes or unaccounted");
     require(slot0.gdn[1].stateBase.contents() == laneActiveGdnBase &&
-                slot0.gdn[0].stateBase.contents() == stableGdnBase &&
-                slot0.draft[0].keys.contents() == stableDraftBase,
+                slot0.gdn[0].stateBase.contents() == stableGdnBase,
             "snapshot moved or aliased the lane's own cells");
     require(storage.metadata(0).activeParity == 1 &&
                 storage.metadata(0).lengths == lengths,
             "snapshot changed the lane's metadata");
 
     // The cached copy is independent of the lane: writes to the lane's
-    // active cell or draft ring after publication never reach a restore.
+    // active cell after publication never reach a restore.
     word(slot0.gdn[1].convolutionBase) = 0xa1a1a1a1;
     word(slot0.gdn[1].recurrentBase) = 0xa2a2a2a2;
-    word(slot0.draft[0].keys) = 0xa3a3a3a3;
     word(slot1.gdn[0].convolutionBase) = 0xb0b0b0b0;
     word(slot1.gdn[1].convolutionBase) = 0xb1b1b1b1;
-    word(slot1.draft[0].keys) = 0xb2b2b2b2;
     void *destinationGdnBase = slot1.gdn[0].stateBase.contents();
-    void *destinationDraftBase = slot1.draft[0].keys.contents();
-    storage.restore(1, *prefix, true);
+    storage.restore(1, *prefix);
 
     require(storage.metadata(1).requestId == 202 &&
                 storage.metadata(1).activeParity == 0 &&
                 storage.metadata(1).lengths == lengths,
             "restore lost owner, changed parity, or lengths");
-    require(slot1.gdn[0].stateBase.contents() == destinationGdnBase &&
-                slot1.draft[0].keys.contents() == destinationDraftBase,
+    require(slot1.gdn[0].stateBase.contents() == destinationGdnBase,
             "restore replaced the destination's buffers");
     require(word(slot1.gdn[0].convolutionBase) == 0x21212121 &&
                 word(slot1.gdn[0].recurrentBase) == 0x31313131,
             "restore did not deliver the pre-mutation GDN snapshot");
     require(word(slot1.gdn[1].convolutionBase) == 0xb1b1b1b1,
             "restore overwrote inactive parity");
-    require(
-        word(slot1.draft[0].keys) == 0x41414141 &&
-            word(slot1.draft[4].values, kDraftState.tensorBytes() -
-                                            sizeof(uint32_t)) == 0x51515151,
-        "restore did not deliver the pre-mutation draft ring snapshot");
     require(word(slot0.gdn[1].convolutionBase) == 0xa1a1a1a1 &&
-                word(slot0.gdn[1].recurrentBase) == 0xa2a2a2a2 &&
-                word(slot0.draft[0].keys) == 0xa3a3a3a3,
+                word(slot0.gdn[1].recurrentBase) == 0xa2a2a2a2,
             "restore wrote back into the source lane");
 
-    // A suffix that will rebuild a full 2048-token window restores only GDN.
-    // A cached draft ring must not consume a 40 MiB copy merely to be
-    // overwritten by the next prefill commands.
+    // Later restores into lane 1 land in its other parity.
     storage.swapParity(1);
-    word(slot1.draft[0].keys) = 0xd2d2d2d2;
-    storage.restore(1, *prefix, false);
-    require(word(slot1.gdn[storage.metadata(1).activeParity].convolutionBase) ==
-                0x21212121,
-            "GDN-only restore did not restore convolution state");
-    require(word(slot1.draft[0].keys) == 0xd2d2d2d2,
-            "GDN-only restore copied an obsolete draft ring");
-    require(storage.metadata(1).lengths.targetTokens == 2048 &&
-                storage.metadata(1).lengths.draftLength == 0 &&
-                storage.metadata(1).lengths.draftBase == 2048,
-            "GDN-only restore exposed stale draft metadata");
     // Cancellation releases ownership and returns the lane's buffers to the
     // pool. Reactivation takes them back in the same order and initializes
     // every state that can be read at logical length zero.
     void *reusableGdnBase = slot0.gdn[0].stateBase.contents();
-    void *reusableDraftBase = slot0.draft[0].keys.contents();
     word(slot0.gdn[0].convolutionBase) = 0xc1c1c1c1;
     word(slot0.gdn[0].recurrentBase) = 0xc2c2c2c2;
     storage.releaseSlot(0, 101);
     require(!storage.metadata(0).assigned && storage.metadata(0).requestId == 0,
             "cancellation did not release metadata");
-    require(storage.idleCells() == 2 && storage.idleRings() == 1 &&
-                storage.actualSlotBytes(0) == 0,
+    require(storage.idleCells() == 2 && storage.actualSlotBytes(0) == 0,
             "released lane buffers did not return to the pool");
     requireThrows<std::logic_error>([&] { storage.swapParity(0); },
                                     "unassigned slot accepted a parity update");
     require(static_cast<bool>(storage.tryActivateSlot(0, 303)), "state cell reuse failed");
-    require(storage.idleCells() == 0 && storage.idleRings() == 0,
+    require(storage.idleCells() == 0,
             "reactivation left pooled buffers behind");
-    require(slot0.gdn[0].stateBase.contents() == reusableGdnBase &&
-                slot0.draft[0].keys.contents() == reusableDraftBase,
+    require(slot0.gdn[0].stateBase.contents() == reusableGdnBase,
             "slot reuse changed stable buffer addresses");
     require(storage.metadata(0).requestId == 303 &&
                 storage.metadata(0).activeParity == 0 &&
@@ -279,13 +240,9 @@ void run(const std::string &metallib) {
 
     // Rejected publications fail before any cache slot is taken or admitted.
     const uint64_t beforeRejected = storage.actualAllocatedBytes();
-    storage.updateLengths(0, {128, 0, 127, 127});
-    requireThrows<std::invalid_argument>(
-        [&] { static_cast<void>(storage.snapshot(0)); },
-        "snapshot accepted divergent target/draft lengths");
     requireThrows<std::invalid_argument>(
         [&] {
-          storage.updateLengths(0, {129, 0, 129, 129});
+          storage.updateLengths(0, {129});
           static_cast<void>(storage.snapshot(0));
         },
         "unaligned prefix snapshot was accepted");
@@ -297,11 +254,11 @@ void run(const std::string &metallib) {
     const uint64_t beforeSuspend = storage.actualAllocatedBytes();
     const uint64_t releasedSlotBytes = storage.actualSlotBytes(0);
     storage.releaseSlot(0, 303);
-    require(storage.releaseIdle(0, 0) == releasedSlotBytes,
+    require(storage.releaseIdle(0) == releasedSlotBytes,
             "recomputation preemption retained active backing");
     require(!storage.metadata(0).assigned && storage.actualSlotBytes(0) == 0 &&
                 storage.actualAllocatedBytes() == beforeSuspend - releasedSlotBytes,
-            "preempted GDN or draft bytes remain outside the cache");
+            "preempted GDN bytes remain outside the cache");
     require(storage.tryActivateSlot(0, 303) &&
                 storage.metadata(0).assigned &&
                 storage.metadata(0).lengths == QwenLogicalLengths{} &&
@@ -322,7 +279,6 @@ void run(const std::string &metallib) {
     storage.updateLengths(0, lengths);
     word(slot0.gdn[0].convolutionBase) = 0xe1e1e1e1;
     word(slot0.gdn[0].recurrentBase) = 0xe2e2e2e2;
-    word(slot0.draft[0].keys) = 0xe3e3e3e3;
     admitNewAllocations = false;
     std::shared_ptr<const QwenCompositeState> pooled = storage.snapshot(0);
     require(pooled != nullptr, "snapshot did not reuse the pooled cache slot");
@@ -335,19 +291,18 @@ void run(const std::string &metallib) {
     require(storage.actualAllocatedBytes() == beforeDrop,
             "denied snapshot leaked cache slot bytes");
     admitNewAllocations = true;
-    storage.restore(1, *pooled, true);
+    storage.restore(1, *pooled);
     require(storage.metadata(1).activeParity == 1 &&
                 storage.metadata(1).lengths == lengths &&
                 word(slot1.gdn[1].convolutionBase) == 0xe1e1e1e1 &&
-                word(slot1.gdn[1].recurrentBase) == 0xe2e2e2e2 &&
-                word(slot1.draft[0].keys) == 0xe3e3e3e3,
+                word(slot1.gdn[1].recurrentBase) == 0xe2e2e2e2,
             "reused cache slot served stale contents");
     require(word(slot1.gdn[0].convolutionBase) == 0x21212121,
             "restore from the reused slot overwrote inactive parity");
     pooled.reset();
     require(storage.actualAllocatedBytes() == beforeDrop,
             "second dropped cached state was freed instead of pooled");
-    require(storage.releaseIdle(0, 0) == observedPrefixActual &&
+    require(storage.releaseIdle(0) == observedPrefixActual &&
                 storage.actualAllocatedBytes() ==
                     beforeDrop - observedPrefixActual,
             "releaseIdle did not free the pooled cache slot");
@@ -365,20 +320,19 @@ void run(const std::string &metallib) {
             "retained snapshot accounting is wrong");
     storage.releaseSlot(0, 303);
     storage.releaseSlot(1, 202);
-    require(storage.idleCells() == 4 && storage.idleRings() == 2,
+    require(storage.idleCells() == 4,
             "released lane buffers are missing from the pool");
     retained.reset();
-    require(storage.idleCells() == 5 && storage.idleRings() == 3,
+    require(storage.idleCells() == 5,
             "dropped cached state did not return its buffers to the pool");
-    // Releasing down to one lane's worth keeps two cells and one ring warm.
-    require(storage.releaseIdle(2, 1) ==
+    // Releasing down to one lane's worth keeps two cells warm.
+    require(storage.releaseIdle(2) ==
                 observedSlotActual + observedPrefixActual &&
-                storage.idleCells() == 2 && storage.idleRings() == 1,
+                storage.idleCells() == 2,
             "partial idle release did not keep the requested buffers");
-    require(storage.releaseIdle(0, 0) == observedSlotActual,
+    require(storage.releaseIdle(0) == observedSlotActual,
             "idle lane buffers were not reclaimed");
-    require(storage.idleCells() == 0 && storage.idleRings() == 0,
-            "reclaimed buffers remain pooled");
+    require(storage.idleCells() == 0, "reclaimed buffers remain pooled");
     require(storage.actualAllocatedBytes() == 0,
             "reclaimed state cells remain accounted");
   }

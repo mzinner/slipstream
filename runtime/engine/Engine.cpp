@@ -28,12 +28,9 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
   if (!std::isfinite(config_.resourceWaitTimeoutMilliseconds) ||
       config_.resourceWaitTimeoutMilliseconds <= 0.0)
     throw std::invalid_argument("resource wait timeout must be positive and finite");
-  if (config_.prefillCheckpointTokens &&
-      (config_.prefillCheckpointTokens <
-           model::ExecutionLimits::draftContextTokens ||
-       config_.prefillCheckpointTokens % KvCache::pageTokens)) {
+  if (config_.prefillCheckpointTokens % KvCache::pageTokens) {
     throw std::invalid_argument(
-        "prefill checkpoint interval must span a draft window and whole KV pages");
+        "prefill checkpoint interval must be whole KV pages");
   }
 }
 
@@ -372,12 +369,10 @@ bool Engine::admit(Request &active, double now) {
     if (resuming)
       scheduler_.resumeFromResources(active.request.id, resumeBoundary,
                                      active.replayTokens);
-    DraftContextPlan draft = configureDraftStatePlan(
-        active, resumeBoundary, lookup.junctionBoundary());
+    configureStateBoundaries(active, resumeBoundary, lookup.junctionBoundary());
     active.latestCheckpoint = {};
     if (lookup.state) {
-      model_.restore(active.request.id, resumeBoundary, lookup.state->state(),
-                     !draft.draftStateRestoreSkipped);
+      model_.restore(active.request.id, resumeBoundary, lookup.state->state());
       active.latestCheckpoint = cache_.checkpointState(lookup.state->kvBlock());
       // A restored endpoint already has the ordinary replay state we need.
       // Other restored progress points retain their rolling lifetime.
@@ -389,7 +384,6 @@ bool Engine::admit(Request &active, double now) {
         active.latestCheckpoint = {};
       }
     }
-    model_.setDraftContextPlan(active.request.id, std::move(draft));
     if (resuming) {
       active.suspended = false;
       active.replaying = true;
@@ -451,9 +445,8 @@ void Engine::signalResourceProgress() noexcept {
     ++resourceEpoch_;
 }
 
-DraftContextPlan Engine::configureDraftStatePlan(Request &active,
-                                                 uint32_t stateBoundary,
-                                                 uint32_t junctionBoundary) {
+void Engine::configureStateBoundaries(Request &active, uint32_t stateBoundary,
+                                      uint32_t junctionBoundary) {
   if (!active.stateBoundaries.empty() || active.stateBoundaryCursor != 0) {
     throw std::logic_error("request already has a composite-state plan");
   }
@@ -472,8 +465,8 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
     active.stateBoundaries.push_back({tokens, purpose});
   };
 
-  // Plan draft windows before prefill; arbitrary chunk ends do not carry a
-  // complete draft state. Progress points remain disposable after restoration.
+  // Plan state boundaries before prefill. Progress points remain disposable
+  // after restoration.
   const uint32_t latestReplayBoundary = replayStateBoundary(active.replayTokens);
   if (const uint32_t interval = config_.prefillCheckpointTokens) {
     for (uint64_t boundary = (uint64_t{stateBoundary} / interval + 1) * interval;
@@ -491,16 +484,7 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
             });
 
   try {
-    std::vector<uint32_t> materializationBoundaries;
-    materializationBoundaries.reserve(active.stateBoundaries.size());
-    for (const auto &boundary : active.stateBoundaries)
-      materializationBoundaries.push_back(boundary.tokens);
-    DraftContextPlan draft = planDraftContext(
-        stateBoundary, active.replayTokens,
-        stateBoundary ? std::optional<uint32_t>(stateBoundary) : std::nullopt,
-        materializationBoundaries);
     armNextStateBoundary(active);
-    return draft;
   } catch (...) {
     discardPendingStateBoundaries(active);
     throw;

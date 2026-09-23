@@ -87,7 +87,6 @@ def check() -> list[str]:
         "runtime/engine/RuntimeResources.mm",
     }
     concrete_model_headers = (
-        "model/DFlashDraft.hpp",
         "model/ModelFactory.hpp",
         "model/Qwen4Exp.hpp",
         "model/Qwen4ExpTarget.hpp",

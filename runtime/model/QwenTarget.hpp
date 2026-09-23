@@ -133,8 +133,6 @@ loadQwenTargetWeights(metal::MetalBackend &backend,
 // targets. It describes semantics only; operators remain responsible for
 // choosing device-specific Metal pipelines and compute tiles.
 struct QwenTargetGeometry final {
-  static constexpr uint32_t maximumCaptureLayers = 8;
-
   uint32_t maximumContextTokens = 0;
   uint32_t layers = 0;
   uint32_t hiddenSize = 0;
@@ -156,8 +154,6 @@ struct QwenTargetGeometry final {
   QwenFfnKind ffnKind = QwenFfnKind::Dense;
   uint32_t maskToken = 0;
   std::array<uint32_t, 2> stopTokens{};
-  std::array<uint32_t, maximumCaptureLayers> captureLayerValues{};
-  uint32_t captureLayerCount = 0;
   kv::Q8Layout kvLayout{};
   GdnStateLayout stateLayout{};
   uint32_t hyperConnectionCount = 1;
@@ -182,16 +178,9 @@ struct QwenTargetGeometry final {
   [[nodiscard]] constexpr uint32_t gdnKeyWidth() const noexcept {
     return gdnKeyHeads * gdnHeadDimension;
   }
-  [[nodiscard]] constexpr uint32_t capturedHiddenSize() const noexcept {
-    return hiddenSize * captureLayerCount;
-  }
   [[nodiscard]] constexpr uint32_t ffnScratchWidth() const noexcept {
     return ffnKind == QwenFfnKind::Dense ? denseIntermediateSize
                                          : moe.expertIntermediateSize;
-  }
-  [[nodiscard]] constexpr std::span<const uint32_t>
-  captureLayers() const noexcept {
-    return {captureLayerValues.data(), captureLayerCount};
   }
   [[nodiscard]] constexpr ops::GdnShape gdnShape() const noexcept {
     return {gdnKeyHeads, gdnValueHeads, gdnHeadDimension,
@@ -203,7 +192,6 @@ struct QwenTargetGeometry final {
            gdnKeyHeads && gdnValueHeads && gdnHeadDimension &&
            attentionWidth && attentionQueryHeads && attentionKvHeads &&
            attentionHeadDimension && rotaryPairs && rotaryTheta > 0.0F &&
-           captureLayerCount && captureLayerCount <= maximumCaptureLayers &&
            kvLayout.valid() && stateLayout.valid() &&
            stateLayout.layers + kvLayout.attentionLayers - extraKvLayers ==
                layers &&
@@ -214,12 +202,6 @@ struct QwenTargetGeometry final {
            ((ffnKind == QwenFfnKind::Dense && denseIntermediateSize) ||
             (ffnKind == QwenFfnKind::SparseMoe && moe.valid()));
   }
-};
-
-struct QwenTargetPrefillCapture final {
-  uint32_t sourceStart = 0;
-  uint32_t destinationStart = 0;
-  uint32_t rows = 0;
 };
 
 // Scratch for qwen4exp's per-layer embedding, and the token ids it hashes.
@@ -246,8 +228,6 @@ struct QwenTargetPrefillSequence final {
   std::span<const metal::MetalBuffer> convolutionOut;
   std::span<const metal::MetalBuffer> recurrentIn;
   std::span<const metal::MetalBuffer> recurrentOut;
-  std::array<QwenTargetPrefillCapture, 2> captures{};
-  uint32_t captureCount = 0;
   // The GDN cell's auxiliary region, current and next parity.
   metal::MetalBuffer auxiliaryIn;
   metal::MetalBuffer auxiliaryOut;
@@ -256,7 +236,6 @@ struct QwenTargetPrefillSequence final {
 struct QwenTargetPrefillBuffers final {
   std::array<metal::MetalBuffer, 2> hidden;
   metal::MetalBuffer normalized;
-  metal::MetalBuffer captured;
   metal::MetalBuffer gdnPacked;
   metal::MetalBuffer gdnQueries;
   metal::MetalBuffer gdnKeys;
@@ -355,7 +334,6 @@ struct QwenTargetVerifyBuffers final {
   metal::MetalBuffer ropeSin;
   metal::MetalBuffer arrived;
   metal::MetalBuffer generation;
-  metal::MetalBuffer capturedTargetHidden;
   metal::MetalBuffer finalHidden;
   metal::MetalBuffer logits;
   metal::MetalBuffer denseGateScratch;
@@ -414,10 +392,6 @@ public:
   [[nodiscard]] const QwenTargetGeometry &geometry() const noexcept {
     return geometry_;
   }
-  // Null when the head is 8-bit (qwen4exp), whose package drafts with its
-  // own MTP head and never runs the DFlash draft that borrows this.
-  [[nodiscard]] const ops::Q4Projection *
-  vocabularyProjection() const noexcept;
 
   void addPrefill(
       metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
@@ -434,8 +408,6 @@ public:
                uint32_t normalizedRows) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
-  void addDraftEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
-                         metal::MetalBuffer hidden, uint32_t rows) const;
   void addStateCommit(metal::CommandGraph &graph,
                       QwenTargetCommitBuffers buffers, uint32_t lanes) const;
 

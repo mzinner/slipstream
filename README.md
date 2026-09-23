@@ -48,6 +48,10 @@ REPO=~/Documents/shared-with-google-drive/model-serving/slipstream \
 Build: `make` (engine), `make build/engine-tests/generate-sample` (test tool).
 Tests: `make check-native-cpu check-native-metal test-python`.
 
+**Memory:** at macOS's default GPU limit Slipstream starts with up to ~57K tokens
+of context (`CTX=57344`); the full 131K context needs the 58 GiB limit the launcher
+sets (`sudo`, once per boot).
+
 **Safety rule:** run every engine experiment through `dev/benchmarks/guarded.py -- <cmd>`.
 Two engines at once pin more memory than the Mac has and freeze it until its
 watchdog restarts it (this happened twice on 2026-09-22).

@@ -4,7 +4,6 @@
 #include "metal/abi/MoE.h"
 #include "metal/abi/PerLayerEmbedding.h"
 #include "model/WeightStore.hpp"
-#include "ops/DraftAttention.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/GDN.hpp"
 #include "ops/MoE.hpp"
@@ -848,24 +847,6 @@ void Qwen4ExpTarget::addPrefill(
           hcParams, {64, 1, 1}, {256, 1, 1});
   };
 
-  auto encodeCapture = [&](metal::CommandGraph &g, uint32_t layerIndex) {
-    const auto captureLayers = geometry.captureLayers();
-    const auto captured =
-        std::find(captureLayers.begin(), captureLayers.end(), layerIndex);
-    if (captured != captureLayers.end()) {
-      const uint32_t slot =
-          static_cast<uint32_t>(captured - captureLayers.begin());
-      for (const QwenTargetPrefillSequence &sequence : sequences) {
-        for (uint32_t index = 0; index < sequence.captureCount; ++index) {
-          const QwenTargetPrefillCapture &capture = sequence.captures[index];
-          ops::DraftAttention::captureTargetHidden(
-              g, buffers.gdnOutput, buffers.captured, capture.rows, slot,
-              capture.sourceStart, capture.destinationStart,
-              geometry.hiddenSize, geometry.capturedHiddenSize());
-        }
-      }
-    }
-  };
 
   const uint32_t R = std::min(weights.residentLayers, geometry.layers);
   const bool useStreamingCache = (R < geometry.layers && weights.streamingCacheGate);
@@ -885,7 +866,6 @@ void Qwen4ExpTarget::addPrefill(
            buffers.expertOutput},
           weights.layers[layerIndex].ffn, moePlan, /*addResidual=*/false);
       encodeMlpUpdate(graph, layerIndex);
-      encodeCapture(graph, layerIndex);
     }
     if (gdnIndex != geometry.stateLayout.layers ||
         attentionIndex + geometry.extraKvLayers != kvLayers.size()) {
@@ -1099,7 +1079,6 @@ void Qwen4ExpTarget::addPrefill(
          buffers.expertOutput},
         weights.layers[layerIndex].ffn, moePlan, /*addResidual=*/false);
     encodeMlpUpdate(residentGraph, layerIndex);
-    encodeCapture(residentGraph, layerIndex);
   }
 
   // Layer R base up to router
@@ -1419,7 +1398,6 @@ void Qwen4ExpTarget::addPrefill(
     metal::CommandGraph stepGraph;
     encodeLayerExperts(stepGraph, L);
     encodeMlpUpdate(stepGraph, L);
-    encodeCapture(stepGraph, L);
 
     // Layer L + 1 base up to router
     encodeAttentionHC(stepGraph, L + 1, /*priorWorkComplete=*/true);
@@ -1440,10 +1418,9 @@ void Qwen4ExpTarget::addPrefill(
     throw std::logic_error("Qwen target layer partition mismatch");
   }
 
-  // Encode final layer's MoE, MLP update, and capture into caller's graph
+  // Encode final layer's MoE and MLP update into the caller's graph
   encodeLayerExperts(graph, lastL);
   encodeMlpUpdate(graph, lastL);
-  encodeCapture(graph, lastL);
 
   // MTP head: fill its attention cache for this chunk's positions. Row r
   // pairs the trunk's final residual at r with the prompt token at r + 1, so
@@ -1816,17 +1793,6 @@ void Qwen4ExpTarget::addVerify(
           hcParams, {64, 1, 1}, {256, 1, 1});
   };
 
-  auto encodeCapture = [&](metal::CommandGraph &g, uint32_t layerIndex) {
-    const auto captureLayers = geometry.captureLayers();
-    const auto captured =
-        std::find(captureLayers.begin(), captureLayers.end(), layerIndex);
-    if (captured != captureLayers.end()) {
-      ops::DraftAttention::captureTargetHidden(
-          g, buffers.gdnOutput, buffers.capturedTargetHidden, rows,
-          static_cast<uint32_t>(captured - captureLayers.begin()), 0, 0,
-          geometry.hiddenSize, geometry.capturedHiddenSize());
-    }
-  };
 
   auto encodeHead = [&](metal::CommandGraph &g) {
     addHyperConnection(g, geometry, buffers.hidden[geometry.layers & 1],
@@ -1857,7 +1823,6 @@ void Qwen4ExpTarget::addVerify(
            buffers.expertOutput},
           weights.layers[layerIndex].ffn, moePlan, /*addResidual=*/false);
       encodeMlpUpdate(graph, layerIndex);
-      encodeCapture(graph, layerIndex);
     }
     if (gdnIndex != geometry.stateLayout.layers ||
         attentionIndex + geometry.extraKvLayers != kvLayers.size()) {
@@ -2694,7 +2659,6 @@ void Qwen4ExpTarget::addVerify(
          buffers.expertOutput},
         weights.layers[layerIndex].ffn, moePlan, /*addResidual=*/false);
     encodeMlpUpdate(residentGraph, layerIndex);
-    encodeCapture(residentGraph, layerIndex);
   }
 
   // Layer R base up to router
@@ -2783,7 +2747,6 @@ void Qwen4ExpTarget::addVerify(
         encodeMoEExecute(stepGraph, makeCacheWeights(L), /*hostGrouped=*/true);
       }
       encodeMlpUpdate(stepGraph, L);
-      encodeCapture(stepGraph, L);
       encodeAttentionHC(stepGraph, L + 1, /*priorWorkComplete=*/true);
       metal::MetalBuffer mixerOutNext = encodeMixer(stepGraph, L + 1, gdnIndex, attentionIndex);
       encodeMixerUpdate(stepGraph, L + 1, mixerOutNext);
@@ -2881,7 +2844,6 @@ void Qwen4ExpTarget::addVerify(
       metal::CommandGraph stepGraph;
       encodeMoEExecute(stepGraph, cacheW);
       encodeMlpUpdate(stepGraph, L);
-      encodeCapture(stepGraph, L);
 
       // Layer L + 1 base up to router
       encodeAttentionHC(stepGraph, L + 1, /*priorWorkComplete=*/true);
@@ -2916,10 +2878,9 @@ void Qwen4ExpTarget::addVerify(
     throw std::logic_error("Qwen target layer partition mismatch");
   }
 
-  // Encode final layer's MoE, MLP update, capture, and head into the caller's graph
+  // Encode final layer's MoE, MLP update and head into the caller's graph
   encodeMoEExecute(graph, cacheWLast, /*hostGrouped=*/pipelined);
   encodeMlpUpdate(graph, lastL);
-  encodeCapture(graph, lastL);
   encodeHead(graph);
 
   if (traceFile && lanes == 1) {

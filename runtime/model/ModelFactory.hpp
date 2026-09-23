@@ -1,6 +1,5 @@
 #pragma once
 
-#include "DFlashDraft.hpp"
 #include "ModelDescriptor.hpp"
 #include "Qwen4Exp.hpp"
 #include "ops/Q8PageStorage.hpp"
@@ -18,7 +17,6 @@ using TargetWeights = std::variant<Qwen4ExpWeights>;
 struct ModelPackage final {
   ModelDescriptor descriptor;
   TargetWeights target;
-  DFlashDraftWeights draft;
   std::string manifestFingerprintSha256;
 
   [[nodiscard]] const std::string &name() const noexcept {

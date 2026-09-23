@@ -33,7 +33,7 @@ DeviceCapabilities device(uint64_t workingSet = 12 * kGiB) {
 }
 
 ModelMemoryProfile model() {
-  return test::modelMemoryProfile(2 * kGiB, 1 * kGiB);
+  return test::modelMemoryProfile(2 * kGiB);
 }
 
 void testUnifiedElasticBudget() {

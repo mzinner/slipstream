@@ -37,10 +37,6 @@ struct Qwen4ExpLayout final {
   // 0031: hyper-connection mix weights 8-bit, in the tiled matrix layout.
   static constexpr std::string_view layerMagic = "MDFN0031";
 
-  // Provisional: the draft is deferred, so these five indices are evenly
-  // spaced rather than chosen against a trained DFlash 2 draft.
-  static constexpr std::array<uint32_t, 5> hiddenCaptureLayers{3, 13, 23, 33, 43};
-
   uint32_t maximumContextTokens = kv::kMaximumLogicalTokens;
   uint32_t layers = 48;
   uint32_t hiddenSize = 2560;
@@ -142,9 +138,6 @@ struct Qwen4ExpLayout final {
     return {hiddenSize,     packedGdnWidth, packedFullWidth,
             convolutionDimension, gdnValueHeads,  gdnHeadDimension,
             attentionWidth, attentionHeadDimension};
-  }
-  [[nodiscard]] constexpr uint32_t capturedHiddenSize() const noexcept {
-    return hiddenSize * hiddenCaptureLayers.size();
   }
   // Four residual streams, so every hyper-connection tensor is this wide.
   [[nodiscard]] constexpr uint32_t hyperConnectionWidth() const noexcept {

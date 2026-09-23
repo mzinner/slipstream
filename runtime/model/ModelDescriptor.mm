@@ -161,29 +161,11 @@ void validateCommonFormat(NSDictionary *format, std::string_view targetMagic) {
   requireEqual(requireString(format, @"target_layer_magic",
                              "target_layer_magic"),
                targetMagic, "target_layer_magic");
-  requireEqual(requireString(format, @"draft_layer_magic",
-                             "draft_layer_magic"),
-               kDFlashLayerMagic, "draft_layer_magic");
-}
-
-// Provisional, like Qwen4ExpLayout::hiddenCaptureLayers: no DFlash 2 draft
-// has been trained for this target, so these are the smallest values that
-// satisfy the draft loader's alignment rules at hidden size 2560.
-DFlashDraftLayout qwen4expDraftLayout() {
-  DFlashDraftLayout layout;
-  layout.layers = 5;
-  layout.hiddenSize = 2560;
-  layout.dynamicSize = 768;
-  layout.qkvSize = 3072;
-  layout.attentionSize = 2048;
-  layout.intermediateSize = 8704;
-  layout.targetHiddenSize = Qwen4ExpLayout{}.capturedHiddenSize();
-  return layout;
 }
 
 ModelDescriptor qwen4expDescriptor(std::string name) {
   constexpr Qwen4ExpLayout target;
-  return makeModelDescriptor(std::move(name), target, qwen4expDraftLayout());
+  return makeModelDescriptor(std::move(name), target);
 }
 
 void validateTokenizer(const std::filesystem::path &root,
@@ -220,22 +202,6 @@ void validateLayerTypes(NSDictionary *target, const Layout &layout) {
     const char *actual = static_cast<NSString *>(value).UTF8String;
     requireEqual(actual ? actual : "", expected,
                  "target layer " + std::to_string(layer));
-  }
-}
-
-template <class Layout>
-void validateCaptureLayers(NSDictionary *draft) {
-  NSArray *layers =
-      requireArray(draft, @"target_capture_layers", "target capture layers");
-  requireEqual(layers.count, Layout::hiddenCaptureLayers.size(),
-               "target capture layer count");
-  for (uint32_t index = 0; index < layers.count; ++index) {
-    id value = layers[index];
-    if (![value isKindOfClass:[NSNumber class]])
-      throw std::invalid_argument("target capture layer must be an integer");
-    requireEqual(static_cast<NSNumber *>(value).unsignedLongLongValue,
-                 Layout::hiddenCaptureLayers[index],
-                 "target capture layer " + std::to_string(index));
   }
 }
 
@@ -292,38 +258,15 @@ void validateQwen4Exp(NSDictionary *manifest,
   }
   validateLayerTypes(target, targetLayout);
 
-  const DFlashDraftLayout &draftLayout = descriptor.draft;
-  NSDictionary *draft =
-      requireObject(manifest, @"draft", "draft declaration");
-  requireEqual(requireString(draft, @"architecture", "draft architecture"),
-               "DFlash2DraftModel", "draft architecture");
-  for (const GeometryField &field : std::to_array<GeometryField>(
-           {{"layers", draftLayout.layers},
-            {"hidden_size", draftLayout.hiddenSize},
-            {"intermediate_size", draftLayout.intermediateSize},
-            {"sliding_window", ExecutionLimits::draftContextTokens},
-            {"block_size", ExecutionLimits::draftQueryRows},
-            {"dynamic_conv_group_size", 16},
-            {"dynamic_conv_kernel_size", 2},
-            {"selector_rank", draftLayout.selectorRank},
-            {"selector_top_k", 16}})) {
-    requireEqual(requireUnsigned(draft,
-                                 [NSString stringWithUTF8String:field.name],
-                                 field.name),
-                 field.value, field.name);
-  }
-  validateCaptureLayers<Qwen4ExpLayout>(draft);
   validateTokenizer(root, descriptor, "qwen4_exp_text");
 }
 
 } // namespace
 
-ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
-                                    DFlashDraftLayout draft) {
+ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target) {
   ModelDescriptor result;
   result.name = std::move(name);
   result.target = target;
-  result.draft = draft;
   std::visit(
       [&](const auto &layout) {
         result.capabilities = {
@@ -337,7 +280,7 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
             ExecutionLimits::draftContextTokens,
         };
         result.targetKvLayout = layout.q8Layout();
-        result.stateLayout = {layout.gdnStateLayout(), draft.stateLayout()};
+        result.stateLayout = {layout.gdnStateLayout()};
       },
       target);
   return result;
@@ -353,8 +296,7 @@ bool ModelDescriptor::valid() const noexcept {
       capabilities.draftProposalTokens != ExecutionLimits::draftProposalTokens ||
       capabilities.targetVerifyRows != ExecutionLimits::targetVerifyRows ||
       capabilities.draftContextTokens != ExecutionLimits::draftContextTokens ||
-      !targetKvLayout.valid() || !stateLayout.valid() ||
-      stateLayout.draft != draft.stateLayout()) {
+      !targetKvLayout.valid() || !stateLayout.valid()) {
     return false;
   }
   return std::visit(
@@ -362,8 +304,6 @@ bool ModelDescriptor::valid() const noexcept {
         return layout.vocabularySize == capabilities.vocabularySize &&
                layout.maximumContextTokens ==
                    capabilities.maximumContextTokens &&
-               layout.hiddenSize == draft.hiddenSize &&
-               layout.capturedHiddenSize() == draft.targetHiddenSize &&
                layout.q8Layout() == targetKvLayout &&
                layout.gdnStateLayout() == stateLayout.target;
       },
@@ -384,10 +324,6 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
     if (format == "splash-packed-q4-qwen4exp") {
       descriptor = qwen4expDescriptor(model);
       validateQwen4Exp(manifest, root, descriptor);
-      NSDictionary *draft = requireObject(manifest, @"draft", "draft declaration");
-      if (NSNumber *placeholder = draft[@"placeholder"];
-          [placeholder isKindOfClass:NSNumber.class])
-        descriptor.draftPlaceholder = placeholder.boolValue;
     } else {
       throw std::invalid_argument("unsupported weight format: " + format);
     }

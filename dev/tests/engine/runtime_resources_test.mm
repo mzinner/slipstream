@@ -25,7 +25,7 @@ public:
     path = std::filesystem::temp_directory_path() /
            ("splash-budget-" +
             std::string([NSUUID UUID].UUIDString.UTF8String));
-    for (const char *component : {"target", "draft"}) {
+    for (const char *component : {"target"}) {
       std::filesystem::create_directories(path / component);
       const auto file = path / component / "placeholder.bin";
       std::ofstream(file).put('\0');
@@ -39,7 +39,7 @@ public:
   }
 
   static constexpr uint64_t fileBytes = 16 * 1024;
-  static constexpr uint64_t packageBytes = 2 * fileBytes;
+  static constexpr uint64_t packageBytes = fileBytes;
   std::filesystem::path path;
 };
 
@@ -48,17 +48,8 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
   RuntimeResourcesConfig config;
   config.metallibPath = metallibPath;
   config.modelRoot = root.path;
-  // The placeholder draft the qwen4exp package declares.
-  model::DFlashDraftLayout draft;
-  draft.layers = 5;
-  draft.hiddenSize = 2560;
-  draft.dynamicSize = 768;
-  draft.qkvSize = 3072;
-  draft.attentionSize = 2048;
-  draft.intermediateSize = 8704;
-  draft.targetHiddenSize = model::Qwen4ExpLayout{}.capturedHiddenSize();
-  config.model = model::makeModelDescriptor(
-      "budget-test", model::Qwen4ExpLayout{}, draft);
+  config.model =
+      model::makeModelDescriptor("budget-test", model::Qwen4ExpLayout{});
   config.buildId = "budget-test";
 
   // Each low ceiling fits two components, so every directory must be counted.

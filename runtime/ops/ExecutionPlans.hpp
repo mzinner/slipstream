@@ -1,6 +1,5 @@
 #pragma once
 
-#include "ops/DraftAttention.hpp"
 #include "ops/Linear.hpp"
 #include "ops/MoE.hpp"
 #include "ops/PagedAttention.hpp"
@@ -33,13 +32,6 @@ struct VerifyAttentionPolicy final {
   auto operator<=>(const VerifyAttentionPolicy &) const = default;
 };
 
-struct DraftAttentionWorkload final {
-  DraftAttentionShape shape;
-  uint32_t lanes = 0;
-  std::strong_ordering operator<=>(const DraftAttentionWorkload &) const noexcept;
-  bool operator==(const DraftAttentionWorkload &) const noexcept;
-};
-
 enum class MoePhase : uint8_t { Prefill, Decode };
 
 struct MoeWorkload final {
@@ -59,10 +51,6 @@ struct VerifyAttentionChoice final {
   VerifyAttentionPolicy workload;
   VerifyAttentionConfig configuration;
 };
-struct DraftAttentionChoice final {
-  DraftAttentionWorkload workload;
-  DraftAttentionConfiguration configuration;
-};
 struct MoeChoice final {
   MoeWorkload workload;
   MoeConfig configuration;
@@ -72,12 +60,11 @@ struct OperatorChoices final {
   std::vector<LinearChoice> linear;
   std::vector<PrefillAttentionChoice> prefillAttention;
   std::vector<VerifyAttentionChoice> verifyAttention;
-  std::vector<DraftAttentionChoice> draftAttention;
   std::vector<MoeChoice> moe;
 
   [[nodiscard]] bool empty() const noexcept {
     return linear.empty() && prefillAttention.empty() && verifyAttention.empty() &&
-           draftAttention.empty() && moe.empty();
+           moe.empty();
   }
 };
 
@@ -99,8 +86,6 @@ public:
   [[nodiscard]] VerifyAttentionPlan verifyAttention(
       uint32_t lanes, uint32_t queryHeads, kv::Q8Layout layout,
       std::span<const uint32_t> historyTokens) const;
-  [[nodiscard]] DraftAttentionPlan draftAttention(
-      DraftAttentionShape shape, uint32_t lanes) const;
   [[nodiscard]] MoePlan moePrefill(MoeShape shape, uint32_t rows) const;
   [[nodiscard]] MoePlan moeDecode(MoeShape shape, uint32_t lanes) const;
   // Shipped baseline first, independent of installed choices. Every candidate
@@ -114,8 +99,6 @@ public:
       uint32_t maximumRows, uint32_t queryHeads, kv::Q8Layout layout) const;
   [[nodiscard]] AttentionWorkspace verifyAttentionWorkspacePerLane(
       uint32_t queryHeads, kv::Q8Layout layout) const;
-  [[nodiscard]] DraftAttentionWorkspace draftAttentionWorkspacePerLane(
-      DraftAttentionShape shape) const;
   [[nodiscard]] MoeWorkspace moePrefillWorkspace(
       MoeShape shape, uint32_t maximumRows) const;
   [[nodiscard]] MoeWorkspace moeDecodeWorkspacePerLane(MoeShape shape) const;

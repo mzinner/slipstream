@@ -180,16 +180,11 @@ public:
     return {{}, StateFailure::ConcurrencyLimit};
   }
   void restore(uint64_t id, uint32_t length,
-               std::shared_ptr<const CompositeState> state,
-               bool restoreDraftState) override {
+               std::shared_ptr<const CompositeState> state) override {
     if (!state)
       throw std::runtime_error("empty restore state");
     requests.at(id).position = length;
     restored += length;
-    restoredDraft = restoreDraftState;
-  }
-  void setDraftContextPlan(uint64_t id, DraftContextPlan plan) override {
-    plans[id] = std::move(plan);
   }
   std::vector<ModelStepResult> prefill(const BatchPlan &,
                                        std::span<const ModelBatchItem> items) {
@@ -302,7 +297,6 @@ public:
     bool replaying = false;
   };
   std::unordered_map<uint64_t, Request> requests;
-  std::unordered_map<uint64_t, DraftContextPlan> plans;
   uint32_t prefillRows = 0;
   uint32_t restored = 0;
   uint32_t snapshots = 0;
@@ -320,7 +314,6 @@ public:
   std::function<bool()> beginGrowthBlocked;
   std::vector<std::vector<uint32_t>> resumedPrompts;
   std::vector<uint32_t> prefillWidths;
-  bool restoredDraft = false;
   metal::AllocationFailure beginAllocationFailure = metal::AllocationFailure::None;
   uint64_t reclaimableIdleStateBytes = 0;
   uint64_t reclaimedIdleStateBytes = 0;
@@ -507,12 +500,7 @@ void testOneRequestPublishesJunctionAndLatestReplayState() {
   engine.submit(request(6, prompt));
   runUntilIdle(engine);
 
-  const DraftContextPlan &plan = executor.plans.at(6);
   const auto snapshot = engine.snapshot();
-  require(plan.boundaries.size() == 3 && plan.boundaries[0].boundary == 96 &&
-              plan.boundaries[1].boundary == 160 &&
-              plan.boundaries[2].boundary == 161,
-          "junction, latest replay state, and active end were not ordered");
   require(executor.snapshots == 3 && snapshot.junctionMaterializations == 1 &&
               snapshot.replayStatePublications == 2 &&
               snapshot.resources.stateCache.entries == 2,
@@ -555,12 +543,7 @@ void testLatestReplayDenialRecyclesOlderStateNotTheJunction() {
   executor.deniedSnapshots = 1;
   runUntilIdle(engine);
 
-  const DraftContextPlan &plan = executor.plans.at(8);
   const auto snapshot = engine.snapshot();
-  require(plan.boundaries.size() == 3 && plan.boundaries[0].boundary == 96 &&
-              plan.boundaries[1].boundary == 160 &&
-              plan.boundaries[2].boundary == 161,
-          "boundaries were not armed without reservation");
   require(executor.deniedSnapshots == 0 &&
               snapshot.recycledStatePublications == 1 &&
               snapshot.replayStatePublications == 3 &&
@@ -644,11 +627,6 @@ void testDeniedSnapshotCostsOnlyThatAttempt() {
 
   engine.submit(request(3, prompt));
   runUntilIdle(engine);
-  const DraftContextPlan &plan = executor.plans.at(3);
-  require(plan.boundaries.size() == 2 && plan.boundaries[0].boundary == 64 &&
-              plan.boundaries[1].boundary == 65 &&
-              plan.draftContextRows() == prompt.size(),
-          "replay boundary was not armed without reservation");
   require(executor.snapshotAttempts == 1 && executor.snapshots == 0 &&
               engine.snapshot().replayStatePublicationFailures == 1 &&
               engine.snapshot().junctionMaterializationFailures == 0 &&
@@ -781,9 +759,6 @@ void testLongSuffixSkipsDraftRestore() {
   extended.resize(4097, 99);
   engine.submit(request(11, extended));
   runUntilIdle(engine);
-  require(!executor.restoredDraft &&
-              executor.plans.at(11).draftStateRestoreSkipped,
-          "long suffix copied a draft ring that its final window overwrites");
 }
 
 // A lane cancelled while the command that ends at its armed boundary is in
@@ -1604,9 +1579,6 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   executor.decodeFinishes = true;
   now += 101;
   require(engine.tick(now++), "long replay did not resume after pressure eased");
-  const auto &plan = executor.plans.at(id);
-  require(plan.replayEnd == history.size() && plan.captureSpans.size() == 2,
-          "resumed draft plan did not cover generated history in two spans");
   const double finishBy = now + 100;
   for (; now < finishBy && !engine.idle(); ++now)
     static_cast<void>(engine.tick(now));
@@ -2683,11 +2655,8 @@ void testShortSuffixContinuesCheckpointDraftState() {
       prompt.begin(), prompt.begin() + defaultCheckpointTokens + 209);
   engine.submit(request(481, shorter));
   runUntilIdle(engine);
-  require(events.starts.back().second == defaultCheckpointTokens &&
-              executor.restoredDraft &&
-              executor.plans.at(481).draftContextRows() == 209 &&
-              !executor.plans.at(481).draftStateRestoreSkipped,
-          "short checkpoint suffix discarded or rebuilt its restored draft window");
+  require(events.starts.back().second == defaultCheckpointTokens,
+          "short checkpoint suffix did not restore its checkpoint");
 }
 
 void testDefaultCheckpointRestoresLatestCommittedPrefix() {

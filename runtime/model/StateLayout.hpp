@@ -57,39 +57,17 @@ struct GdnStateLayout final {
   bool operator==(const GdnStateLayout &) const = default;
 };
 
-struct DraftStateLayout final {
-  static constexpr uint32_t bfloat16Bytes = 2;
-
-  uint32_t layers = 0;
-  uint32_t kvHeads = 0;
-  uint32_t tokens = 0;
-  uint32_t headDimension = 0;
-
-  [[nodiscard]] constexpr bool valid() const noexcept {
-    return layers && kvHeads && tokens && headDimension;
-  }
-  [[nodiscard]] constexpr uint64_t tensorBytes() const noexcept {
-    return uint64_t{kvHeads} * tokens * headDimension * bfloat16Bytes;
-  }
-  [[nodiscard]] constexpr uint64_t ringBytes() const noexcept {
-    return uint64_t{layers} * 2 * tensorBytes();
-  }
-
-  bool operator==(const DraftStateLayout &) const = default;
-};
-
 struct CompositeStateLayout final {
   GdnStateLayout target;
-  DraftStateLayout draft;
 
-  [[nodiscard]] constexpr bool valid() const noexcept {
-    return target.valid() && draft.valid();
-  }
+  [[nodiscard]] constexpr bool valid() const noexcept { return target.valid(); }
+  // An active request double-buffers its recurrent state (current and next);
+  // a cached prefix keeps one copy.
   [[nodiscard]] constexpr uint64_t activeCellBytes() const noexcept {
-    return 2 * target.cellBytes() + draft.ringBytes();
+    return 2 * target.cellBytes();
   }
   [[nodiscard]] constexpr uint64_t cachedBytes() const noexcept {
-    return target.cellBytes() + draft.ringBytes();
+    return target.cellBytes();
   }
 
   bool operator==(const CompositeStateLayout &) const = default;

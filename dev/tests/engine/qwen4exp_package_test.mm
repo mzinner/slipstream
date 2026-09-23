@@ -116,26 +116,6 @@ std::vector<uint64_t> layerSections(const Qwen4ExpLayout &l, bool full) {
   return s;
 }
 
-std::vector<uint64_t> draftLayerSections(const DFlashDraftLayout &d) {
-  const uint64_t hidden = uint64_t(d.hiddenSize) * kBFloat16Bytes;
-  const uint64_t conv = uint64_t(4) * d.hiddenSize * kBFloat16Bytes;
-  const uint64_t headNorm =
-      uint64_t(d.attentionHeadDimension) * kBFloat16Bytes;
-  return {hidden,
-          conv,
-          q4Bytes(d.dynamicSize, d.hiddenSize),
-          q4Bytes(d.qkvSize, d.hiddenSize),
-          headNorm,
-          headNorm,
-          q4Bytes(d.hiddenSize, d.attentionSize),
-          hidden,
-          conv,
-          q4Bytes(d.dynamicSize, d.hiddenSize),
-          q4Bytes(d.intermediateSize, d.hiddenSize),
-          q4Bytes(d.intermediateSize, d.hiddenSize),
-          q4Bytes(d.hiddenSize, d.intermediateSize)};
-}
-
 std::string gib(uint64_t bytes) {
   std::ostringstream out;
   out << std::fixed << std::setprecision(2)
@@ -143,8 +123,7 @@ std::string gib(uint64_t bytes) {
   return out.str();
 }
 
-void writeManifest(const std::filesystem::path &root, const Qwen4ExpLayout &l,
-                   const DFlashDraftLayout &d) {
+void writeManifest(const std::filesystem::path &root, const Qwen4ExpLayout &l) {
   std::ostringstream m;
   m << "{\"model\":\"Qwen3.8-Flash-Next\",\"schema_version\":5,"
     << "\"format\":{\"name\":\"splash-packed-q4-qwen4exp\",\"q4_bits\":4,"
@@ -153,8 +132,7 @@ void writeManifest(const std::filesystem::path &root, const Qwen4ExpLayout &l,
     << ",\"expert_storage_n\":" << kQ4ExpertStorageN
     << ",\"section_alignment_bytes\":" << kWeightFileAlignment
     << ",\"target_layer_magic\":\"" << Qwen4ExpLayout::layerMagic
-    << "\",\"draft_layer_magic\":\"MDFD0004\","
-    << "\"vision_magic\":\"MDFV0001\"},"
+    << "\"},"
     << "\"execution_geometry\":{"
     << "\"allocation_extent_target_bytes\":" << kv::kAllocationExtentTargetBytes
     << ",\"draft_proposal_tokens\":" << ExecutionLimits::draftProposalTokens
@@ -186,17 +164,6 @@ void writeManifest(const std::filesystem::path &root, const Qwen4ExpLayout &l,
   for (uint32_t layer = 0; layer < l.layers; ++layer)
     m << (layer ? "," : "")
       << (l.isFullAttentionLayer(layer) ? "\"attention\"" : "\"gdn\"");
-  m << "]},\"draft\":{\"architecture\":\"DFlash2DraftModel\",\"layers\":"
-    << d.layers << ",\"hidden_size\":" << d.hiddenSize
-    << ",\"intermediate_size\":" << d.intermediateSize
-    << ",\"sliding_window\":" << ExecutionLimits::draftContextTokens
-    << ",\"block_size\":" << ExecutionLimits::draftQueryRows
-    << ",\"dynamic_conv_group_size\":16,\"dynamic_conv_kernel_size\":2,"
-    << "\"selector_rank\":" << d.selectorRank << ",\"selector_top_k\":16,"
-    << "\"target_capture_layers\":[";
-  for (size_t index = 0; index < Qwen4ExpLayout::hiddenCaptureLayers.size();
-       ++index)
-    m << (index ? "," : "") << Qwen4ExpLayout::hiddenCaptureLayers[index];
   m << "]}}";
   std::ofstream(root / "manifest.json") << m.str();
 
@@ -223,16 +190,7 @@ int main(int argc, const char *argv[]) {
     if (!supplied) std::filesystem::remove_all(root);
 
     constexpr Qwen4ExpLayout layout;
-    DFlashDraftLayout draft;
-    draft.layers = 5;
-    draft.hiddenSize = layout.hiddenSize;
-    draft.dynamicSize = 768;
-    draft.qkvSize = 3072;
-    draft.attentionSize = 2048;
-    draft.intermediateSize = 8704;
-    draft.targetHiddenSize = layout.capturedHiddenSize();
-
-    uint64_t targetBytes = 0, draftBytes = 0;
+    uint64_t targetBytes = 0;
     for (uint32_t layer = 0; layer < layout.layers && !supplied; ++layer) {
       const bool full = layout.isFullAttentionLayer(layer);
       targetBytes += writeWeightFile(
@@ -247,8 +205,6 @@ int main(int argc, const char *argv[]) {
         const std::string name = entry.path().string();
         if (name.find("/target/") != std::string::npos)
           targetBytes += entry.file_size();
-        else if (name.find("/draft/") != std::string::npos)
-          draftBytes += entry.file_size();
       }
     }
     std::vector<uint64_t> head = hyperConnectionSections(layout, false);
@@ -290,23 +246,7 @@ int main(int argc, const char *argv[]) {
                                    layout.ngramHeadDimension(), ple);
     if (!supplied) targetBytes += ngramBytes;
 
-    for (uint32_t layer = 0; layer < draft.layers && !supplied; ++layer)
-      draftBytes += writeWeightFile(
-          root / "draft" / ("layer-" + std::to_string(layer) + ".bin"),
-          "MDFD0004", layer, 0, draftLayerSections(draft));
-    const uint64_t codebook =
-        uint64_t(draft.vocabularySize) * draft.selectorRank * kBFloat16Bytes;
-    if (!supplied)
-      draftBytes += writeWeightFile(
-        root / "draft/model.bin", "MDFD0004", draft.layers, 1,
-        std::array<uint64_t, 6>{
-            q4Bytes(draft.hiddenSize, draft.targetHiddenSize),
-            uint64_t(draft.hiddenSize) * kBFloat16Bytes,
-            uint64_t(draft.hiddenSize) * kBFloat16Bytes,
-            q4Bytes(draft.selectorRank, draft.hiddenSize), codebook,
-            codebook});
-
-    if (!supplied) writeManifest(root, layout, draft);
+    if (!supplied) writeManifest(root, layout);
 
     uint64_t onDisk = 0;
     for (const auto &entry :
@@ -316,7 +256,6 @@ int main(int argc, const char *argv[]) {
     std::cout << "synthetic qwen4exp package at " << root << "\n"
               << "  target weights   " << gib(targetBytes) << "\n"
               << "    of which PLE  " << "  " << gib(ngramBytes) << "\n"
-              << "  draft weights    " << gib(draftBytes) << "\n"
               << "  apparent total   " << gib(onDisk) << "\n";
 
     // The manifest branch and the loader, on the real geometry.
@@ -338,14 +277,14 @@ int main(int argc, const char *argv[]) {
     const uint64_t resident = targetBytes - streamable;
     std::cout << "  streamable       " << gib(streamable)
               << "  (routed experts and the per-layer embedding)\n"
-              << "  resident weights " << gib(resident + draftBytes) << '\n';
+              << "  resident weights " << gib(resident) << '\n';
     require(streamable < targetBytes,
             "the streamable share cannot be the whole target");
-    require(resident + draftBytes < capabilities.recommendedMaxWorkingSetBytes,
+    require(resident < capabilities.recommendedMaxWorkingSetBytes,
             "the resident weights alone must fit the working set, or no "
             "cache size can make this model plannable");
     const uint64_t spare =
-        capabilities.recommendedMaxWorkingSetBytes - resident - draftBytes;
+        capabilities.recommendedMaxWorkingSetBytes - resident;
     std::cout << "  budget left for  " << gib(spare)
               << "  cache, KV and activations\n"
               << "  VERDICT          plannable: the resident weights fit, and "

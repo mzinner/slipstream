@@ -18,10 +18,9 @@ namespace splash::engine {
 struct EngineConfig final {
   uint32_t maxContext = kv::kMaximumLogicalTokens;
   uint32_t vocabularySize = std::numeric_limits<uint32_t>::max();
-  // Two draft windows balance recovery granularity and capture work.
+  // Spacing of prompt checkpoints saved for prefix reuse (whole KV pages).
   // Zero disables progress checkpoints without changing reusable end states.
-  uint32_t prefillCheckpointTokens =
-      2 * model::ExecutionLimits::draftContextTokens;
+  uint32_t prefillCheckpointTokens = 4096;
   // Rows per prompt command: the package's chunk, at most the built maximum.
   uint32_t prefillChunkTokens = model::ExecutionLimits::defaultPrefillChunkTokens;
   double resourceWaitTimeoutMilliseconds = 30000.0;
@@ -149,9 +148,8 @@ private:
   [[nodiscard]] Request &request(uint64_t requestId);
   [[nodiscard]] bool admitQueued(double nowMilliseconds);
   [[nodiscard]] bool admit(Request &request, double nowMilliseconds);
-  [[nodiscard]] DraftContextPlan
-  configureDraftStatePlan(Request &request, uint32_t stateBoundary,
-                          uint32_t junctionBoundary);
+  void configureStateBoundaries(Request &request, uint32_t stateBoundary,
+                                uint32_t junctionBoundary);
   void armNextStateBoundary(Request &request);
   void discardPendingStateBoundaries(Request &request) noexcept;
   [[nodiscard]] bool retireCheckpoint(Request &request);

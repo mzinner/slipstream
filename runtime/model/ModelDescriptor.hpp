@@ -1,6 +1,5 @@
 #pragma once
 
-#include "DFlashDraft.hpp"
 #include "Model.hpp"
 #include "Qwen4Exp.hpp"
 
@@ -20,14 +19,9 @@ using TargetLayout =
 struct ModelDescriptor final {
   std::string name;
   TargetLayout target;
-  DFlashDraftLayout draft;
   ModelCapabilities capabilities;
   kv::Q8Layout targetKvLayout;
   CompositeStateLayout stateLayout;
-  // The draft is zero-filled, present only because the format requires one
-  // (qwen4exp has no DFlash 2 draft). Its proposals are never worth keeping,
-  // so the runtime keeps only each step's anchor row.
-  bool draftPlaceholder = false;
   // Exact bytes parsed during package inspection, including artifact digests.
   // Synthetic descriptors retain zero; this is separate from layout identity.
   std::array<uint8_t, 32> packageManifestSha256{};
@@ -36,10 +30,9 @@ struct ModelDescriptor final {
 };
 
 // Derives the capabilities and cache layouts the engine consumes from the
-// concrete target and draft layouts.
+// concrete target layout.
 [[nodiscard]] ModelDescriptor makeModelDescriptor(std::string name,
-                                                  TargetLayout target,
-                                                  DFlashDraftLayout draft);
+                                                  TargetLayout target);
 [[nodiscard]] ModelDescriptor
 inspectModelPackage(const std::filesystem::path &root);
 

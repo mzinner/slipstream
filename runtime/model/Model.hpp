@@ -49,7 +49,7 @@ struct ModelRequest final {
 };
 
 
-// Immutable target-recurrent plus draft-context state.  Concrete model
+// Immutable recurrent state of a request prefix.  Concrete model
 // implementations own its buffers; the engine only pins and accounts it.
 class CompositeState {
 public:
@@ -59,77 +59,6 @@ public:
   // pool, and idle-state reclaim frees it.
   [[nodiscard]] virtual uint64_t bytes() const noexcept = 0;
 };
-
-enum class DraftBoundaryPurpose : uint8_t { Active, Materialization };
-
-struct DraftCaptureSpan final {
-  uint32_t begin = 0;
-  uint32_t end = 0;
-  bool resetDraftState = false;
-};
-
-struct DraftBoundaryPlan final {
-  uint32_t boundary = 0;
-  DraftBoundaryPurpose purpose = DraftBoundaryPurpose::Active;
-  uint32_t captureBegin = 0;
-};
-
-struct DraftContextPlan final {
-  uint32_t replayBegin = 0;
-  uint32_t replayEnd = 0;
-  std::optional<uint32_t> restoredDraftBoundary;
-  std::vector<DraftCaptureSpan> captureSpans;
-  std::vector<DraftBoundaryPlan> boundaries;
-
-  uint64_t targetPrefillRows = 0;
-  uint64_t draftContextRowsActive = 0;
-  uint64_t draftContextRowsMaterialization = 0;
-  uint64_t draftContextRowsAvoided = 0;
-  uint64_t draftStateRestoreSkipped = 0;
-  uint64_t draftStateResets = 0;
-
-  [[nodiscard]] uint64_t draftContextRows() const noexcept {
-    return draftContextRowsActive + draftContextRowsMaterialization;
-  }
-  [[nodiscard]] std::span<const DraftCaptureSpan> captures() const noexcept {
-    return captureSpans;
-  }
-  [[nodiscard]] std::span<const DraftBoundaryPlan>
-  plannedBoundaries() const noexcept {
-    return boundaries;
-  }
-};
-
-struct DispatchDraftCaptureSpan final {
-  uint32_t absoluteBegin = 0;
-  uint32_t absoluteEnd = 0;
-  uint32_t compactDestinationRow = 0;
-  bool resetDraftState = false;
-  uint32_t activeRows = 0;
-  uint32_t materializationRows = 0;
-};
-
-struct DispatchDraftCapturePlan final {
-  std::array<DispatchDraftCaptureSpan, 2> values{};
-  uint32_t count = 0;
-
-  [[nodiscard]] uint32_t size() const noexcept { return count; }
-  [[nodiscard]] const DispatchDraftCaptureSpan &
-  operator[](uint32_t index) const {
-    return values.at(index);
-  }
-  [[nodiscard]] auto begin() const noexcept { return values.begin(); }
-  [[nodiscard]] auto end() const noexcept { return values.begin() + count; }
-};
-
-[[nodiscard]] DraftContextPlan
-planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
-                 std::optional<uint32_t> restoredDraftBoundary,
-                 std::span<const uint32_t> materializationBoundaries);
-
-[[nodiscard]] DispatchDraftCapturePlan
-draftCaptureSpansForDispatch(const DraftContextPlan &plan,
-                             uint32_t dispatchBegin, uint32_t dispatchEnd);
 
 struct BatchItem final {
   uint64_t requestId = 0;
@@ -266,8 +195,7 @@ public:
   [[nodiscard]] virtual uint64_t actualAllocatedBytes() const noexcept = 0;
   // Frees pooled idle buffers beyond the counts kept warm and returns the
   // bytes released. Active lanes and cached states are never touched.
-  [[nodiscard]] virtual uint64_t releaseIdle(uint32_t keepCells,
-                                             uint32_t keepRings) noexcept = 0;
+  [[nodiscard]] virtual uint64_t releaseIdle(uint32_t keepCells) noexcept = 0;
 };
 
 // Startup sizing and observability are part of the concrete model runtime,
@@ -379,10 +307,7 @@ public:
   virtual void suspend(uint64_t requestId) = 0;
   [[nodiscard]] virtual StateAdmission resume(const ModelRequest &request) = 0;
   virtual void restore(uint64_t requestId, uint32_t restoredPrefixLength,
-                       std::shared_ptr<const CompositeState> state,
-                       bool restoreDraftState) = 0;
-  virtual void setDraftContextPlan(uint64_t requestId,
-                                   DraftContextPlan plan) = 0;
+                       std::shared_ptr<const CompositeState> state) = 0;
   // Optional async wake hook; an immediately ready ticket need not call it.
   [[nodiscard]] virtual std::unique_ptr<ModelBatchTicket>
   submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,

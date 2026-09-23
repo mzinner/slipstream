@@ -10,8 +10,7 @@
 // Separate from ops::RoPETableShape so host-only fields cannot change the ABI.
 struct RopeTableParams {
   uint32_t target_rows;
-  uint32_t draft_rows;
 };
 
-static_assert(sizeof(RopeTableParams) == 8,
-              "RoPE table parameters are 8 bytes on both sides");
+static_assert(sizeof(RopeTableParams) == 4,
+              "RoPE table parameters are 4 bytes on both sides");

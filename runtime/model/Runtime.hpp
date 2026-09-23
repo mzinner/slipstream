@@ -26,9 +26,7 @@ public:
   [[nodiscard]] StateAdmission
   resume(const ModelRequest &request) override;
   void restore(uint64_t requestId, uint32_t restoredPrefixLength,
-                     std::shared_ptr<const CompositeState> restoredState,
-                     bool restoreDraftState) override;
-  void setDraftContextPlan(uint64_t requestId, DraftContextPlan plan) override;
+                     std::shared_ptr<const CompositeState> restoredState) override;
   [[nodiscard]] std::vector<ModelStepResult>
   prefill(const BatchPlan &plan, std::span<const ModelBatchItem> items);
   [[nodiscard]] std::unique_ptr<ModelBatchTicket>

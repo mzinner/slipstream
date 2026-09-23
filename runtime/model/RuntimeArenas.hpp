@@ -2,7 +2,6 @@
 
 // Shared Qwen prefill/decode scratch layouts and allocation owners.
 
-#include "model/DFlashDraft.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/QwenTarget.hpp"
 
@@ -37,22 +36,14 @@ inline constexpr uint32_t kMaximumPageTableEntries =
 
 struct RuntimeGeometry final {
   QwenTargetGeometry target;
-  DFlashDraftLayout draft;
-  DraftStateLayout draftState;
 
   [[nodiscard]] static RuntimeGeometry from(const ModelPackage &package) {
     RuntimeGeometry result;
     result.target = std::visit(
         [](const auto &weights) { return qwenTargetGeometry(weights); },
         package.target);
-    result.draft = package.draft.layout;
-    result.draftState = result.draft.stateLayout();
-    if (!result.target.valid() || !result.draftState.valid() ||
-        result.target.hiddenSize != result.draft.hiddenSize ||
-        result.target.vocabularySize != result.draft.vocabularySize ||
-        result.target.capturedHiddenSize() != result.draft.targetHiddenSize) {
+    if (!result.target.valid())
       throw std::invalid_argument("invalid model runtime geometry");
-    }
     return result;
   }
 
@@ -61,10 +52,7 @@ struct RuntimeGeometry final {
   }
   [[nodiscard]] uint32_t projectionSumsWidth() const noexcept {
     uint32_t maximumInput = std::max(
-        {target.hiddenSize, target.attentionWidth,
-         target.capturedHiddenSize(), target.ffnScratchWidth(),
-         draft.targetHiddenSize, draft.hiddenSize,
-         draft.intermediateSize});
+        {target.hiddenSize, target.attentionWidth, target.ffnScratchWidth()});
     return (maximumInput + kQ4GroupElements - 1) / kQ4GroupElements;
   }
 };
@@ -98,7 +86,6 @@ enum class PrefillTensor : uint32_t {
   Hidden1,
   InputTokens,
   Normalized,
-  Captured,
   GdnPacked,
   GdnQueries,
   GdnKeys,
@@ -120,16 +107,9 @@ enum class PrefillTensor : uint32_t {
   ProjectionSums,
   DownProjectionSums,
   TargetPositions,
-  DraftPositions,
   TargetInverseFrequencies,
-  DraftInverseFrequencies,
   RopeCos,
   RopeSin,
-  ContextProjected,
-  ContextHidden,
-  ContextQkv,
-  DraftRopeCos,
-  DraftRopeSin,
   ChunkKeys,
   ChunkValues,
   MoeSelectedExperts,
@@ -182,19 +162,12 @@ public:
       throw std::logic_error("prefill arena mismatch");
     auto *target = static_cast<float *>(
         get(PrefillTensor::TargetInverseFrequencies).contents());
-    auto *draft = static_cast<float *>(
-        get(PrefillTensor::DraftInverseFrequencies).contents());
-    if (!target || !draft)
+    if (!target)
       throw std::logic_error("RoPE frequencies are not CPU-visible");
     for (uint32_t dim = 0; dim < geometry.target.rotaryPairs; ++dim) {
       target[dim] =
           std::pow(geometry.target.rotaryTheta,
                    -static_cast<float>(dim) / geometry.target.rotaryPairs);
-    }
-    const uint32_t draftRotaryPairs = geometry.draftState.headDimension / 2;
-    for (uint32_t dim = 0; dim < draftRotaryPairs; ++dim) {
-      draft[dim] = std::pow(geometry.draft.rotaryTheta,
-                            -static_cast<float>(dim) / draftRotaryPairs);
     }
   }
 
@@ -226,19 +199,10 @@ enum class DecodeTensor : uint32_t {
   AttentionHidden,
   AttentionOutput,
   Positions,
-  DraftPositions,
   RopeCos,
   RopeSin,
   Arrived,
   Generation,
-  ContextProjected,
-  ContextHidden,
-  ContextQkv,
-  CapturedTargetHidden,
-  DraftQueryKeys,
-  DraftQueryValues,
-  DraftRopeCos,
-  DraftRopeSin,
   FinalHidden,
   Logits,
   ArgmaxValues,
@@ -254,22 +218,7 @@ enum class DecodeTensor : uint32_t {
   NextAnchor,
   AcceptedCount,
   DraftInputTokens,
-  DraftHidden0,
-  DraftHidden1,
-  DraftNormalized,
-  DraftDynamic,
-  DraftConvolved,
-  DraftProposalQkv,
-  DraftAttention,
-  DraftProjected,
-  DraftResidual,
-  DraftIntermediate,
-  DraftFinalHidden,
-  SelectorHidden,
   Candidates,
-  Unary,
-  TopPartialIds,
-  TopPartialValues,
   ProposalProbs,
   ProposedTokens,
   PageTable,
@@ -395,16 +344,12 @@ public:
 
   static uint64_t gateScratchBytes(const RuntimeGeometry &geometry,
                                   const ops::ExecutionPlans &operators) {
-    // One private gate buffer is reused serially by the target dense FFN (when
-    // present) and the always-dense DFlash draft. Sparse target FFNs use their
-    // own route-major arena tensors, but must not remove the draft's scratch.
-    const uint64_t draft = operators.gateUpWorkspace(
-        {geometry.draft.intermediateSize, geometry.draft.hiddenSize});
-    const uint64_t target = geometry.target.denseIntermediateSize
+    // A private gate buffer for a dense target FFN; sparse (MoE) targets use
+    // their own route-major arena tensors and need none.
+    return geometry.target.denseIntermediateSize
         ? operators.gateUpWorkspace({geometry.target.denseIntermediateSize,
                                      geometry.target.hiddenSize})
         : 0;
-    return std::max(target, draft);
   }
 
   [[nodiscard]] metal::MetalBuffer gdnBatchSlice(DecodeTensor base, uint32_t gdnLayer,

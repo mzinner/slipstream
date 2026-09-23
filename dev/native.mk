@@ -18,7 +18,6 @@ SANITIZER_CONFIG_DIGEST := $(shell printf '%s\0' $(CONFIG_DIGEST) \
 # and its tests compile these sources directly.
 BACKEND_CONTROL_SOURCES := \
 	runtime/engine/Scheduler.cpp \
-	runtime/model/DraftContextPlan.cpp \
 	runtime/engine/KvPool.cpp \
 	runtime/engine/KvCache.cpp \
 	runtime/engine/StateCache.cpp \
@@ -29,11 +28,9 @@ MODEL_SOURCES := \
 	runtime/model/Qwen4Exp.cpp \
 	runtime/model/QwenTarget.cpp \
 	runtime/model/Qwen4ExpTarget.cpp \
-	runtime/model/DFlashDraft.cpp \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/ModelDescriptor.mm
 MODEL_OPERATOR_SOURCES := \
-	runtime/ops/DraftAttention.cpp \
 	runtime/ops/Embedding.cpp \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
@@ -50,7 +47,6 @@ TEST_MEMORY_TEST := $(ENGINE_TEST_BUILD)/engine-memory-plan
 TEST_DEVICE_QUERIES := $(ENGINE_TEST_BUILD)/device-queries
 TEST_KV_PAGE_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-page-cache
 TEST_KV_FIRST_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-first-cache
-TEST_DRAFT_CONTEXT_PLAN_TEST := $(ENGINE_TEST_BUILD)/draft-context-plan
 TEST_RAGGED_SCHEDULER_TEST := $(ENGINE_TEST_BUILD)/ragged-scheduler
 TEST_CACHE_TEST := $(ENGINE_TEST_BUILD)/engine-cache
 TEST_KV_FIRST_ENGINE_TEST := $(ENGINE_TEST_BUILD)/kv-first-engine
@@ -88,10 +84,7 @@ TEST_EXECUTION_PLANS := $(ENGINE_TEST_BUILD)/execution-plans
 TEST_MODEL_EXECUTION_PLANS := $(ENGINE_TEST_BUILD)/model-execution-plans
 TEST_ATTENTION_PLAN := $(ENGINE_TEST_BUILD)/paged-attention-plan
 TEST_LINEAR_PLAN := $(ENGINE_TEST_BUILD)/linear-plan
-TEST_DFLASH_BATCH_CONTROL_TEST := $(ENGINE_TEST_BUILD)/dflash-batch-control
-TEST_DRAFT_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/draft-attention
 TEST_GDN_DECODE_TEST := $(ENGINE_TEST_BUILD)/gdn-decode
-TEST_DRAFT_SELECTOR_TEST := $(ENGINE_TEST_BUILD)/draft-selector
 TEST_Q4_PREFILL_PROFILE := $(ENGINE_TEST_BUILD)/q4-prefill-profile
 TEST_Q4_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/q4-decode-profile
 TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
@@ -119,7 +112,6 @@ TEST_CPU_TARGETS := $(TEST_OPERATOR_WORKSPACE) \
 	$(TEST_MEMORY_TEST) \
 	$(TEST_KV_PAGE_CACHE_TEST) \
 	$(TEST_KV_FIRST_CACHE_TEST) \
-	$(TEST_DRAFT_CONTEXT_PLAN_TEST) \
 	$(TEST_QWEN4EXP_LAYOUT_TEST) \
 	$(TEST_RAGGED_SCHEDULER_TEST) \
 	$(TEST_CACHE_TEST) \
@@ -156,10 +148,7 @@ TEST_METAL_TARGETS := \
 	$(TEST_Q4_BATCH_TEST) \
 	$(TEST_MOE_METAL_TEST) \
 	$(TEST_GDN_METAL_TEST) \
-	$(TEST_DFLASH_BATCH_CONTROL_TEST) \
-	$(TEST_DRAFT_ATTENTION_TEST) \
 	$(TEST_GDN_DECODE_TEST) \
-	$(TEST_DRAFT_SELECTOR_TEST) \
 	$(TEST_METAL_BACKEND_TEST) \
 	$(LIB) $(TEST_METAL_BACKEND_LIB) $(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB)
 
@@ -205,7 +194,6 @@ $(TEST_KV_PAGE_CACHE_TEST): runtime/engine/KvPool.cpp \
 		dev/tests/engine/kv_page_cache_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
-$(TEST_DRAFT_CONTEXT_PLAN_TEST): runtime/model/DraftContextPlan.cpp \
 		dev/benchmarks/PrefillWork.hpp \
 		dev/tests/engine/draft_context_plan_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
@@ -226,7 +214,6 @@ $(TEST_CACHE_TEST): runtime/engine/KvPool.cpp \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 $(TEST_KV_FIRST_ENGINE_TEST): runtime/engine/Scheduler.cpp \
-		runtime/model/DraftContextPlan.cpp \
 		runtime/engine/KvPool.cpp \
 		runtime/engine/KvCache.cpp \
 		runtime/engine/StateCache.cpp \
@@ -353,7 +340,6 @@ $(TEST_QWEN_STATE_TEST): runtime/metal/DeviceCapabilities.cpp \
 		runtime/engine/MemoryGovernor.cpp \
 		runtime/ops/Q8PageStorage.mm \
 		runtime/model/WeightStore.cpp \
-		runtime/model/DFlashDraft.cpp \
 		$(MODEL_OPERATOR_SOURCES) \
 		runtime/model/QwenState.cpp \
 		dev/tests/engine/qwen_state_storage_test.mm | $(ENGINE_TEST_BUILD)
@@ -455,17 +441,7 @@ $(TEST_LINEAR_PLAN): runtime/metal/DeviceCapabilities.cpp \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_DFLASH_BATCH_CONTROL_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm \
-		dev/tests/engine/dflash_batch_control_metal_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
-		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_DRAFT_ATTENTION_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm runtime/ops/DraftAttention.cpp \
-		dev/tests/engine/draft_attention_metal_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
-		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_GDN_DECODE_TEST): runtime/metal/DeviceCapabilities.cpp \
 		runtime/metal/MetalBackend.mm runtime/ops/GDN.cpp \
@@ -473,11 +449,6 @@ $(TEST_GDN_DECODE_TEST): runtime/metal/DeviceCapabilities.cpp \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_DRAFT_SELECTOR_TEST): runtime/metal/DeviceCapabilities.cpp \
-		runtime/metal/MetalBackend.mm runtime/ops/Sampling.cpp \
-		dev/tests/engine/draft_selector_metal_test.mm $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
-		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_Q4_PREFILL_PROFILE): dev/benchmarks/q4_prefill_profile.mm \
 		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
@@ -566,7 +537,6 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP)
 	$(TEST_MEMORY_TEST)
 	$(TEST_KV_PAGE_CACHE_TEST)
 	$(TEST_KV_FIRST_CACHE_TEST)
-	$(TEST_DRAFT_CONTEXT_PLAN_TEST)
 	$(TEST_QWEN4EXP_LAYOUT_TEST)
 	$(TEST_RAGGED_SCHEDULER_TEST)
 	$(TEST_CACHE_TEST)
@@ -602,10 +572,7 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_Q4_BATCH_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_MOE_METAL_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GDN_METAL_TEST) $(LIB)
-	$(METAL_TEST_ENV) $(TEST_DFLASH_BATCH_CONTROL_TEST) $(LIB)
-	$(METAL_TEST_ENV) $(TEST_DRAFT_ATTENTION_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GDN_DECODE_TEST) $(LIB)
-	$(METAL_TEST_ENV) $(TEST_DRAFT_SELECTOR_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_METAL_BACKEND_TEST) $(TEST_METAL_BACKEND_LIB)
 
 VISION_FIXTURE_incoai/Qwen3.8-27B-Splash := qwen3.8-27b

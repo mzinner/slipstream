@@ -42,9 +42,7 @@ public:
   StateAdmission resume(const ModelRequest &) override {
     return {0, StateFailure::None};
   }
-  void restore(uint64_t, uint32_t, std::shared_ptr<const CompositeState>,
-                     bool) override {}
-  void setDraftContextPlan(uint64_t, DraftContextPlan) override {}
+  void restore(uint64_t, uint32_t, std::shared_ptr<const CompositeState>) override {}
   std::vector<ModelStepResult> prefill(const BatchPlan &,
                                           std::span<const ModelBatchItem>) {
     return {};
