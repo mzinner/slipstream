@@ -77,4 +77,3 @@
 - [ ] Draft head: literature survey (incl. huggingface.co/papers/2609.26796), then plan
 - [ ] Optional: drop `install/` and Homebrew/release packaging
 - [ ] Optional: explicit model interface in place of `QwenTarget`
-
