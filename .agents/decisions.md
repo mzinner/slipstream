@@ -244,3 +244,25 @@ session prompts (39.6 -> 40.9), outputs identical. Plain least-recent eviction
 tied the current rule on session text, so the rule stays. Overrides:
 SPLASH_LOOKAHEAD_EXPERTS, SPLASH_EXPERT_SLOTS (=even for the old split),
 SPLASH_EXPERT_EVICT=lru.
+
+## 2026-09-23 — Review of upstream PR incoai/splash#115 (Flash-Next on M5 Ultra)
+
+One squashed commit, 67K lines (also github.com/mweinbach/splash-flash-next,
+branch codex/qwen38-flash-next-m5-ultra); a separate Flash worker importing an
+MLX checkpoint as-is, 8-bit experts (~9.8 MB each), tuned for an M5 Ultra, no
+Flash-Next speed claims, no whole-model runs on the rebased build.
+- **MTP depth controller** (FlashMTPDepthController: one depth per stretch of
+  text from averaged acceptance and measured cost, with probing): replayed on
+  our traces (bench/depth_controller_replay.py) it gives 31-41 tok/s vs our
+  per-step confidence stop's 40.5 / 43.8. Not borrowed.
+- **GDN lazy rollback**: we already replay only kept rows into the other state
+  copy (ops::GDN::addCommit); nothing to take.
+- **Static hot-expert plan, 8-bit experts, SSD n-gram row cache, 2048-row bulk
+  QSA prefill**: built for far more memory; our bottleneck is expert reads.
+  Bulk QSA prefill could be revisited if long-prompt prefill becomes the target
+  (profile first: SPLASH_PROFILE_PREFILL).
+- **Upstream Splash since our fork (1.0, 2026-09-18): 67 commits we lack.**
+  Worth porting: #92 tool arguments omitted with required-first order + exact
+  message-prefix reuse (agent turns), #44 false Metal command timeouts, #40
+  UTF-8 JSON, #31 composed tool schemas, #120 per-request timings. Most kernel
+  commits target Apple9 or dense Q4 (the 27B/35B), not our 8-bit/expert paths.
