@@ -40,8 +40,8 @@ what this model needs.
 ## Run it
 
 **Three commands cover daily use: start, watch, stop.** The server speaks the
-OpenAI and Anthropic APIs on `http://127.0.0.1:8090`, and omp is already set up
-for it.
+OpenAI and Anthropic APIs on `http://127.0.0.1:8090`, and omp and pi are already
+set up for it.
 
 ```zsh
 ~/models/bin/slipstream-server.sh      # start (foreground; ~15 s to load)
@@ -146,7 +146,33 @@ omp --model splash-flashnext/local/qwen3.8-flash-next-splash -p "Reply with exac
 - **Check it is connected:** run the quick check above, then look for its `Done`
   line in `slipstream-log.sh`.
 
-Any other OpenAI-compatible client works too:
+---
+
+## Use it from pi
+
+**pi has a `slipstream` provider for this server** (added 2026-09-23 in
+`~/.pi/agent/models.json`; model `local/qwen3.8-flash-next-splash`, port 8090). It
+is also in pi's Ctrl+P list. pi's default model is still llama.cpp (`flashnext`).
+
+```zsh
+pi --model slipstream/local/qwen3.8-flash-next-splash                   # interactive
+pi --model slipstream/local/qwen3.8-flash-next-splash --thinking low    # less thinking, faster answers
+pi --model slipstream/local/qwen3.8-flash-next-splash -p "Reply with exactly: OK" < /dev/null   # quick check
+```
+
+- **Thinking levels:** `off`, `low`, `medium`, `xhigh` (the model's template has
+  no others, so pi hides `minimal`, `high` and `max`). pi sends them as
+  `reasoning_effort`; the log's `think` field shows what arrived.
+- **Make it pi's default:** in `~/.pi/agent/settings.json` set `"defaultProvider":
+  "slipstream"` and `"defaultModel": "slipstream/local/qwen3.8-flash-next-splash"`.
+- **Context:** 126,976 tokens, as for omp. Lower `contextWindow` in `models.json` if
+  you start the server with a smaller `CTX`.
+
+---
+
+## Other clients
+
+Any OpenAI-compatible client works too:
 
 ```zsh
 curl -s localhost:8090/v1/chat/completions -H 'content-type: application/json' -d '{
