@@ -1970,7 +1970,33 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(
             output.call_args.args[0],
             "14:32:08 Done · input 10,240 · cached 8,192 · output 320"
-            " · TTFT 0.8s · 85.0 tok/s",
+            " · TTFT 0.8s · decode 85.0 tok/s",
+        )
+
+    def test_console_request_summary_shows_prompt_speed(self):
+        record = {
+            "outcome": "stop",
+            "prompt_tokens": 10240,
+            "completion_tokens": 320,
+            "metrics": {
+                "cache": {"matched_tokens": 8192},
+                "prefill": {"tokens": 2048},
+                "request_latency": {
+                    "ttft_ms": 900,
+                    "start_to_first_token_ms": 800,
+                    "stream_tokens_per_second": 41.5,
+                },
+            },
+        }
+        with (
+            mock.patch.object(api.time, "strftime", return_value="14:32:08"),
+            mock.patch("builtins.print") as output,
+        ):
+            diagnostics.print_request(record)
+        self.assertEqual(
+            output.call_args.args[0],
+            "14:32:08 Done · input 10,240 · cached 8,192 · output 320"
+            " · TTFT 0.9s · prompt 2,560 tok/s · decode 41.5 tok/s",
         )
 
     def test_console_shows_the_tool_block_signature(self):

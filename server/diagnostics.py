@@ -43,6 +43,12 @@ def print_request(record):
     speed = latency.get("stream_tokens_per_second")
     if ttft is not None:
         parts.append(f"TTFT {ttft / 1000:.1f}s")
+    # Prompt speed: the new (uncached) prompt tokens over the time from the
+    # engine starting the request to its first token (queueing excluded).
+    new_tokens = metrics.get("prefill", {}).get("tokens", 0)
+    to_first = latency.get("start_to_first_token_ms")
+    if new_tokens and to_first:
+        parts.append(f"prompt {new_tokens * 1000 / to_first:,.0f} tok/s")
     if speed is not None:
-        parts.append(f"{speed:.1f} tok/s")
+        parts.append(f"decode {speed:.1f} tok/s")
     print_status(" · ".join(parts))
