@@ -28,11 +28,14 @@ architecture check, 10/10 identical greedy outputs vs Splash on the real model
 1. **Cheaper check steps (Nitin chose this, 2026-09-23).** Done so far:
    read-ahead 6 + uneven cache slots, +3-4% (41.4 tok/s on the 10-prompt
    suite, 40.9 on session prompts). Still open, by expected value:
-   - read-ahead that skips experts a row is unlikely to use (rank or score
-     margin), or only for rows likely to be kept;
-   - a larger cache now that phase 3 freed 1.45 GB (check memory headroom at
-     the 58 GiB GPU limit and 128K context);
-   - fewer GPU-CPU hand-offs (~2 ms of host work a step).
+   - tried, no gain: reading experts several rows agree on
+     (SPLASH_LOOKAHEAD_CONSENSUS), plain least-recent eviction;
+   - not done on purpose: a larger cache. Free memory already dips to ~7.5 GiB
+     during runs; +1-2 GiB of cache risks the freezes of 2026-09-22 for an
+     estimated 2%;
+   - left: fewer GPU-CPU hand-offs (~2 ms a step). The GPU still idles ~15 ms
+     a step waiting for ~50 on-demand reads; only better prediction or more
+     memory moves that.
 2. Draft-head pilot: no-go (docs/draft-head-plan.md); tools kept. Data in
    `~/models/qwen38-flash-next-drafter-data` (~27 GB), safe to delete.
 3. Optional cleanup: drop `install/` and Homebrew packaging; explicit model

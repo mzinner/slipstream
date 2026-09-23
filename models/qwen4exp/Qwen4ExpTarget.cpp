@@ -2068,6 +2068,10 @@ void Qwen4ExpTarget::addVerify(
     struct Miss { uint32_t expert; uint32_t slot; };
     std::vector<Miss> misses;
     ++cache.clock;
+    constexpr uint32_t kMaxPredicted = 512;
+    std::bitset<kMaxPredicted> wanted;
+    std::array<uint8_t, kMaxPredicted> votes{};
+    std::vector<uint32_t> order;
     for (uint32_t r = 0; r < rows; ++r) {
       if (r % ExecutionLimits::targetVerifyRows >= buffers.liveRowsPerLane)
         continue;
@@ -2087,32 +2091,49 @@ void Qwen4ExpTarget::addVerify(
       for (uint32_t k = 0; k < 16; ++k) {
         predictedWide[layer].set(ids[k]);
         if (k < guesses) predictedNarrow[layer].set(ids[k]);
+        if (k < 10 && ids[k] < kMaxPredicted) ++votes[ids[k]];
       }
-      for (uint32_t k = 0; k < guesses; ++k) {
-        const uint32_t expert = ids[k];
-        if (expert >= weights.layout.experts)
-          continue;
-        const int16_t existing = cache.expertToSlot[expert];
-        if (existing >= 0) {
-          cache.lruTime[existing] = cache.clock;
-          continue;
+      for (uint32_t k = 0; k < guesses; ++k)
+        if (ids[k] < kMaxPredicted && !wanted.test(ids[k])) {
+          wanted.set(ids[k]);
+          order.push_back(ids[k]);
         }
-        uint32_t slot = 0;
-        if (cache.numCached < cache.capacity) {
-          slot = cache.numCached++;
-        } else {
-          const int32_t victim = pickVictim(cache);
-          if (victim < 0)
-            break;
-          slot = static_cast<uint32_t>(victim);
-          if (cache.slotToExpert[slot] >= 0)
-            cache.expertToSlot[cache.slotToExpert[slot]] = -1;
+    }
+    // SPLASH_LOOKAHEAD_CONSENSUS=n also reads experts that n or more rows
+    // predict in their top 10 (0, the default, reads only each row's top k).
+    // Tried 2026-09-23: n = 2 or 3, with top 4 or 6 - all within noise of the
+    // default (41.2-41.5 tok/s), so it stays off.
+    static const uint32_t consensus = [] {
+      const char *value = std::getenv("SPLASH_LOOKAHEAD_CONSENSUS");
+      return value ? static_cast<uint32_t>(std::atoi(value)) : 0u;
+    }();
+    if (consensus)
+      for (uint32_t e = 0; e < weights.layout.experts && e < kMaxPredicted; ++e)
+        if (votes[e] >= consensus && !wanted.test(e)) {
+          wanted.set(e);
+          order.push_back(e);
         }
-        cache.slotToExpert[slot] = static_cast<int16_t>(expert);
-        cache.expertToSlot[expert] = static_cast<int16_t>(slot);
-        cache.lruTime[slot] = cache.clock;
-        misses.push_back({expert, slot});
+    for (const uint32_t expert : order) {
+      const int16_t existing = cache.expertToSlot[expert];
+      if (existing >= 0) {
+        cache.lruTime[existing] = cache.clock;
+        continue;
       }
+      uint32_t slot = 0;
+      if (cache.numCached < cache.capacity) {
+        slot = cache.numCached++;
+      } else {
+        const int32_t victim = pickVictim(cache);
+        if (victim < 0)
+          break;
+        slot = static_cast<uint32_t>(victim);
+        if (cache.slotToExpert[slot] >= 0)
+          cache.expertToSlot[cache.slotToExpert[slot]] = -1;
+      }
+      cache.slotToExpert[slot] = static_cast<int16_t>(expert);
+      cache.expertToSlot[expert] = static_cast<int16_t>(slot);
+      cache.lruTime[slot] = cache.clock;
+      misses.push_back({expert, slot});
     }
     if (misses.empty())
       return;
