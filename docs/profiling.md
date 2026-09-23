@@ -24,7 +24,9 @@ models/qwen4exp/bench/trace_report.py $S-trace.jsonl $S-out.jsonl $S-prompts.txt
 | `SPLASH_STEP_TIMING=1` | The same timing split as one stderr line per step | free |
 | `SPLASH_PROFILE_STEPS=N` | **GPU time per kernel** over N steps (each kernel in its own command, so slower than real) | one run |
 | `SPLASH_HC_REPEAT=n` (`_PARTS`) | Cost of the hyper-connection kernels, by running them n times (answers unchanged) | one run |
-| `SPLASH_ROUTE_LOG=path` + `simulate_cache.py` | Which experts each layer picked; **replays cache sizes and policies offline** | one run |
+| `SPLASH_ROUTE_LOG=path` + `cache_plan.py` | Which experts each layer picked; **replays eviction rules and an uneven split of the same memory**, and prints the split (`SPLASH_EXPERT_SLOTS`) | one run + ~1 min |
+| `SPLASH_ROUTE_LOG=path` + `simulate_cache.py` | Older replay: whole-cache sizes and policies | one run |
+| `[Verify Timing]` lines (`SPLASH_STEP_TIMING=1`) | **"predicted" is a running count of read-ahead reads**; with "misses" it gives total SSD reads a step | free |
 | `profile_steps.py` | Slowest steps and what they have in common | one run |
 | `compare_logits.py` | **Quality**: top-pick agreement and KL against the bf16 reference | ~5 min |
 | `check_decode_consistency.py` | Does decoding agree with prompt processing on the same text | ~2 min |
@@ -49,6 +51,19 @@ is fixed, so "what the model would have said" is known exactly. Measured accurac
 this replay: it predicted 39.5 tok/s for the chain-confidence stop; the real run gave
 39.1.
 
+## SSD reads: the number to watch
+
+A check step reads experts from the SSD in two ways:
+- **read-ahead**: experts predicted for the next layer, read while the GPU works;
+- **on demand**: experts the prediction missed; the GPU waits for these.
+
+Both use the same SSD bandwidth. On 2026-09-23 the step read **87 ahead + 46 on
+demand**; a third of the read-ahead was wasted (wrong guesses). Narrowing
+read-ahead to each row's top 6 predicted experts and splitting cache slots
+unevenly across layers brought it to **37 + 50**, +4% tok/s, same output.
+Replays (`cache_plan.py`) count reads without read-ahead, so use them to rank
+plans, then confirm with the engine.
+
 ## Pitfalls
 
 - **Noise is ±2% run to run** (SSD timing). Do not believe a 1% gain from one run.
@@ -56,6 +71,8 @@ this replay: it predicted 39.5 tok/s for the chain-confidence stop; the real run
 - **Tracing, logging and timing flags can slow a run.** Compare like with like.
 - **The first steps after loading are cold.** The 10-prompt suite runs on one warm engine.
 - **Compiling during a timed run skews it.** Do not build while measuring.
+- **Background apps skew it too.** Google Drive syncing this folder took a full
+  core and the SSD on 2026-09-23 (runs 3-4% slower). Alternate A and B runs.
 
 ## Where the time went on 2026-09-22 (qwen4exp, 10-prompt suite)
 

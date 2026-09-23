@@ -489,14 +489,19 @@ void countExpertUse(Qwen4ExpLayerExpertCache &cache, uint32_t expert) {
 }
 
 // The slot to evict: least used, then least recent, never one this step uses.
+// SPLASH_EXPERT_EVICT=lru ignores use counts (least recent only).
 int32_t pickVictim(const Qwen4ExpLayerExpertCache &cache) {
+  static const bool leastRecentOnly = [] {
+    const char *value = std::getenv("SPLASH_EXPERT_EVICT");
+    return value && std::string_view(value) == "lru";
+  }();
   int32_t best = -1;
   uint64_t bestKey = UINT64_MAX;
   for (uint32_t s = 0; s < cache.capacity; ++s) {
     if (cache.lruTime[s] == cache.clock) continue;
     if (cache.slotReads && cache.slotReads[s].load(std::memory_order_acquire)) continue;
     const int16_t expert = cache.slotToExpert[s];
-    const uint64_t count = expert >= 0 && !cache.frequency.empty()
+    const uint64_t count = expert >= 0 && !cache.frequency.empty() && !leastRecentOnly
                                ? cache.frequency[expert] : 0;
     const uint64_t key = (count << 32) | cache.lruTime[s];
     if (key < bestKey) { bestKey = key; best = static_cast<int32_t>(s); }
@@ -2066,12 +2071,14 @@ void Qwen4ExpTarget::addVerify(
     for (uint32_t r = 0; r < rows; ++r) {
       if (r % ExecutionLimits::targetVerifyRows >= buffers.liveRowsPerLane)
         continue;
-      // The router's own top-k. Prefetching 14 instead cut misses 23 -> 20
-      // a step but raised staging 15.6 -> 19.8 ms: the extra reads compete
-      // with the ones that matter. SPLASH_LOOKAHEAD_EXPERTS overrides.
+      // The predicted top 6 of each row's 10. The prediction is right for
+      // ~2/3 of its top 10, and every wrong guess is a wasted SSD read that
+      // competes with the reads that matter: 10 -> 6 cut reads 133 -> 95 a
+      // step and gave 38.6 -> 40.3 tok/s on the 10-prompt suite (5-8 tie;
+      // 12 and none are slower). SPLASH_LOOKAHEAD_EXPERTS overrides.
       static const uint32_t widened = [] {
         const char *value = std::getenv("SPLASH_LOOKAHEAD_EXPERTS");
-        return value ? static_cast<uint32_t>(std::atoi(value)) : 10u;
+        return value ? static_cast<uint32_t>(std::atoi(value)) : 6u;
       }();
       const uint32_t guesses = std::clamp(widened, 1u, 16u);
       uint32_t ids[16];

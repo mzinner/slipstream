@@ -3,6 +3,7 @@
 #include "Qwen4Exp.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <dispatch/dispatch.h>
@@ -283,10 +284,50 @@ Qwen4ExpCachePlan planQwen4ExpExpertCache(const Qwen4ExpLayout &layout,
   if (const char *envCap = getenv("SPLASH_EXPERT_CACHE_CAPACITY"))
     plan.capacity = std::max(16, std::atoi(envCap));
   plan.capacity = std::max<uint32_t>(plan.capacity, 16);
-  const uint32_t cachedLayers =
-      layout.layers - plan.residentLayers + (mtpLayer ? 1 : 0);
-  plan.pinnedBytes = 3 * expertStride *
-      (uint64_t{kPromptStagingExperts} + uint64_t{plan.capacity} * cachedLayers);
+  plan.layerCapacity.assign(layout.layers + 1, plan.capacity);
+  // A check step of 8 rows can route to 80 distinct experts in one layer.
+  constexpr uint32_t kMinimumSlots = 96;
+  // Some layers spread their routing over many more experts than others, so
+  // the same memory misses less when split unevenly. This profile was fitted
+  // by replaying Nitin's coding sessions (models/qwen4exp/bench/cache_plan.py)
+  // and checked on the 10-prompt suite, which it never saw: SSD reads 95 ->
+  // 87 a step, 39.7 -> 41.5 tok/s, same memory. SPLASH_EXPERT_SLOTS overrides;
+  // SPLASH_EXPERT_SLOTS=even gives every layer the same.
+  static constexpr std::array<uint16_t, 48> kSlotProfile = {
+      416, 352, 368, 272, 304, 304, 336, 336, 272, 272, 304, 272, 288, 272, 240, 192,
+      208, 256, 304, 240, 256, 288, 336, 272, 272, 256, 272, 224, 288, 288, 240, 208,
+      208, 256, 304, 240, 240, 272, 336, 224, 224, 256, 272, 224, 240, 256, 240, 256};
+  std::vector<double> weights(kSlotProfile.begin(), kSlotProfile.end());
+  const char *profile = getenv("SPLASH_EXPERT_SLOTS");
+  if (profile && std::string_view(profile) == "even") {
+    weights.assign(layout.layers, 1.0);
+  } else if (profile) {
+    weights.clear();
+    for (const char *cursor = profile; *cursor;) {
+      char *end = nullptr;
+      weights.push_back(std::strtod(cursor, &end));
+      if (end == cursor)
+        throw std::invalid_argument("SPLASH_EXPERT_SLOTS: expected numbers");
+      cursor = *end == ',' ? end + 1 : end;
+    }
+  }
+  if (weights.size() == layout.layers) {
+    double mean = 0.0;
+    for (uint32_t l = plan.residentLayers; l < layout.layers; ++l) mean += weights[l];
+    mean /= double(layout.layers - plan.residentLayers);
+    for (uint32_t l = plan.residentLayers; l < layout.layers; ++l)
+      plan.layerCapacity[l] = std::clamp<uint32_t>(
+          static_cast<uint32_t>(std::lround(plan.capacity * weights[l] / mean)),
+          kMinimumSlots, layout.experts);
+  } else if (profile) {
+    throw std::invalid_argument("SPLASH_EXPERT_SLOTS: need one weight per layer");
+  }
+  uint64_t slots = kPromptStagingExperts;
+  for (uint32_t l = plan.residentLayers; l < layout.layers; ++l)
+    slots += plan.layerCapacity[l];
+  if (mtpLayer)
+    slots += plan.layerCapacity[layout.layers];
+  plan.pinnedBytes = 3 * expertStride * slots;
   return plan;
 }
 
@@ -585,6 +626,7 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     const Qwen4ExpCachePlan cachePlan =
         planQwen4ExpExpertCache(layout, static_cast<bool>(result.mtpLayer));
     const uint32_t cacheCapacity = cachePlan.capacity;
+    auto capacityOf = [&](uint32_t l) { return cachePlan.layerCapacity[std::min(l, layout.layers)]; };
     // The cache is pinned: macOS cannot page it out. If it does not fit in
     // free memory, the machine freezes until its watchdog restarts it (twice
     // on 2026-09-22: two engines at once, then one asked for 60 GiB). The
@@ -599,7 +641,7 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
       const uint64_t available = hostAvailableBytes();
       constexpr double kGiB = double(1ULL << 30);
       std::cerr << "[Qwen4Exp] expert cache: " << cacheCapacity
-                << " experts per layer, pins " << double(cachePlan.pinnedBytes) / kGiB
+                << " experts per layer on average, pins " << double(cachePlan.pinnedBytes) / kGiB
                 << " GiB; free now " << double(available) / kGiB << " GiB\n";
       if (available < cachePlan.pinnedBytes + reserve) {
         std::ostringstream message;
@@ -611,7 +653,6 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
         throw std::runtime_error(message.str());
       }
     }
-    const uint64_t cacheBytes = uint64_t{cacheCapacity} * expertStride;
     {
       auto &staging = result.promptStaging;
       staging.capacity = kPromptStagingExperts;
@@ -626,13 +667,14 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     const uint32_t cachedLayers = layout.layers + (result.mtpLayer ? 1 : 0);
     for (uint32_t l = residentLayers; l < cachedLayers; ++l) {
       auto &cache = streamingLayer(l).expertCache;
-      cache.capacity = cacheCapacity;
+      cache.capacity = capacityOf(l);
+      const uint64_t cacheBytes = uint64_t{cache.capacity} * expertStride;
       cache.cacheGate = backend.allocateBuffer(cacheBytes, metal::BufferStorage::Shared, "layer-expert-gate");
       cache.cacheUp = backend.allocateBuffer(cacheBytes, metal::BufferStorage::Shared, "layer-expert-up");
       cache.cacheDown = backend.allocateBuffer(cacheBytes, metal::BufferStorage::Shared, "layer-expert-down");
       cache.expertToSlot.assign(layout.experts, -1);
-      cache.slotToExpert.assign(cacheCapacity, -1);
-      cache.lruTime.assign(cacheCapacity, 0);
+      cache.slotToExpert.assign(cache.capacity, -1);
+      cache.lruTime.assign(cache.capacity, 0);
       cache.numCached = 0;
       cache.clock = 0;
     }
@@ -643,11 +685,12 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     if (const char *envPre = getenv("SPLASH_PREWARM_EXPERTS")) {
       prewarmCount = std::atoi(envPre);
     }
-    const uint32_t prewarm = std::min(cacheCapacity, prewarmCount);
     dispatch_apply(streamingLayersCount, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t idx) {
       const uint32_t l = residentLayers + static_cast<uint32_t>(idx);
       auto &cache = streamingLayer(l).expertCache;
       const auto &layer = streamingLayer(l);
+      const uint64_t cacheBytes = uint64_t{cache.capacity} * expertStride;
+      const uint32_t prewarm = std::min(cache.capacity, prewarmCount);
       char *cg = static_cast<char *>(cache.cacheGate.contents());
       char *cu = static_cast<char *>(cache.cacheUp.contents());
       char *cd = static_cast<char *>(cache.cacheDown.contents());

@@ -19,11 +19,11 @@ what this model needs.
 | | |
 |---|---|
 | **Model** | Qwen3.8-Flash-Next, package `~/models/qwen38-flash-next-splash` (shared with Splash, unchanged) |
-| **Speed** | ~39–40 tok/s greedy on the 10-prompt suite (Splash: 36.4 at the start of the day); 45 tok/s on short answers |
+| **Speed** | ~41 tok/s greedy on the 10-prompt suite and on held-out coding sessions (Splash: 36.4 on 2026-09-22) |
 | **Quality** | Greedy output identical to Splash token for token; 91% same top pick as the bf16 reference |
 | **Removed from Splash** | two other models, the kernel tuner, the vision encoder, the unused DFlash draft (~19,300 lines, 1.45 GB less memory) |
 | **Layout** | Everything specific to this model is in `models/qwen4exp/`; the rest is shared (`docs/architecture.md`) |
-| **Next** | a better draft head, to push past ~45 tok/s |
+| **Next** | cheaper check steps: fewer SSD reads (see `docs/profiling.md`) |
 
 ## Words we can't avoid
 

@@ -1,5 +1,13 @@
 # Journal — qwen4exp port
 
+## 2026-09-23 06:10 PDT — claude-code
+
+Nitin chose "cheaper check steps". Found most SSD reads were read-ahead, a third
+wasted. Read-ahead 10 -> 6 and an uneven per-layer slot split (new
+bench/cache_plan.py; fitted on sessions, confirmed on the 10-prompt suite) give
++3-4% (41.4 / 40.9 tok/s), outputs identical, same memory. Google Drive syncing
+this folder costs ~3% in timed runs; alternate A/B runs.
+
 ## 2026-09-23 — claude-code
 
 Recorded 3M training + 0.3M held-out positions (2.7 h) and two greedy evaluation

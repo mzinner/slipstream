@@ -185,11 +185,15 @@ struct Qwen4ExpLayout final {
 // load (caches plus the prompt staging buffer). The loader allocates exactly
 // this; startup checks it against free memory first, so a second engine
 // started beside a running one refuses instead of freezing the machine.
-// Reads SPLASH_RESIDENT_LAYERS, SPLASH_EXPERT_CACHE_GIB and
-// SPLASH_EXPERT_CACHE_CAPACITY.
+// Reads SPLASH_RESIDENT_LAYERS, SPLASH_EXPERT_CACHE_GIB,
+// SPLASH_EXPERT_CACHE_CAPACITY and SPLASH_EXPERT_SLOTS (a per-layer profile:
+// 48 comma-separated weights; each layer gets capacity x weight / mean weight,
+// so the total stays the same).
 struct Qwen4ExpCachePlan final {
   uint32_t residentLayers = 0;
-  uint32_t capacity = 0;
+  uint32_t capacity = 0;  // the average per cached layer
+  // Slots per layer: trunk layers 0..47, then the MTP head's layer.
+  std::vector<uint32_t> layerCapacity;
   uint64_t pinnedBytes = 0;
 };
 [[nodiscard]] Qwen4ExpCachePlan planQwen4ExpExpertCache(const Qwen4ExpLayout &layout,

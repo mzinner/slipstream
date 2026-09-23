@@ -233,3 +233,14 @@ beating one needs 20-100x more data than this Mac can produce quickly. The
 recording mode, corpus, trainer and `trace_report --proposals` stay for a
 future attempt. Guesser design lessons: work at the model's width, start from
 its latest state, test with a copy task first. See docs/draft-head-plan.md.
+
+## 2026-09-23 — Read ahead 6 experts a row; split cache slots unevenly
+
+Each check step read 87 experts ahead (on a prediction that is right ~2/3 of
+the time) plus 46 on demand. Read-ahead 10 -> 6 per row and a per-layer slot
+profile (fitted on Nitin's sessions with cache_plan.py, same total memory) cut
+that to 37 + 50: +4% on the 10-prompt suite (39.7 -> 41.4) and +3% on held-out
+session prompts (39.6 -> 40.9), outputs identical. Plain least-recent eviction
+tied the current rule on session text, so the rule stays. Overrides:
+SPLASH_LOOKAHEAD_EXPERTS, SPLASH_EXPERT_SLOTS (=even for the old split),
+SPLASH_EXPERT_EVICT=lru.

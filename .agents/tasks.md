@@ -76,6 +76,9 @@
 - [x] Phase 4: `models/qwen4exp/` layout, checker rules, lint clean
 - [x] Draft head: survey and plan (docs/draft-head-plan.md)
 - [x] Draft head pilot: corpus, recording mode, trainer, scoring - no-go (25 vs 39 tok/s)
-- [ ] Next track - Nitin's choice: cheaper rows / rent GPUs for a guesser / benchmark round
+- [x] Next track: cheaper check steps (Nitin, 2026-09-23)
+- [x] Read-ahead 6 + uneven cache slots: +3-4%, outputs identical
+- [ ] Smarter read-ahead (rank/score margin, likely-kept rows)
+- [ ] Larger expert cache with the memory phase 3 freed
 - [ ] Optional: drop `install/` and Homebrew/release packaging
 - [ ] Optional: explicit model interface in place of `QwenTarget`

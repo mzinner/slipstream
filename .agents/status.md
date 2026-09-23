@@ -1,6 +1,6 @@
 # Status — Slipstream
 
-**Updated:** 2026-09-23 by claude-code
+**Updated:** 2026-09-23 06:10 PDT by claude-code
 **Branch:** `main` (local only; no remote. Never push to `incoai/splash`.)
 
 ## In one line
@@ -25,19 +25,17 @@ architecture check, 10/10 identical greedy outputs vs Splash on the real model
 
 ## Next
 
-1. **Draft-head pilot: no-go (2026-09-23).** A block guesser trained on this Mac
-   (3M positions of session text) scored 25 tok/s vs today's 39 at the same
-   anchors; today's head stays. Full write-up: `docs/draft-head-plan.md`. Tools
-   kept: engine recording mode, `models/qwen4exp/tools/{session_corpus,
-   feature_store,record_features,train_drafter,drafter_proposals}.py`,
-   `trace_report --proposals`. Data: `~/models/qwen38-flash-next-drafter-data`
-   (~27 GB; safe to delete, 3 h to regenerate).
-2. **Waiting on Nitin:** which way next - cheaper rows on the Mac (no training;
-   estimate ~42-44 tok/s), rent GPUs to train a guesser on far more text, or stop
-   at ~39-40 and resume the paused benchmark round.
-3. Re-measure speed on a cool machine: the last check read 38.3 tok/s after hours
-   of engine work (39.9 before; noise ±2%).
-4. Optional cleanup: drop `install/` and Homebrew packaging; explicit model
+1. **Cheaper check steps (Nitin chose this, 2026-09-23).** Done so far:
+   read-ahead 6 + uneven cache slots, +3-4% (41.4 tok/s on the 10-prompt
+   suite, 40.9 on session prompts). Still open, by expected value:
+   - read-ahead that skips experts a row is unlikely to use (rank or score
+     margin), or only for rows likely to be kept;
+   - a larger cache now that phase 3 freed 1.45 GB (check memory headroom at
+     the 58 GiB GPU limit and 128K context);
+   - fewer GPU-CPU hand-offs (~2 ms of host work a step).
+2. Draft-head pilot: no-go (docs/draft-head-plan.md); tools kept. Data in
+   `~/models/qwen38-flash-next-drafter-data` (~27 GB), safe to delete.
+3. Optional cleanup: drop `install/` and Homebrew packaging; explicit model
    interface in place of `QwenTarget`.
 
 ## Memory
