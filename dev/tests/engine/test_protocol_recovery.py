@@ -5,7 +5,6 @@ from itertools import product
 from unittest import mock
 
 from dev.tests.test_server import FakeRuntime, Harness, Plan
-from server import errors as api_errors
 from server import output as model_output
 from server import server as api
 from server import tool_schema
@@ -460,4 +459,3 @@ class ProtocolRecoveryTests(unittest.TestCase):
                         model_output.validate_tool_calls(calls, policy)
                 else:
                     model_output.validate_tool_calls(calls, policy)
-

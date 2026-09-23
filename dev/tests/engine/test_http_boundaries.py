@@ -5,7 +5,6 @@ from email.message import Message
 from pathlib import Path
 from unittest import mock
 
-
 from dev.tests.test_server import FakeRuntime, Harness
 from server import crash_trace, http_security
 from server.errors import APIError

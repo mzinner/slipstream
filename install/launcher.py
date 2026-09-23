@@ -18,8 +18,9 @@ try:
 except ImportError:  # Executed directly by the source or packaged entry point.
     import catalog
     import clients
-    import models as model_artifacts
     import paths
+
+    import models as model_artifacts
 
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME

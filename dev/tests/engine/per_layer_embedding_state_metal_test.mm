@@ -11,7 +11,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
-#include "metal/abi/PerLayerEmbedding.h"
+#include "models/qwen4exp/abi/PerLayerEmbedding.h"
 
 #include <cstdint>
 #include <cstring>

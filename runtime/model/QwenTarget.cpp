@@ -1,7 +1,7 @@
 #include "model/QwenTarget.hpp"
 
-#include "model/Qwen4Exp.hpp"
-#include "model/Qwen4ExpTarget.hpp"
+#include "models/qwen4exp/Qwen4Exp.hpp"
+#include "models/qwen4exp/Qwen4ExpTarget.hpp"
 
 #include "ops/Embedding.hpp"
 #include "ops/Normalization.hpp"

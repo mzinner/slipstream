@@ -12,9 +12,9 @@ fact that set the whole shape of this project.
 |---|---|
 | Source checkpoint | `~/models/qwen38-flash-next-bf16` — 338 GB, 131 shards, complete |
 | Tensor name prefix | `model.language_model.` (the 27B uses `language_model.model.`) |
-| Converter | `dev/tools/convert_qwen4exp.py` |
+| Converter | `models/qwen4exp/tools/convert_qwen4exp.py` |
 | 27B converter (format proof) | `dev/tools/convert_qwen38.py` |
-| Verification scripts | `dev/tools/checks/` |
+| Verification scripts | `models/qwen4exp/tools/checks/` |
 | Nitin's working V3 model | `~/models/qwen38-flash-next-v3` (GGUF, llama.cpp) |
 
 ## The file format is unforgiving, which is good

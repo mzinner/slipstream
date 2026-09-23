@@ -84,4 +84,3 @@ inline void q8_embedding_impl(device const uint *tokens,
 Q8_EMBEDDING_ENTRY(embedding_q8_h5120, 5120)
 Q8_EMBEDDING_ENTRY(embedding_q8_h2560, 2560)
 #undef Q8_EMBEDDING_ENTRY
-

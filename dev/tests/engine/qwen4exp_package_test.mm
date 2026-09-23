@@ -9,7 +9,7 @@
 #include "engine/MemoryPlan.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/ModelFactory.hpp"
-#include "model/Qwen4Exp.hpp"
+#include "models/qwen4exp/Qwen4Exp.hpp"
 
 #include <array>
 #include <cstring>

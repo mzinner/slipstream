@@ -13,6 +13,7 @@ this happened twice on 2026-09-22. This wrapper:
 
 Usage: dev/benchmarks/guarded.py [--floor-gib N] [--max-seconds S] -- <command> [args...]
 """
+
 import argparse
 import os
 import re
@@ -27,7 +28,9 @@ ENGINE_PROGRAMS = {"generate-sample", "splash", "llama-server", "splash-q8"}
 def other_engines():
     """Running engines, judged by program name (not by text in a command
     line, which would match any shell that merely mentions one)."""
-    out = subprocess.run(["ps", "-axo", "pid=,comm="], capture_output=True, text=True).stdout
+    out = subprocess.run(
+        ["ps", "-axo", "pid=,comm="], capture_output=True, text=True
+    ).stdout
     me = os.getpid()
     found = []
     for line in out.splitlines():
@@ -38,7 +41,9 @@ def other_engines():
         if name in ENGINE_PROGRAMS:
             found.append(line.strip())
         elif name.lower().startswith("python"):
-            args = subprocess.run(["ps", "-o", "args=", "-p", pid], capture_output=True, text=True).stdout
+            args = subprocess.run(
+                ["ps", "-o", "args=", "-p", pid], capture_output=True, text=True
+            ).stdout
             if "server.server" in args or "llama_cpp.server" in args:
                 found.append(f"{pid} {args.strip()[:100]}")
     return found
@@ -47,8 +52,18 @@ def other_engines():
 def free_gib():
     out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
     page = int(re.search(r"page size of (\d+)", out).group(1))
-    pages = {k: int(v) for k, v in re.findall(r"^(Pages [a-z ]+|File-backed pages):\s+(\d+)\.", out, re.M)}
-    usable = pages.get("Pages free", 0) + pages.get("Pages inactive", 0) + pages.get("Pages speculative", 0) + pages.get("Pages purgeable", 0)
+    pages = {
+        k: int(v)
+        for k, v in re.findall(
+            r"^(Pages [a-z ]+|File-backed pages):\s+(\d+)\.", out, re.M
+        )
+    }
+    usable = (
+        pages.get("Pages free", 0)
+        + pages.get("Pages inactive", 0)
+        + pages.get("Pages speculative", 0)
+        + pages.get("Pages purgeable", 0)
+    )
     return usable * page / 2**30
 
 
@@ -63,7 +78,11 @@ def main():
         ap.error("no command given")
     running = other_engines()
     if running:
-        print("guarded: another engine is running, not starting:\n  " + "\n  ".join(running), file=sys.stderr)
+        print(
+            "guarded: another engine is running, not starting:\n  "
+            + "\n  ".join(running),
+            file=sys.stderr,
+        )
         return 3
     proc = subprocess.Popen(cmd, start_new_session=True)
     lowest = free_gib()
@@ -74,12 +93,18 @@ def main():
         if now < a.floor_gib:
             os.killpg(proc.pid, signal.SIGKILL)
             proc.wait()
-            print(f"guarded: killed - free memory fell to {now:.1f} GiB (floor {a.floor_gib})", file=sys.stderr)
+            print(
+                f"guarded: killed - free memory fell to {now:.1f} GiB (floor {a.floor_gib})",
+                file=sys.stderr,
+            )
             return 4
         if time.monotonic() > deadline:
             os.killpg(proc.pid, signal.SIGKILL)
             proc.wait()
-            print(f"guarded: killed - still running after {a.max_seconds:.0f} s", file=sys.stderr)
+            print(
+                f"guarded: killed - still running after {a.max_seconds:.0f} s",
+                file=sys.stderr,
+            )
             return 5
         time.sleep(0.25)
     print(f"guarded: lowest free memory {lowest:.1f} GiB", file=sys.stderr)

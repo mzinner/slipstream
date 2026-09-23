@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ModelDescriptor.hpp"
-#include "Qwen4Exp.hpp"
+#include "models/qwen4exp/Qwen4Exp.hpp"
 #include "ops/Q8PageStorage.hpp"
 #include "ops/ExecutionPlans.hpp"
 

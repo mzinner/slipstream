@@ -214,10 +214,7 @@ class PdfProtocolTests(unittest.TestCase):
 
     def test_user_and_tool_files_share_one_request_budget(self):
         parts = documents.file_content(self.file, budget=documents.DocumentBudget())
-        size = sum(
-            len(p.get("text", "")) * 4
-            for p in parts
-        )
+        size = sum(len(p.get("text", "")) * 4 for p in parts)
         for dialect in ("chat", "responses"):
             with self.subTest(dialect=dialect):
                 if dialect == "chat":

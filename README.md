@@ -19,10 +19,11 @@ what this model needs.
 | | |
 |---|---|
 | **Model** | Qwen3.8-Flash-Next, package `~/models/qwen38-flash-next-splash` (shared with Splash, unchanged) |
-| **Speed** | ~39 tok/s greedy on the 10-prompt suite (Splash: 36.4 at the start of the day); 45 tok/s on short answers |
+| **Speed** | ~39–40 tok/s greedy on the 10-prompt suite (Splash: 36.4 at the start of the day); 45 tok/s on short answers |
 | **Quality** | Greedy output identical to Splash token for token; 91% same top pick as the bf16 reference |
-| **Removed from Splash** | two other models, the kernel tuner, the vision encoder (~14,100 lines) |
-| **Next** | remove the placeholder DFlash draft; move model code into `models/qwen4exp/` |
+| **Removed from Splash** | two other models, the kernel tuner, the vision encoder, the unused DFlash draft (~19,300 lines, 1.45 GB less memory) |
+| **Layout** | Everything specific to this model is in `models/qwen4exp/`; the rest is shared (`docs/architecture.md`) |
+| **Next** | a better draft head, to push past ~45 tok/s |
 
 ## Words we can't avoid
 
@@ -48,9 +49,10 @@ REPO=~/Documents/shared-with-google-drive/model-serving/slipstream \
 Build: `make` (engine), `make build/engine-tests/generate-sample` (test tool).
 Tests: `make check-native-cpu check-native-metal test-python`.
 
-**Memory:** at macOS's default GPU limit Slipstream starts with up to ~57K tokens
-of context (`CTX=57344`); the full 131K context needs the 58 GiB limit the launcher
-sets (`sudo`, once per boot).
+**Memory:** the launcher raises macOS's GPU memory limit to 58 GiB (`sudo`, once
+per boot). Without that, use a smaller expert cache: `CACHE_GIB=30` still starts
+with the full 128K context and costs a little speed. At the default limit, a 34 GiB
+cache leaves too little room and the server refuses to start.
 
 **Safety rule:** run every engine experiment through `dev/benchmarks/guarded.py -- <cmd>`.
 Two engines at once pin more memory than the Mac has and freeze it until its

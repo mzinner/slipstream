@@ -10,7 +10,7 @@ S=/tmp/run; P=$(python3 -c "import json;p=json.load(open('build/qwen4exp-speed-p
 echo "$P" > $S-prompts.txt
 SPLASH_TRACE=$S-trace.jsonl SPLASH_EXPERT_CACHE_GIB=34 dev/benchmarks/guarded.py -- \
   build/engine-tests/generate-sample build/splash.metallib ~/models/qwen38-flash-next-splash 256 "$P" > $S-out.jsonl
-dev/benchmarks/qwen4exp/trace_report.py $S-trace.jsonl $S-out.jsonl $S-prompts.txt
+models/qwen4exp/bench/trace_report.py $S-trace.jsonl $S-out.jsonl $S-prompts.txt
 ```
 
 ---
@@ -19,7 +19,7 @@ dev/benchmarks/qwen4exp/trace_report.py $S-trace.jsonl $S-out.jsonl $S-prompts.t
 
 | Tool | Answers | Cost |
 |---|---|---|
-| `dev/benchmarks/qwen4exp/speed_suite.py` | **Headline tok/s** over 10 varied prompts (greedy, or `--temperature 0.7`) | ~4 min |
+| `models/qwen4exp/bench/speed_suite.py` | **Headline tok/s** over 10 varied prompts (greedy, or `--temperature 0.7`) | ~4 min |
 | `SPLASH_TRACE=path` + `trace_report.py` | **Time per part, acceptance by depth, a cost model, and a replay of other guessing strategies** | one run |
 | `SPLASH_STEP_TIMING=1` | The same timing split as one stderr line per step | free |
 | `SPLASH_PROFILE_STEPS=N` | **GPU time per kernel** over N steps (each kernel in its own command, so slower than real) | one run |

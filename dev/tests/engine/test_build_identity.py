@@ -15,7 +15,7 @@ class BuildIdentityTests(unittest.TestCase):
     def test_copied_input_is_stable_and_content_sensitive(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            relative = Path("runtime/model/Qwen4Exp.hpp")
+            relative = Path("models/qwen4exp/Qwen4Exp.hpp")
             destination = root / relative
             destination.parent.mkdir(parents=True)
             shutil.copy2(build_identity.ROOT / relative, destination)

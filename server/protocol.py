@@ -954,24 +954,21 @@ def _encode_message(
         prompt = _words(message.prompt_tokens, "prompt tokens")
         temperature = _float32(message.sampling.temperature, "temperature")
         top_p = _float32(message.sampling.top_p, "top_p")
-        payload = (
-            _REQUEST.pack(
-                message.request_id,
-                int(message.priority),
-                int(message.cohort),
-                int(message.constraint),
-                message.absolute_deadline_unix_micros,
-                message.remaining_deadline_micros,
-                message.logical_max_output_tokens,
-                len(prompt),
-                temperature,
-                top_p,
-                message.sampling.top_k,
-                message.seed,
-                message.return_progress,
-            )
-            + _pack_words(prompt)
-        )
+        payload = _REQUEST.pack(
+            message.request_id,
+            int(message.priority),
+            int(message.cohort),
+            int(message.constraint),
+            message.absolute_deadline_unix_micros,
+            message.remaining_deadline_micros,
+            message.logical_max_output_tokens,
+            len(prompt),
+            temperature,
+            top_p,
+            message.sampling.top_k,
+            message.seed,
+            message.return_progress,
+        ) + _pack_words(prompt)
         frame_type = FrameType.REQUEST
     elif isinstance(message, CancelFrame):
         _raise_issue(_cancel_issue(message))

@@ -68,3 +68,13 @@
 - [ ] DFlash 2 draft training. No longer needed for speed: the model's own MTP
       head drafts. The zero placeholder stays because the package format needs one.
 
+## Slipstream
+
+- [x] Phase 1: other models and the tuner removed
+- [x] Phase 2: text only
+- [x] Phase 3: DFlash placeholder removed (−1.45 GB)
+- [x] Phase 4: `models/qwen4exp/` layout, checker rules, lint clean
+- [ ] Draft head: literature survey (incl. huggingface.co/papers/2609.26796), then plan
+- [ ] Optional: drop `install/` and Homebrew/release packaging
+- [ ] Optional: explicit model interface in place of `QwenTarget`
+

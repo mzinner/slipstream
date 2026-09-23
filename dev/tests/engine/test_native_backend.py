@@ -1,5 +1,4 @@
 import array
-import gc
 import queue
 import struct
 import threading
@@ -12,8 +11,8 @@ from server import backend as backend_api
 from server import constraints as generation_constraints
 from server import errors as api_errors
 from server import frontend as request_frontend
-from server import runtime
 from server import protocol as wire
+from server import runtime
 
 
 class FakeTokenizer:

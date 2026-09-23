@@ -1,5 +1,9 @@
 # Development
 
+> **Inherited from Splash.** For Slipstream, start with [README.md](README.md) and
+> [docs/architecture.md](docs/architecture.md). Sections about other models, Homebrew
+> packaging and the model installer describe Splash and are out of date here.
+
 Use Apple Silicon with macOS 26.4+, Xcode 26 or newer with Metal tools, and
 Python 3.12–3.14. Packaged users need none of these development tools.
 
@@ -51,7 +55,9 @@ New architectures require engine support; ordinary HF weights need conversion.
 - `server/`: OpenAI Chat/Responses, Anthropic Messages/count_tokens, templates,
   streaming and input processing. No client-version branches.
 - `runtime/engine/`: scheduling, memory admission and reusable request state.
-- `runtime/model/`: target/draft execution and vision.
+- `runtime/model/`: shared model runtime (state, arenas, drafting loop) and the
+  few files where a model plugs in.
+- `models/<name>/`: one model's layout, forward pass, own kernels and tools.
 - `runtime/ops/` and `runtime/metal/`: operators and Metal kernels.
 - `install/`: launcher, client configuration and model installation.
 - `dev/`: maintained tests, benchmarks and build/release tools.

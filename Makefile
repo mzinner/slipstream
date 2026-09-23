@@ -21,28 +21,32 @@ MODEL_ROOT := install/models/$(MODEL)
 BUILD := build
 TARGET := $(BUILD)/splash
 METAL_BUILD := $(BUILD)/metal
-# Production kernels are grouped by execution phase under
-# runtime/metal/kernels/{prefill,decode,shared}; every .metal file there is
-# compiled into the metallib. Templates both phases instantiate live in
-# kernels/common/, the host/shader contract in runtime/metal/abi/.
+# Shared kernels are grouped by execution phase under
+# runtime/metal/kernels/{prefill,decode,shared}; each model's own kernels live
+# in models/<name>/kernels/. Every .metal file in either place is compiled
+# into the metallib. Templates both phases instantiate live in
+# kernels/common/, the host/shader contract in runtime/metal/abi/ and
+# models/<name>/abi/.
 PRODUCTION_KERNEL_SOURCES := $(sort $(wildcard \
 	runtime/metal/kernels/prefill/*.metal \
 	runtime/metal/kernels/decode/*.metal \
 	runtime/metal/kernels/shared/*.metal))
+MODEL_KERNEL_SOURCES := $(sort $(wildcard models/*/kernels/*.metal))
 PRODUCTION_KERNEL_NAMES := \
 	$(patsubst runtime/metal/kernels/%.metal,%,$(PRODUCTION_KERNEL_SOURCES))
 PRODUCTION_AIRS := $(addprefix $(METAL_BUILD)/, \
-	$(addsuffix .air,$(PRODUCTION_KERNEL_NAMES)))
+	$(addsuffix .air,$(PRODUCTION_KERNEL_NAMES))) \
+	$(patsubst models/%.metal,$(METAL_BUILD)/models/%.air,$(MODEL_KERNEL_SOURCES))
 KERNEL_HEADERS := $(sort $(wildcard runtime/metal/abi/*.h \
-	runtime/metal/kernels/common/*.h))
+	runtime/metal/kernels/common/*.h models/*/abi/*.h))
 # Placement-sparse support became queryable in macOS 26.4
 # (MTLDevice.supportsPlacementSparse). The engine refuses older systems at
 # startup; every binary and metallib records the same floor.
 MACOS_MIN_VERSION := 26.4
 MACOS_TARGET_FLAG := -mmacosx-version-min=$(MACOS_MIN_VERSION)
-PROD_METALFLAGS := -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime \
+PROD_METALFLAGS := -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime -I. \
 	$(MACOS_TARGET_FLAG)
-ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime \
+ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime -I. \
 	$(MACOS_TARGET_FLAG)
 ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
 LIB := $(BUILD)/splash.metallib
@@ -161,6 +165,11 @@ $(METAL_BUILD)/%.air: runtime/metal/kernels/%.metal $(KERNEL_HEADERS) \
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $< -o $@
 
+$(METAL_BUILD)/models/%.air: models/%.metal $(KERNEL_HEADERS) \
+		| $(METAL_BUILD)
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $< -o $@
+
 $(LIB): $(PRODUCTION_AIRS)
 	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
 
@@ -224,9 +233,9 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/MemoryAudit.cpp \
 	runtime/engine/Status.cpp \
 	runtime/model/WeightStore.cpp \
-	runtime/model/Qwen4Exp.cpp \
+	models/qwen4exp/Qwen4Exp.cpp \
 	runtime/model/QwenTarget.cpp \
-	runtime/model/Qwen4ExpTarget.cpp \
+	models/qwen4exp/Qwen4ExpTarget.cpp \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/QwenState.cpp
 ENGINE_MM_SOURCES := \
@@ -237,7 +246,8 @@ ENGINE_MM_SOURCES := \
 	runtime/engine/RuntimeResources.mm \
 	runtime/engine/Bootstrap.mm
 ENGINE_OBJECTS := \
-	$(patsubst runtime/%.cpp,$(ENGINE_BUILD)/%.o,$(ENGINE_CPP_SOURCES)) \
+	$(patsubst runtime/%.cpp,$(ENGINE_BUILD)/%.o,$(filter runtime/%,$(ENGINE_CPP_SOURCES))) \
+	$(patsubst models/%.cpp,$(ENGINE_BUILD)/models/%.o,$(filter models/%,$(ENGINE_CPP_SOURCES))) \
 	$(patsubst runtime/%.mm,$(ENGINE_BUILD)/%.o,$(ENGINE_MM_SOURCES)) \
 	$(ENGINE_METAL_RUNTIME_OBJECT)
 PRODUCTION_CONFIG_TARGETS := $(ENGINE_OBJECTS) $(ENGINE_MAIN_OBJECT) \
@@ -260,6 +270,10 @@ $(BUILD_ID_HEADER): $(BUILD_ID_STAMP)
 	@:
 
 $(ENGINE_BUILD)/%.o: runtime/%.cpp
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_CXXFLAGS) $(ENGINE_DEPFLAGS) -c $< -o $@
+
+$(ENGINE_BUILD)/models/%.o: models/%.cpp
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_CXXFLAGS) $(ENGINE_DEPFLAGS) -c $< -o $@
 

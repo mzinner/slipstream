@@ -30,6 +30,7 @@ if __package__:
     from .models import ModelError, validate_repo_id
 else:  # Executed directly, e.g. `python install/catalog.py --refresh`.
     import paths
+
     from models import ModelError, validate_repo_id
 
 # The collection is the source of truth for which packages are official.

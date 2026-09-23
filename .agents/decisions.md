@@ -16,7 +16,7 @@ mlp hyper-connection        (norm -> mix-down -> mix-up)
 ```
 
 Residual width is 10240 = 4 streams of 2560. The check script is
-`dev/tools/checks/check_layer_composition.py` — re-run it if the forward path
+`models/qwen4exp/tools/checks/check_layer_composition.py` — re-run it if the forward path
 disagrees with the reference.
 
 **Why this matters:** every kernel was already verified against its own
@@ -130,7 +130,7 @@ Binding even a single 5 KB norm from a 1.42 GiB `WeightFile` forces Apple's IOGP
 
 > **Superseded (2026-09-22):** capacity is now 288 per layer (llama.cpp's 36 GiB budget, minus a 144-expert prompt staging buffer), eviction is least-used first, caches are mlock'd and in a GPU residency set.
 
-To eliminate copying 20+ active experts on every token step, each layer maintains an in-memory `Qwen4ExpLayerExpertCache` with dedicated `cacheGate`, `cacheUp`, and `cacheDown` `MTLBuffer`s of configurable capacity (default 64 experts per layer = 9.4 GiB across all 48 layers). 
+To eliminate copying 20+ active experts on every token step, each layer maintains an in-memory `Qwen4ExpLayerExpertCache` with dedicated `cacheGate`, `cacheUp`, and `cacheDown` `MTLBuffer`s of configurable capacity (default 64 experts per layer = 9.4 GiB across all 48 layers).
 - Active experts are mapped to persistent cache slots using `expertToSlot` and `slotToExpert` arrays.
 - Cache hits touch `lruTime[slot]` with zero copy overhead (0 ns).
 - Cache misses allocate the next free slot or evict the least-recently-used slot not used in the current step.
@@ -212,3 +212,14 @@ runtime governor) refused the normal 34 GiB setup, which leaves ~4 GiB.
 Merging down and up-mix needs every threadgroup to wait on the others
 mid-launch. Metal does not promise they all run at once, so it can deadlock
 the GPU. Three safe variants measured no faster.
+
+## 2026-09-22 — Model code lives in `models/<name>/` (Slipstream phase 4)
+
+A model folder holds its layout, loader, forward pass, own kernels, ABI headers,
+converter, checks and benchmarks. It may launch its own kernels; it may not
+depend on the engine or another model. Shared code reaches it only through four
+files (`ModelDescriptor.hpp`, `ModelFactory.hpp`, `QwenTarget.cpp`, `Runtime.mm`).
+`check_architecture.py` enforces this; the build fingerprint hashes `models/`.
+Kept `runtime/` as the shared root (no rename to `core/`): the rename adds churn
+and no checkable boundary. The installer and Homebrew packaging stay for now:
+they are wired into 13 tests, so removing them is its own step.

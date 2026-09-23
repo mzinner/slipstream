@@ -1,5 +1,14 @@
 # Journal — qwen4exp port
 
+## 2026-09-22 21:40 PDT — claude-code
+
+Phase 3 removed the placeholder DFlash draft (−1.45 GB). Phase 4 moved all
+qwen4exp code, kernels, ABI headers and Python tools into `models/qwen4exp/`;
+the checker now lets a model folder launch its own kernels and allows only 4
+shared plug-in files. Found and fixed: a phase-3 leftover make recipe, the build
+fingerprint ignoring model code, lint (108 → 0). All gates green, 10/10 identical,
+39.9 tok/s. Wrong README note fixed: at the default GPU limit use `CACHE_GIB=30`.
+
 ## 2026-09-22 20:00 PDT — claude-code
 
 Created Slipstream from Splash (local clone, origin removed). Phase 1 dropped two

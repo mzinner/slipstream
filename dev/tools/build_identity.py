@@ -27,6 +27,9 @@ def production_input_paths(root: Path = ROOT) -> tuple[str, ...]:
     for suffix in ("*.c", "*.cc", "*.cpp", "*.h", "*.hpp", "*.m", "*.mm"):
         sources.extend(source_root.rglob(suffix))
     sources.extend((source_root / "metal" / "kernels").rglob("*.metal"))
+    # Each model folder (models/<name>/) carries its own C++, ABI headers and kernels.
+    for suffix in ("*.c", "*.cc", "*.cpp", "*.h", "*.hpp", "*.m", "*.mm", "*.metal"):
+        sources.extend((root / "models").rglob(suffix))
     relative_sources = {path.relative_to(root).as_posix() for path in sources}
     return tuple(sorted(relative_sources | {"dev/tools/build_identity.py"}))
 

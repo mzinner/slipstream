@@ -65,14 +65,14 @@ test-models: install-development
 
 check-python-engine: install-development test-python test-models
 	$(PYTHON) -m compileall -q server install/*.py \
-		dev/tools dev/tests dev/benchmarks
+		dev/tools dev/tests dev/benchmarks models
 	$(PYTHON) -m ruff check --config dev/ruff.toml server \
-		install/*.py dev/tools dev/tests dev/benchmarks
+		install/*.py dev/tools dev/tests dev/benchmarks models
 	$(PYTHON) -m ruff format --check --config dev/ruff.toml server \
-		install/*.py dev/tools dev/tests dev/benchmarks
+		install/*.py dev/tools dev/tests dev/benchmarks models
 
 architecture-check:
-	$(BUILD_ID_PYTHON) dev/tools/check_architecture.py
+	$(PYTHON) dev/tools/check_architecture.py
 
 check: check-source check-native-engine check-python-engine
 

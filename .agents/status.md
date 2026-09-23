@@ -1,52 +1,52 @@
 # Status — Slipstream
 
-**Updated:** 2026-09-22 20:00 PDT by claude-code
+**Updated:** 2026-09-22 21:40 PDT by claude-code
 **Branch:** `main` (local only; no remote. Never push to `incoai/splash`.)
 
 ## In one line
 
-Slipstream is Splash cut down to Qwen3.8-Flash-Next (qwen4exp) and on its way to
-being a framework for the next model. Greedy output is identical to Splash; speed
-~38–39 tok/s on the 10-prompt suite; ~14,100 lines removed so far.
+Slipstream is Splash cut down to Qwen3.8-Flash-Next (qwen4exp), with everything
+specific to that model in `models/qwen4exp/`. Greedy output is identical to Splash;
+speed ~39–40 tok/s on the 10-prompt suite; ~19,300 lines and 1.45 GB of memory removed.
 
 ## Done
 
 | Phase | What | Commit |
 |---|---|---|
 | 1 | Dropped Qwen3.8 dense, Qwen3.6 MoE, the kernel tuner | 7160200 |
-| 2 | Text only: vision encoder, image protocol (v6), image cache keys, image server code; PDFs read as text | 114d979 |
-| docs | README, docs/architecture.md, docs/new-model-playbook.md, docs/profiling.md | (this commit) |
+| 2 | Text only: vision encoder, image protocol (v6), image server code; PDFs read as text | 114d979 |
+| docs | README, docs/architecture.md, docs/new-model-playbook.md, docs/profiling.md | 598123b |
+| 3 | Removed the placeholder DFlash draft (weights, draft context cache, hidden-state capture, draft kernels): −1.45 GB | 56e0bcd |
+| 4 | Model folder `models/qwen4exp/` (C++, own kernels, ABI headers, converter, checks, bench); checker rules for model folders; lint clean | (this commit) |
 
-Checks after each phase: native CPU and Metal gates, Python 383 + 168 + 41, 10/10
-identical greedy outputs vs Splash on the real model, server smoke test.
+Checks after each phase: native CPU and Metal gates, Python 383 + 168 + 41, lint,
+architecture check, 10/10 identical greedy outputs vs Splash on the real model
+(phase 4: 39.9 tok/s), server smoke test (17×23 → 391, sampled haiku, image refused).
 
 ## Next
 
-1. **Phase 3 — remove the placeholder DFlash draft.** Every DFlash path is already
-   guarded by `descriptor.draftPlaceholder`, so keeping only the placeholder branch
-   preserves behaviour. It reaches: `Runtime.mm` (context prefill/commit, draft batch
-   graph, draft rings), `DFlashDraft.*`, `DraftContextPlan.*`, `ops/DraftAttention.*`,
-   `draft.metal`, `draft_context.metal`, state layout (draft rings per state cell),
-   arenas (Draft* tensors, captured hidden rows), descriptor (draft layout,
-   capabilities), memory plan (draft weights), engine (draft context stats,
-   checkpoint spacing), tests (dflash/draft attention/selector/context plan).
-   Keep the shared verify path: proposed tokens, acceptance, retained rows (MTP uses it).
-   Expected gain: ~0.5–1 GB memory → a larger expert cache.
-2. **Phase 4 — framework layout.** `core/` (metal, ops, engine, runtime),
-   `models/qwen4exp/` (layout, loader, forward, kernels, converter, tools); an explicit
-   model interface in place of `QwenTarget`; allow model folders to launch their own
-   kernels in `check_architecture.py`; drop Homebrew/release packaging and installer;
-   fix the ~100 lint errors in one-off scripts (or delete the scripts).
+1. **Better draft head, to pass ~45 tok/s** (Nitin chose this, 2026-09-22). Start
+   with a literature survey (including https://huggingface.co/papers/2609.26796),
+   then a plan. Quality must hold: checking guesses keeps the model's exact output,
+   so re-run the identical-output check, the bf16 top-pick/KL check
+   (`models/qwen4exp/bench/compare_logits.py`) and the benchmarks.
+2. Optional cleanup: drop Homebrew/release packaging and `install/` (wired into 13
+   tests, so a step of its own); turn `QwenTarget` into an explicit model interface.
 3. Launcher: `~/models/bin/splash-flashnext-server.sh` serves Slipstream with
-   `REPO=<this folder>`; give Slipstream its own launcher once it replaces Splash.
+   `REPO=<this folder>`.
+
+## Memory
+
+The launcher raises macOS's GPU memory limit to 58 GiB (sudo, once per boot). At
+the default limit a 34 GiB expert cache does not leave room for context memory and
+the server refuses to start; `CACHE_GIB=30` starts with the full 128K context.
 
 ## Speed toward 50 tok/s
 
 Measured ceiling with this draft head and perfect stopping: ~45.6 tok/s. Each row
 checked costs ~7.35 ms (~16 extra SSD expert reads). Trees, runner-up guesses and
-prompt lookup all lose at that price. 50 needs a better-guessing draft head
-(training) or cheaper rows. Details: Splash `.agents/decisions.md`, trace tools in
-`docs/profiling.md`.
+prompt lookup all lose at that price. 50 needs a better-guessing draft head or
+cheaper rows. Trace tools: `docs/profiling.md`.
 
 ## Do not touch
 

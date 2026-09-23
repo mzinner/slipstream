@@ -1,6 +1,6 @@
 #include "model/Runtime.hpp"
-#include "model/Qwen4ExpTarget.hpp"
-#include "model/Qwen4Exp.hpp"
+#include "models/qwen4exp/Qwen4ExpTarget.hpp"
+#include "models/qwen4exp/Qwen4Exp.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"

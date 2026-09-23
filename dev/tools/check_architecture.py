@@ -27,7 +27,8 @@ OPERATOR_WORKSPACE_POLICY = re.compile(
 def production_sources() -> list[Path]:
     return sorted(
         path
-        for path in (ROOT / "runtime").rglob("*")
+        for root in ("runtime", "models")
+        for path in (ROOT / root).rglob("*")
         if path.is_file() and path.suffix in SOURCE_SUFFIXES
     )
 
@@ -77,9 +78,17 @@ def check() -> list[str]:
         if path.exists():
             errors.append(f"obsolete production directory exists: {relative(path)}")
 
-    forbidden_metal_dependencies = ("engine/", "model/")
+    forbidden_metal_dependencies = ("engine/", "model/", "models/")
     forbidden_model_dependencies = ("engine/",)
-    forbidden_operator_dependencies = ("engine/", "model/")
+    forbidden_operator_dependencies = ("engine/", "model/", "models/")
+    # Shared model code reaches a concrete model (models/<name>/) only here.
+    # A new model adds itself to these files and nowhere else in runtime/.
+    model_registry_sources = {
+        "runtime/model/ModelDescriptor.hpp",
+        "runtime/model/ModelFactory.hpp",
+        "runtime/model/QwenTarget.cpp",
+        "runtime/model/Runtime.mm",
+    }
     engine_assembly_sources = {
         "runtime/engine/Bootstrap.hpp",
         "runtime/engine/Bootstrap.mm",
@@ -88,8 +97,6 @@ def check() -> list[str]:
     }
     concrete_model_headers = (
         "model/ModelFactory.hpp",
-        "model/Qwen4Exp.hpp",
-        "model/Qwen4ExpTarget.hpp",
         "model/QwenState.hpp",
         "model/QwenTarget.hpp",
         "model/Runtime.hpp",
@@ -115,9 +122,22 @@ def check() -> list[str]:
             for include in includes:
                 if any(part in include for part in forbidden_model_dependencies):
                     errors.append(f"{name}: model depends on engine layer {include}")
+                if include.startswith("models/") and name not in model_registry_sources:
+                    errors.append(
+                        f"{name}: shared model code depends on concrete model {include}"
+                    )
             if re.search(r"\b(?:graph|commandGraph)\.add\s*\(", text):
                 errors.append(f"{name}: model dispatches a Metal pipeline directly")
-        if name.startswith(("runtime/model/", "runtime/engine/")):
+        if name.startswith("models/"):
+            # A model folder may launch its own kernels, but never reaches the
+            # engine or another model's folder.
+            own = "/".join(name.split("/")[:2]) + "/"
+            for include in includes:
+                if any(part in include for part in forbidden_model_dependencies):
+                    errors.append(f"{name}: model depends on engine layer {include}")
+                if include.startswith("models/") and not include.startswith(own):
+                    errors.append(f"{name}: model depends on another model {include}")
+        if name.startswith(("runtime/model/", "runtime/engine/", "models/")):
             if OPERATOR_WORKSPACE_POLICY.search(text):
                 layer = name.split("/")[1]
                 errors.append(f"{name}: {layer} owns an operator workspace policy")
@@ -129,13 +149,13 @@ def check() -> list[str]:
                     )
         if name.startswith("runtime/engine/") and name not in engine_assembly_sources:
             for include in includes:
-                if include in concrete_model_headers:
+                if include in concrete_model_headers or include.startswith("models/"):
                     errors.append(
                         f"{name}: engine policy depends on concrete model {include}"
                     )
         if name == "runtime/main.mm":
             for include in includes:
-                if include in concrete_model_headers:
+                if include in concrete_model_headers or include.startswith("models/"):
                     errors.append(
                         f"{name}: startup depends on concrete model {include}"
                     )

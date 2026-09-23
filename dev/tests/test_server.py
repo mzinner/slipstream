@@ -1,6 +1,5 @@
 import base64
 import concurrent.futures
-import hashlib
 import http.client
 import io
 import json

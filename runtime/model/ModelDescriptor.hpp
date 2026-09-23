@@ -1,7 +1,7 @@
 #pragma once
 
 #include "Model.hpp"
-#include "Qwen4Exp.hpp"
+#include "models/qwen4exp/Qwen4Exp.hpp"
 
 #include <array>
 #include <cstdint>

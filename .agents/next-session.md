@@ -9,9 +9,9 @@ framework for new models). First read `.agents/status.md`, the top 3 entries of
 `.agents/journal.md`, `.agents/memory.md`, `.agents/decisions.md`, then
 `docs/architecture.md`.
 
-Next task: phase 3 in status.md (remove the placeholder DFlash draft), then phase 4
-(framework layout). After every change: `make check-native-cpu check-native-metal
-test-python`, then the identical-output check on the real model (10-prompt suite,
-greedy, compare with a saved Splash run), all engine runs through
-`dev/benchmarks/guarded.py`. Commit per phase; write plain-language notes in
-`.agents/`.
+Next task: the better draft head (status.md "Next" 1): literature survey, then a
+plan, keeping output quality exactly the model's. After every change: `make
+check-native-cpu check-native-metal test-python`, then the identical-output check on
+the real model (10-prompt suite, greedy, compare with a saved Splash run), all
+engine runs through `dev/benchmarks/guarded.py`. Commit per step; write
+plain-language notes in `.agents/`.

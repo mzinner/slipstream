@@ -1,5 +1,5 @@
 ENGINE_TEST_BUILD := $(BUILD)/engine-tests
-ENGINE_TEST_CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev \
+ENGINE_TEST_CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -I. -Idev \
 	$(MACOS_TARGET_FLAG)
 # Test kernels compile like production ones without the release optimizer.
 TEST_METALFLAGS := $(filter-out -O3,$(PROD_METALFLAGS))
@@ -10,7 +10,7 @@ TEST_CONFIG_DIGEST := $(shell printf '%s\0' $(CONFIG_DIGEST) \
 	$(call shell-quote,$(TEST_METALFLAGS)) | shasum -a 256 | cut -c1-16)
 ENGINE_SANITIZER_BUILD := $(BUILD)/sanitizers
 ENGINE_SANITIZER_CXXFLAGS := -std=c++20 -O1 -g -fno-omit-frame-pointer \
-	-Wall -Wextra -Werror -Iruntime -Idev $(MACOS_TARGET_FLAG)
+	-Wall -Wextra -Werror -Iruntime -I. -Idev $(MACOS_TARGET_FLAG)
 SANITIZER_CONFIG_DIGEST := $(shell printf '%s\0' $(CONFIG_DIGEST) \
 	$(call shell-quote,$(ENGINE_SANITIZER_CXXFLAGS)) \
 	| shasum -a 256 | cut -c1-16)
@@ -25,9 +25,9 @@ BACKEND_CONTROL_SOURCES := \
 	runtime/engine/Engine.cpp
 MODEL_SOURCES := \
 	runtime/model/WeightStore.cpp \
-	runtime/model/Qwen4Exp.cpp \
+	models/qwen4exp/Qwen4Exp.cpp \
 	runtime/model/QwenTarget.cpp \
-	runtime/model/Qwen4ExpTarget.cpp \
+	models/qwen4exp/Qwen4ExpTarget.cpp \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/ModelDescriptor.mm
 MODEL_OPERATOR_SOURCES := \
@@ -194,11 +194,7 @@ $(TEST_KV_PAGE_CACHE_TEST): runtime/engine/KvPool.cpp \
 		dev/tests/engine/kv_page_cache_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
-		dev/benchmarks/PrefillWork.hpp \
-		dev/tests/engine/draft_context_plan_test.cpp | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
-
-$(TEST_QWEN4EXP_LAYOUT_TEST): runtime/model/Qwen4Exp.hpp \
+$(TEST_QWEN4EXP_LAYOUT_TEST): models/qwen4exp/Qwen4Exp.hpp \
 		dev/tests/engine/qwen4exp_layout_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 

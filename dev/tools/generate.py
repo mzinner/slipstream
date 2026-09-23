@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
 from transformers import AutoTokenizer
 
 
@@ -17,9 +18,7 @@ def main():
     )
     parser.add_argument("--metallib", default="build/splash.metallib")
     parser.add_argument("--binary", default="build/engine-tests/generate-sample")
-    parser.add_argument(
-        "--prompt", type=str, default="What is the capital of France?"
-    )
+    parser.add_argument("--prompt", type=str, default="What is the capital of France?")
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument(
         "--raw", action="store_true", help="Do not format with chat template"
@@ -39,7 +38,7 @@ def main():
             messages, tokenize=False, add_generation_prompt=True
         )
 
-    print(f"\n--- PROMPT ---")
+    print("\n--- PROMPT ---")
     print(prompt_text)
     print("----------------\n")
 

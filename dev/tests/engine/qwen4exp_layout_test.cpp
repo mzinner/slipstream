@@ -1,4 +1,4 @@
-#include "model/Qwen4Exp.hpp"
+#include "models/qwen4exp/Qwen4Exp.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/GDN.hpp"
 

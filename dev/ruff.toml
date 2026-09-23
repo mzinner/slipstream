@@ -5,3 +5,5 @@ select = ["E4", "E7", "E9", "F", "I"]
 
 [lint.per-file-ignores]
 "dev/tests/test_*.py" = ["E402"]
+# Verification scripts import the reference model only after loading weights.
+"models/*/tools/checks/*.py" = ["E402"]

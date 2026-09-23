@@ -329,7 +329,9 @@ class Frontend:
         template_kwargs = template_kwargs or {}
         if reasoning_effort is None:
             reasoning_effort = template_kwargs.get("reasoning_effort")
-        enable_thinking = body.get("enable_thinking", template_kwargs.get("enable_thinking"))
+        enable_thinking = body.get(
+            "enable_thinking", template_kwargs.get("enable_thinking")
+        )
         if enable_thinking is not None and not isinstance(enable_thinking, bool):
             raise APIError(400, "enable_thinking must be a boolean")
         if enable_thinking is False:
