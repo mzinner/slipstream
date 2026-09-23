@@ -32,8 +32,6 @@ using splash::model::WeightFileRecord;
 using splash::model::WeightStoreError;
 using splash::model::QwenAttentionWeights;
 using splash::model::QwenGdnWeights;
-using splash::model::Qwen3_8Layout;
-using splash::model::Qwen3_8Weights;
 using splash::ops::VisionLayout;
 using splash::model::kWeightFileAlignment;
 using splash::model::loadModelPackage;
@@ -43,11 +41,6 @@ using splash::metal::BufferStorage;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 
-constexpr std::string_view kDraftLayerMagic = "MDFD0004";
-constexpr std::string_view kTargetEmbeddingMagic = "MDFE0001";
-constexpr std::string_view kTargetHeadMagic = "MDFL0002";
-constexpr std::string_view kTargetLayerMagic = "MDFL0006";
-constexpr std::string_view kVisionMagic = "MDFV0001";
 
 [[noreturn]] void fail(const std::string &message) {
     std::cerr << "FAIL: " << message << '\n';
@@ -83,17 +76,6 @@ void requirePackedError(Function &&function, const std::string &message) {
 uint64_t alignPacked(uint64_t value) {
     return (value + kWeightFileAlignment - 1) &
         ~(kWeightFileAlignment - 1);
-}
-
-uint64_t checkedProduct(uint64_t left, uint64_t right) {
-    if (left && right > std::numeric_limits<uint64_t>::max() / left) {
-        fail("synthetic layout size overflow");
-    }
-    return left * right;
-}
-
-uint64_t q4Bytes(uint32_t outputSize, uint32_t inputSize) {
-    return checkedProduct(outputSize, inputSize) * 9 / 16;
 }
 
 uint64_t declaredBytes(std::span<const WeightFileRecord> records) {
@@ -168,146 +150,6 @@ uint64_t writeWeightFile(const std::filesystem::path &path,
     }
     close(descriptor);
     return fileBytes;
-}
-
-std::vector<uint64_t> targetLayerSections(
-    const Qwen3_8Layout &layout, bool full) {
-    constexpr uint64_t bf16 = 2;
-    std::vector<uint64_t> result{
-        uint64_t(layout.hiddenSize) * bf16,
-        q4Bytes(full ? layout.packedFullWidth : layout.packedGdnWidth,
-                layout.hiddenSize),
-    };
-    if (full) {
-        result.insert(result.end(), {
-            uint64_t(layout.attentionHeadDimension) * bf16,
-            uint64_t(layout.attentionHeadDimension) * bf16,
-            q4Bytes(layout.hiddenSize, layout.attentionWidth),
-        });
-    } else {
-        result.insert(result.end(), {
-            uint64_t(layout.convolutionDimension) * 4 * bf16,
-            uint64_t(layout.gdnValueHeads) * 4,
-            uint64_t(layout.gdnValueHeads) * bf16,
-            uint64_t(layout.gdnHeadDimension) * bf16,
-            q4Bytes(layout.hiddenSize, layout.attentionWidth),
-        });
-    }
-    result.insert(result.end(), {
-        uint64_t(layout.hiddenSize) * bf16,
-        q4Bytes(layout.intermediateSize, layout.hiddenSize),
-        q4Bytes(layout.intermediateSize, layout.hiddenSize),
-        q4Bytes(layout.hiddenSize, layout.intermediateSize),
-    });
-    return result;
-}
-
-std::vector<uint64_t> draftLayerSections(const DFlashDraftLayout &layout) {
-    constexpr uint64_t bf16 = 2;
-    return {
-        uint64_t(layout.hiddenSize) * bf16,
-        uint64_t(4) * layout.hiddenSize * bf16,
-        q4Bytes(layout.dynamicSize, layout.hiddenSize),
-        q4Bytes(layout.qkvSize, layout.hiddenSize),
-        uint64_t(layout.attentionHeadDimension) * bf16,
-        uint64_t(layout.attentionHeadDimension) * bf16,
-        q4Bytes(layout.hiddenSize, layout.attentionSize),
-        uint64_t(layout.hiddenSize) * bf16,
-        uint64_t(4) * layout.hiddenSize * bf16,
-        q4Bytes(layout.dynamicSize, layout.hiddenSize),
-        q4Bytes(layout.intermediateSize, layout.hiddenSize),
-        q4Bytes(layout.intermediateSize, layout.hiddenSize),
-        q4Bytes(layout.hiddenSize, layout.intermediateSize),
-    };
-}
-
-std::vector<uint64_t> visionSections(const VisionLayout &layout) {
-    constexpr uint64_t bf16 = 2;
-    auto affine = [&](uint64_t outputSize, uint64_t inputSize,
-                      std::vector<uint64_t> &sections) {
-        sections.push_back(outputSize * inputSize * bf16);
-        sections.push_back(outputSize * bf16);
-    };
-    auto norm = [&](std::vector<uint64_t> &sections) {
-        sections.push_back(uint64_t(layout.hiddenSize) * bf16);
-        sections.push_back(uint64_t(layout.hiddenSize) * bf16);
-    };
-    std::vector<uint64_t> result;
-    affine(layout.hiddenSize, layout.patchDimension, result);
-    result.push_back(uint64_t(layout.positionGridSide) *
-                     layout.positionGridSide * layout.hiddenSize * bf16);
-    for (uint32_t block = 0; block < layout.depth; ++block) {
-        norm(result);
-        affine(uint64_t(3) * layout.hiddenSize, layout.hiddenSize, result);
-        affine(layout.hiddenSize, layout.hiddenSize, result);
-        norm(result);
-        affine(layout.paddedIntermediateSize, layout.hiddenSize, result);
-        affine(layout.hiddenSize, layout.paddedIntermediateSize, result);
-    }
-    norm(result);
-    affine(layout.mergedHiddenSize, layout.mergedHiddenSize, result);
-    affine(layout.outputHiddenSize, layout.mergedHiddenSize, result);
-    return result;
-}
-
-struct SyntheticAccounting {
-    uint64_t targetBytes = 0;
-    uint64_t draftBytes = 0;
-    uint64_t visionBytes = 0;
-};
-
-SyntheticAccounting writeSyntheticPackage(
-    const std::filesystem::path &root, const Qwen3_8Layout &target,
-    const DFlashDraftLayout &draft, const VisionLayout &vision) {
-    SyntheticAccounting result;
-    for (uint32_t layer = 0; layer < target.layers; ++layer) {
-        bool full = target.isFullAttentionLayer(layer);
-        auto sections = targetLayerSections(target, full);
-        result.targetBytes += writeWeightFile(
-            root / "target" / ("layer-" + std::to_string(layer) + ".bin"),
-            kTargetLayerMagic, layer, full ? 1U : 0U, sections);
-    }
-    std::array<uint64_t, 2> headSections{
-        uint64_t(target.hiddenSize) * 2,
-        q4Bytes(target.vocabularySize, target.hiddenSize),
-    };
-    result.targetBytes += writeWeightFile(
-        root / "target/head.bin", kTargetHeadMagic, target.layers, 2,
-        headSections);
-    uint64_t embeddingElements =
-        uint64_t(target.vocabularySize) * target.hiddenSize;
-    std::array<uint64_t, 3> embeddingSections{
-        embeddingElements / 2,
-        embeddingElements / 32,
-        embeddingElements / 32,
-    };
-    result.targetBytes += writeWeightFile(
-        root / "target/embedding.bin", kTargetEmbeddingMagic,
-        target.vocabularySize, target.hiddenSize, embeddingSections);
-
-    for (uint32_t layer = 0; layer < draft.layers; ++layer) {
-        auto sections = draftLayerSections(draft);
-        result.draftBytes += writeWeightFile(
-            root / "draft" / ("layer-" + std::to_string(layer) + ".bin"),
-            kDraftLayerMagic, layer, 0, sections);
-    }
-    uint64_t codebookBytes =
-        uint64_t(draft.vocabularySize) * draft.selectorRank * 2;
-    std::array<uint64_t, 6> modelSections{
-        q4Bytes(draft.hiddenSize, draft.targetHiddenSize),
-        uint64_t(draft.hiddenSize) * 2,
-        uint64_t(draft.hiddenSize) * 2,
-        q4Bytes(draft.selectorRank, draft.hiddenSize),
-        codebookBytes,
-        codebookBytes,
-    };
-    result.draftBytes += writeWeightFile(
-        root / "draft/model.bin", kDraftLayerMagic, draft.layers, 1,
-        modelSections);
-    auto sections = visionSections(vision);
-    result.visionBytes += writeWeightFile(
-        root / "vision/model.bin", kVisionMagic, vision.depth, 0, sections);
-    return result;
 }
 
 bool addressIsMapped(void *address) {
@@ -466,127 +308,6 @@ void testWeightFileValidationAndLifetime(MetalBackend &backend,
         "unaligned packed file size was accepted");
 }
 
-void testSyntheticPackage(MetalBackend &backend,
-                          const std::filesystem::path &root) {
-    Qwen3_8Layout target;
-    target.layers = 4;
-    target.hiddenSize = 256;
-    target.vocabularySize = 256;
-    target.packedGdnWidth = 256;
-    target.packedFullWidth = 256;
-    target.convolutionDimension = 256;
-    target.gdnKeyHeads = 2;
-    target.gdnValueHeads = 4;
-    target.gdnHeadDimension = 64;
-    target.attentionWidth = 64;
-    target.intermediateSize = 256;
-    target.attentionQueryHeads = 1;
-    target.attentionKvHeads = 1;
-    target.attentionHeadDimension = 64;
-    target.fullAttentionPeriod = 4;
-
-    DFlashDraftLayout draft;
-    draft.layers = 2;
-    draft.hiddenSize = 256;
-    draft.vocabularySize = 256;
-    draft.dynamicSize = 256;
-    draft.qkvSize = 256;
-    draft.attentionSize = 64;
-    draft.intermediateSize = 256;
-    draft.attentionHeadDimension = 64;
-    draft.targetHiddenSize = target.capturedHiddenSize();
-    draft.selectorRank = 256;
-
-    VisionLayout vision;
-    vision.depth = 2;
-    vision.hiddenSize = 128;
-    vision.patchDimension = 1536;
-    vision.intermediateSize = 200;
-    vision.paddedIntermediateSize = 256;
-    vision.mergedHiddenSize = 512;
-    vision.outputHiddenSize = 256;
-    vision.heads = 2;
-    vision.headDimension = 64;
-    vision.positionGridSide = 4;
-
-    SyntheticAccounting expected =
-        writeSyntheticPackage(root, target, draft, vision);
-    uint64_t baseline = backend.memoryStats().allocatedBytes;
-    uint64_t actualTrackedBytes = 0;
-    {
-        auto package = loadModelPackage(
-            backend, root,
-            makeModelDescriptor("Qwen dense loader oracle", target, draft,
-                                vision));
-        const auto &loadedTarget = std::get<Qwen3_8Weights>(package.target);
-        require(loadedTarget.layers.size() == target.layers,
-                "target layer vector is incomplete");
-        require(package.draft.layers.size() == draft.layers,
-                "draft layer vector is incomplete");
-        require(std::holds_alternative<QwenGdnWeights>(
-                    loadedTarget.layers[0].mixer),
-                "target GDN layer has the wrong typed layout");
-        require(std::holds_alternative<QwenAttentionWeights>(
-                    loadedTarget.layers[3].mixer),
-                "target full-attention layer has the wrong typed layout");
-        require(loadedTarget.files.size() == target.layers + 2,
-                "target file records are incomplete");
-        require(package.draft.files.size() == draft.layers + 1,
-                "draft file records are incomplete");
-        require(declaredBytes(loadedTarget.files) == expected.targetBytes,
-                "target declared byte accounting is wrong");
-        require(declaredBytes(package.draft.files) == expected.draftBytes,
-                "draft declared byte accounting is wrong");
-        require(package.vision.tensors.blocks.size() == vision.depth &&
-                    package.vision.files.size() == 1 &&
-                    declaredBytes(package.vision.files) == expected.visionBytes,
-                "vision role records are incomplete");
-        require(loadedTarget.actualAllocatedBytes +
-                    package.draft.actualAllocatedBytes +
-                    package.vision.actualAllocatedBytes ==
-                    backend.memoryStats().allocatedBytes - baseline,
-                "actual package allocation accounting is wrong");
-        require(package.manifestFingerprintSha256.size() == 64,
-                "manifest SHA-256 has the wrong length");
-
-        std::vector<WeightFileRecord> records = loadedTarget.files;
-        records.insert(records.end(), package.draft.files.begin(),
-                       package.draft.files.end());
-        records.insert(records.end(), package.vision.files.begin(),
-                       package.vision.files.end());
-        require(weightManifestFingerprint(records) ==
-                    package.manifestFingerprintSha256,
-                "combined manifest fingerprint is not reproducible");
-        std::reverse(records.begin(), records.end());
-        require(weightManifestFingerprint(records) ==
-                    package.manifestFingerprintSha256,
-                "manifest fingerprint depends on load order");
-        records.front().declaredBytes += kWeightFileAlignment;
-        require(weightManifestFingerprint(records) !=
-                    package.manifestFingerprintSha256,
-                "manifest fingerprint ignores declared file sizes");
-
-        require(package.draft.layers[0].attentionDynamic.outputSize ==
-                        draft.dynamicSize &&
-                    package.draft.layers[0].downProjection.outputSize ==
-                        draft.hiddenSize,
-                "draft projections lost their logical dimensions");
-        actualTrackedBytes =
-            backend.memoryStats().allocatedBytes - baseline;
-        require(actualTrackedBytes >= expected.targetBytes +
-                                          expected.draftBytes +
-                                          expected.visionBytes,
-                "backend actual allocation accounting is below logical bytes");
-    }
-    require(backend.memoryStats().allocatedBytes == baseline,
-            "model package allocations survived package destruction");
-
-    std::cout << "synthetic declared_target=" << expected.targetBytes
-              << " declared_draft=" << expected.draftBytes
-              << " declared_vision=" << expected.visionBytes
-              << " actual_tracked=" << actualTrackedBytes << '\n';
-}
-
 void validateRealPackage(MetalBackend &backend,
                          const std::filesystem::path &root) {
     uint64_t baseline = backend.memoryStats().allocatedBytes;
@@ -634,7 +355,7 @@ void testRealPackageMetadata(const std::filesystem::path &root) {
     require(bool(input), "unable to read model manifest for format test");
     const std::string original{std::istreambuf_iterator<char>(input),
                                std::istreambuf_iterator<char>()};
-    const std::string_view originalPrefix = "splash-packed-q4";
+    const std::string_view originalPrefix = "splash-packed-q4-qwen4exp";
     const size_t offset = original.find(originalPrefix);
     require(offset != std::string::npos, "model manifest lacks a known format");
 
@@ -645,7 +366,7 @@ void testRealPackageMetadata(const std::filesystem::path &root) {
     const auto expected = splash::model::inspectModelPackage(root);
     for (std::string_view name : {std::string_view(expected.name),
                                   std::string_view("Community fine-tune")}) {
-        for (std::string_view prefix : {"splash-packed-q4", "unknown-packed-q4"}) {
+        for (std::string_view prefix : {"splash-packed-q4-qwen4exp", "unknown-packed-q4"}) {
             std::string manifest = original;
             manifest.replace(offset, originalPrefix.size(), prefix);
             const std::string originalName = '"' + expected.name + '"';
@@ -691,7 +412,6 @@ int main(int argc, const char *argv[]) {
         MetalBackend backend(argv[1]);
         TempDirectory temporary;
         testWeightFileValidationAndLifetime(backend, temporary.path());
-        testSyntheticPackage(backend, temporary.path() / "package");
         if (argc == 3) {
             testRealPackageMetadata(argv[2]);
             validateRealPackage(backend, argv[2]);

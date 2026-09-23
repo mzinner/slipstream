@@ -89,8 +89,8 @@ def check() -> list[str]:
     concrete_model_headers = (
         "model/DFlashDraft.hpp",
         "model/ModelFactory.hpp",
-        "model/Qwen3_6Moe.hpp",
-        "model/Qwen3_8.hpp",
+        "model/Qwen4Exp.hpp",
+        "model/Qwen4ExpTarget.hpp",
         "model/QwenState.hpp",
         "model/QwenTarget.hpp",
         "model/Runtime.hpp",

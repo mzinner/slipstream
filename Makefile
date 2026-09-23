@@ -225,9 +225,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/MemoryAudit.cpp \
 	runtime/engine/Status.cpp \
 	runtime/model/WeightStore.cpp \
-	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen4Exp.cpp \
-	runtime/model/Qwen3_8.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/QwenTarget.cpp \
 	runtime/model/Qwen4ExpTarget.cpp \

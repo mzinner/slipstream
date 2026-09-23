@@ -77,7 +77,7 @@ public:
       throw std::runtime_error("unable to create temporary model root");
     std::filesystem::create_directories(path_ / "tokenizer");
     std::ofstream config(path_ / "tokenizer" / "config.json");
-    config << R"({"text_config":{"model_type":"qwen3_5_text","max_position_embeddings":262144,"hidden_size":5120,"vocab_size":248320}})";
+    config << R"({"text_config":{"model_type":"qwen4_exp_text","max_position_embeddings":262144,"hidden_size":2560,"vocab_size":248320}})";
     if (!config)
       throw std::runtime_error("unable to write tokenizer config");
   }
@@ -98,7 +98,9 @@ private:
 std::string executionManifest(uint32_t draftRows = 8,
                               std::string_view extraGeometry = {}) {
   std::ostringstream out;
-  out << R"({"schema_version":3,"model":"Qwen3.8-27B-DFlash2","format":{"name":"splash-packed-q4","q4_bits":4,"q4_group_size":64,"q4_storage_n":256,"section_alignment_bytes":16384,"target_layer_magic":"MDFL0006","draft_layer_magic":"MDFD0004","vision_magic":"MDFV0001"},"execution_geometry":{)"
+  out << R"({"schema_version":5,"model":"Qwen3.8-Flash-Next","format":{"name":"splash-packed-q4-qwen4exp","q4_bits":4,"q8_bits":8,"quant_group_size":64,"storage_n":256,"expert_storage_n":128,"section_alignment_bytes":16384,"target_layer_magic":"MDFN0031","draft_layer_magic":"MDFD0004","vision_magic":"MDFV0001"},)"
+      << R"("target":{"architecture":"qwen4exp","layers":48,"hidden_size":2560,"vocabulary_size":248320,"gdn_actual_width":16480,"gdn_packed_width":16640,"attention_packed_width":13312,"experts":512,"experts_per_token":10,"moe_intermediate_size":640,"shared_expert_intermediate_size":640,"hyper_connection_count":4,"hyper_connection_low_rank":320,"indexer_heads":4,"indexer_kv_heads":1,"indexer_head_dim":128,"ngram_layer":1,"ngram_vocabulary_size":320001536,"ngram_embedding_size":2560,"layer_types":["gdn","gdn","gdn","attention","gdn","gdn","gdn","attention","gdn","gdn","gdn","attention","gdn","gdn","gdn","attention","gdn","gdn","gdn","attention","gdn","gdn","gdn","attention","gdn","gdn","gdn","attention","gdn","gdn","gdn","attention","gdn","gdn","gdn","attention","gdn","gdn","gdn","attention","gdn","gdn","gdn","attention","gdn","gdn","gdn","attention"]},)"
+      << R"("draft":{"architecture":"DFlash2DraftModel","layers":5,"hidden_size":2560,"intermediate_size":8704,"sliding_window":2048,"block_size":8,"dynamic_conv_group_size":16,"dynamic_conv_kernel_size":2,"selector_rank":256,"selector_top_k":16,"target_capture_layers":[3,13,23,33,43],"placeholder":true},"execution_geometry":{)"
       << R"("allocation_extent_target_bytes":134217728,)"
       << R"("draft_proposal_tokens":7,)"
       << "\"draft_query_rows\":" << draftRows << ','
@@ -144,16 +146,16 @@ void testInstalledManifestBindsExecutionGeometry() {
   }
 
   std::string wrongStorage = executionManifest();
-  const size_t storage = wrongStorage.find("\"q4_storage_n\":256");
+  const size_t storage = wrongStorage.find("\"storage_n\":256");
   require(storage != std::string::npos, "test manifest lost Q4 storage");
-  wrongStorage.replace(storage, std::string("\"q4_storage_n\":256").size(),
-                       "\"q4_storage_n\":128");
+  wrongStorage.replace(storage, std::string("\"storage_n\":256").size(),
+                       "\"storage_n\":128");
   root.write(wrongStorage);
   try {
     static_cast<void>(model::inspectModelPackage(root.path()));
     throw std::runtime_error("wrong Q4 storage was accepted");
   } catch (const std::invalid_argument &error) {
-    require(std::string_view(error.what()).find("q4_storage_n") !=
+    require(std::string_view(error.what()).find("storage_n") !=
                 std::string_view::npos,
             "Q4 storage mismatch did not identify the weight format");
   }

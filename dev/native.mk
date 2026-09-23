@@ -16,14 +16,6 @@ SANITIZER_CONFIG_DIGEST := $(shell printf '%s\0' $(CONFIG_DIGEST) \
 	| shasum -a 256 | cut -c1-16)
 # Offline kernel tuning lives outside the production library. The dev tool
 # and its tests compile these sources directly.
-TUNING_SOURCES := \
-	dev/tuning/Tuning.cpp \
-	dev/tuning/Measurement.cpp \
-	dev/tuning/LinearTuning.cpp \
-	dev/tuning/AttentionTuning.cpp \
-	dev/tuning/DraftAttentionTuning.cpp \
-	dev/tuning/MoeTuning.cpp \
-	dev/tuning/TuningWorkloads.cpp
 BACKEND_CONTROL_SOURCES := \
 	runtime/engine/Scheduler.cpp \
 	runtime/model/DraftContextPlan.cpp \
@@ -34,9 +26,7 @@ BACKEND_CONTROL_SOURCES := \
 	runtime/engine/Engine.cpp
 MODEL_SOURCES := \
 	runtime/model/WeightStore.cpp \
-	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen4Exp.cpp \
-	runtime/model/Qwen3_8.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/QwenTarget.cpp \
 	runtime/model/Qwen4ExpTarget.cpp \
@@ -57,10 +47,6 @@ TEST_BACKEND_ASAN := $(ENGINE_SANITIZER_BUILD)/kv-first-engine-asan-ubsan
 TEST_BACKEND_TSAN := $(ENGINE_SANITIZER_BUILD)/kv-first-engine-tsan
 TEST_FD_TRANSPORT_ASAN := $(ENGINE_SANITIZER_BUILD)/native-fd-asan-ubsan
 TEST_FD_TRANSPORT_TSAN := $(ENGINE_SANITIZER_BUILD)/native-fd-tsan
-TEST_OPERATOR_TUNING_ASAN := $(ENGINE_SANITIZER_BUILD)/operator-tuning-asan-ubsan
-TEST_OPERATOR_TUNING_TSAN := $(ENGINE_SANITIZER_BUILD)/operator-tuning-tsan
-TEST_OPERATOR_MEASUREMENT_ASAN := $(ENGINE_SANITIZER_BUILD)/operator-measurement-asan-ubsan
-TEST_OPERATOR_MEASUREMENT_TSAN := $(ENGINE_SANITIZER_BUILD)/operator-measurement-tsan
 TEST_MEMORY_TEST := $(ENGINE_TEST_BUILD)/engine-memory-plan
 TEST_DEVICE_QUERIES := $(ENGINE_TEST_BUILD)/device-queries
 TEST_KV_PAGE_CACHE_TEST := $(ENGINE_TEST_BUILD)/kv-page-cache
@@ -99,18 +85,10 @@ TEST_Q4_BATCH_TEST := $(ENGINE_TEST_BUILD)/q4-batched-projection
 TEST_MOE_METAL_TEST := $(ENGINE_TEST_BUILD)/moe-metal
 TEST_GDN_METAL_TEST := $(ENGINE_TEST_BUILD)/gdn-metal
 TEST_OPERATOR_WORKSPACE := $(ENGINE_TEST_BUILD)/operator-workspace
-TEST_OPERATOR_TUNING := $(ENGINE_TEST_BUILD)/operator-tuning
-TEST_OPERATOR_MEASUREMENT := $(ENGINE_TEST_BUILD)/operator-measurement
 TEST_EXECUTION_PLANS := $(ENGINE_TEST_BUILD)/execution-plans
 TEST_MODEL_EXECUTION_PLANS := $(ENGINE_TEST_BUILD)/model-execution-plans
 TEST_ATTENTION_PLAN := $(ENGINE_TEST_BUILD)/paged-attention-plan
 TEST_LINEAR_PLAN := $(ENGINE_TEST_BUILD)/linear-plan
-TEST_LINEAR_TUNING := $(ENGINE_TEST_BUILD)/linear-tuning
-TEST_ATTENTION_TUNING := $(ENGINE_TEST_BUILD)/attention-tuning
-TEST_DRAFT_ATTENTION_TUNING := $(ENGINE_TEST_BUILD)/draft-attention-tuning
-TEST_MOE_TUNING := $(ENGINE_TEST_BUILD)/moe-tuning
-TEST_TUNING_WORKLOADS := $(ENGINE_TEST_BUILD)/tuning-workloads
-TUNE_KERNELS := $(ENGINE_TEST_BUILD)/tune-kernels
 TEST_DFLASH_BATCH_CONTROL_TEST := $(ENGINE_TEST_BUILD)/dflash-batch-control
 TEST_DRAFT_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/draft-attention
 TEST_GDN_DECODE_TEST := $(ENGINE_TEST_BUILD)/gdn-decode
@@ -139,11 +117,6 @@ TEST_METAL_BACKEND_LIB := $(ENGINE_TEST_BUILD)/metal-backend.metallib
 
 TEST_CPU_TARGETS := $(TEST_OPERATOR_WORKSPACE) \
 	$(TEST_DEVICE_QUERIES) \
-	$(TEST_TUNING_WORKLOADS) \
-	$(TEST_LINEAR_TUNING) $(TEST_ATTENTION_TUNING) \
-	$(TEST_DRAFT_ATTENTION_TUNING) $(TEST_MOE_TUNING) \
-	$(TEST_OPERATOR_TUNING) \
-	$(TEST_OPERATOR_MEASUREMENT) \
 	$(TEST_EXECUTION_PLANS) \
 	$(TEST_MODEL_EXECUTION_PLANS) \
 	$(TEST_MEMORY_TEST) \
@@ -164,11 +137,7 @@ TEST_CPU_TARGETS := $(TEST_OPERATOR_WORKSPACE) \
 	$(TEST_STATUS_TEST) \
 	$(TEST_Q8_CPU_TEST)
 
-TEST_METAL_TARGETS := $(TEST_TUNING_WORKLOADS) \
-	$(TEST_LINEAR_TUNING) \
-	$(TEST_ATTENTION_TUNING) \
-	$(TEST_DRAFT_ATTENTION_TUNING) \
-	$(TEST_MOE_TUNING) \
+TEST_METAL_TARGETS := \
 	$(TEST_ATTENTION_PLAN) \
 	$(TEST_LINEAR_PLAN) \
 	$(TEST_RESOURCES_TEST) \
@@ -206,20 +175,18 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(TEST_UNIT_TEST_TARGETS)) \
 	$(TEST_DECODE_PROFILE) $(TEST_GENERATE_SAMPLE) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_METAL_BACKEND_AIR)
 PRODUCTION_CONFIG_TARGETS += $(TEST_Q4_PREFILL_PROFILE) \
-	$(TEST_Q4_DECODE_PROFILE) $(TEST_BACKEND_BENCHMARK) $(TUNE_KERNELS)
+	$(TEST_Q4_DECODE_PROFILE) $(TEST_BACKEND_BENCHMARK)
 SANITIZER_CONFIG_TARGETS := $(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN) \
-	$(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN) \
-	$(TEST_OPERATOR_TUNING_ASAN) $(TEST_OPERATOR_TUNING_TSAN) \
-	$(TEST_OPERATOR_MEASUREMENT_ASAN) $(TEST_OPERATOR_MEASUREMENT_TSAN)
+	$(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN)
 
 # These binaries compile runtime, tuning and test sources directly. Header
 # prerequisites and the force dependency are not compiler input files.
 ENGINE_TEST_HEADERS := $(filter %.h %.hpp,$(PRODUCTION_ENGINE_INPUTS)) \
-	$(wildcard dev/tuning/*.hpp dev/tests/engine/*.hpp)
+	$(wildcard dev/tests/engine/*.hpp)
 TEST_INPUTS = $(filter-out %.h %.hpp %.metallib,$(BUILD_INPUTS))
 $(filter-out %.air %.metallib,$(TEST_CONFIG_TARGETS)) \
 	$(TEST_Q4_PREFILL_PROFILE) $(TEST_Q4_DECODE_PROFILE) \
-	$(TEST_BACKEND_BENCHMARK) $(TUNE_KERNELS) $(SANITIZER_CONFIG_TARGETS): \
+	$(TEST_BACKEND_BENCHMARK) $(SANITIZER_CONFIG_TARGETS): \
 	$(ENGINE_TEST_HEADERS)
 
 $(ENGINE_TEST_BUILD):
@@ -248,7 +215,6 @@ $(TEST_DRAFT_CONTEXT_PLAN_TEST): runtime/model/DraftContextPlan.cpp \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 $(TEST_QWEN4EXP_LAYOUT_TEST): runtime/model/Qwen4Exp.hpp \
-		runtime/model/Qwen3_8.hpp \
 		dev/tests/engine/qwen4exp_layout_test.cpp | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
@@ -459,13 +425,7 @@ $(TEST_OPERATOR_WORKSPACE): dev/tests/engine/operator_workspace_test.cc \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_OPERATOR_TUNING): dev/tuning/Tuning.cpp \
-		dev/tests/engine/operator_tuning_test.cpp | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
-$(TEST_OPERATOR_MEASUREMENT): dev/tuning/Tuning.cpp dev/tuning/Measurement.cpp \
-		dev/tests/engine/operator_measurement_test.cpp | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
 $(TEST_EXECUTION_PLANS): dev/tests/engine/execution_plans_test.cc \
 		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
@@ -477,43 +437,15 @@ $(TEST_MODEL_EXECUTION_PLANS): dev/tests/engine/model_execution_plan_test.cpp \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_LINEAR_TUNING): dev/tests/engine/linear_tuning_test.cc $(TUNING_SOURCES) \
-		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) \
-		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_ATTENTION_TUNING): dev/tests/engine/attention_tuning_test.cc $(TUNING_SOURCES) \
-		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) \
-		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_DRAFT_ATTENTION_TUNING): dev/tests/engine/draft_attention_tuning_test.cc $(TUNING_SOURCES) \
-		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) \
-		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_MOE_TUNING): dev/tests/engine/moe_tuning_test.mm $(TUNING_SOURCES) \
-		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
-		$(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_TUNING_WORKLOADS): dev/tests/engine/tuning_workloads_test.cpp $(TUNING_SOURCES) \
-		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) \
-		$(ENGINE_LINKFLAGS) -o $@
 
-$(TUNE_KERNELS): dev/tuning/tune_kernels.mm $(TUNING_SOURCES) \
-		$(ENGINE_LIBRARY) $(BUILD_ID_HEADER) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_CXXFLAGS) -Idev -fobjc-arc -include $(BUILD_ID_HEADER) \
-		$(filter-out $(BUILD_ID_HEADER),$(TEST_INPUTS)) \
-		$(ENGINE_LINKFLAGS) -o $@
 
 # Offline kernel measurement for this device and model: reports every key
 # where a precompiled candidate beats the policy default in runtime/ops.
 # Run on an idle host after a kernel or policy change.
-.PHONY: tune-kernels
-tune-kernels: preflight $(TARGET) $(TUNE_KERNELS) $(LIB)
-	$(TUNE_KERNELS) $(LIB) $(MODEL_ROOT) $(TUNE_ARGS)
 
 $(TEST_ATTENTION_PLAN): runtime/metal/DeviceCapabilities.cpp \
 		runtime/metal/MetalBackend.mm runtime/ops/PagedAttention.cpp \
@@ -642,18 +574,10 @@ verify-build-identity: $(TARGET) $(BUILD_ID_HEADER) $(BUILD_ID_STAMP)
 METAL_TEST_ENV := MTL_SHADER_VALIDATION=1
 test-engine: test-engine-cpu test-engine-metal
 
-test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS)
+test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP)
 	$(TEST_DEVICE_QUERIES)
-	$(TEST_TUNING_WORKLOADS)
-	$(TEST_LINEAR_TUNING) --cpu
-	$(TEST_ATTENTION_TUNING)
-	$(TEST_DRAFT_ATTENTION_TUNING)
-	$(TEST_MOE_TUNING) --cpu
 	/bin/sh dev/tests/attention_sweep_cli.sh $(TEST_ATTENTION_SWEEP)
-	/bin/sh dev/tests/tune_kernels_cli.sh $(TUNE_KERNELS)
 	$(TEST_OPERATOR_WORKSPACE)
-	$(TEST_OPERATOR_TUNING)
-	$(TEST_OPERATOR_MEASUREMENT)
 	$(TEST_EXECUTION_PLANS)
 	$(TEST_MODEL_EXECUTION_PLANS)
 	$(TEST_MEMORY_TEST)
@@ -675,11 +599,6 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS)
 	$(TEST_Q8_CPU_TEST)
 
 test-engine-metal: $(TEST_METAL_TARGETS)
-	$(METAL_TEST_ENV) $(TEST_TUNING_WORKLOADS) $(LIB)
-	$(METAL_TEST_ENV) $(TEST_LINEAR_TUNING) $(LIB)
-	$(METAL_TEST_ENV) $(TEST_ATTENTION_TUNING) --metal $(LIB)
-	$(METAL_TEST_ENV) $(TEST_DRAFT_ATTENTION_TUNING) --metal $(LIB)
-	$(METAL_TEST_ENV) $(TEST_MOE_TUNING) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_PLAN) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_LINEAR_PLAN) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_RESOURCES_TEST) $(LIB)
@@ -762,29 +681,13 @@ $(TEST_FD_TRANSPORT_TSAN): $(BACKEND_CONTROL_SOURCES) \
 		dev/tests/engine/native_fd_transport_test.cpp | $(ENGINE_SANITIZER_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=thread $(TEST_INPUTS) -o $@
 
-$(TEST_OPERATOR_TUNING_ASAN): dev/tuning/Tuning.cpp \
-		dev/tests/engine/operator_tuning_test.cpp | $(ENGINE_SANITIZER_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=address,undefined \
-		$(TEST_INPUTS) -o $@
 
-$(TEST_OPERATOR_TUNING_TSAN): dev/tuning/Tuning.cpp \
-		dev/tests/engine/operator_tuning_test.cpp | $(ENGINE_SANITIZER_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=thread $(TEST_INPUTS) -o $@
 
-$(TEST_OPERATOR_MEASUREMENT_ASAN): dev/tuning/Tuning.cpp dev/tuning/Measurement.cpp \
-		dev/tests/engine/operator_measurement_test.cpp | $(ENGINE_SANITIZER_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=address,undefined \
-		$(TEST_INPUTS) -o $@
 
-$(TEST_OPERATOR_MEASUREMENT_TSAN): dev/tuning/Tuning.cpp dev/tuning/Measurement.cpp \
-		dev/tests/engine/operator_measurement_test.cpp | $(ENGINE_SANITIZER_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_SANITIZER_CXXFLAGS) -fsanitize=thread $(TEST_INPUTS) -o $@
 
 .PHONY: test-sanitizers
 test-sanitizers: $(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN) \
-		$(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN) \
-		$(TEST_OPERATOR_TUNING_ASAN) $(TEST_OPERATOR_TUNING_TSAN) \
-		$(TEST_OPERATOR_MEASUREMENT_ASAN) $(TEST_OPERATOR_MEASUREMENT_TSAN)
+		$(TEST_FD_TRANSPORT_ASAN) $(TEST_FD_TRANSPORT_TSAN)
 	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
 		UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 		$(TEST_BACKEND_ASAN)
@@ -793,11 +696,3 @@ test-sanitizers: $(TEST_BACKEND_ASAN) $(TEST_BACKEND_TSAN) \
 		UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 		$(TEST_FD_TRANSPORT_ASAN)
 	TSAN_OPTIONS=halt_on_error=1 $(TEST_FD_TRANSPORT_TSAN)
-	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
-		UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-		$(TEST_OPERATOR_TUNING_ASAN)
-	TSAN_OPTIONS=halt_on_error=1 $(TEST_OPERATOR_TUNING_TSAN)
-	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
-		UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-		$(TEST_OPERATOR_MEASUREMENT_ASAN)
-	TSAN_OPTIONS=halt_on_error=1 $(TEST_OPERATOR_MEASUREMENT_TSAN)

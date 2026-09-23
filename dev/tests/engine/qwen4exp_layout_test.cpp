@@ -1,5 +1,4 @@
 #include "model/Qwen4Exp.hpp"
-#include "model/Qwen3_8.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/GDN.hpp"
 
@@ -50,24 +49,10 @@ void packedWidthsFollowFromTheConcatenation() {
                 "conv width is 2*k + v head widths");
 }
 
-// Three layers in four are linear attention, and their mixer geometry is
-// identical to the Qwen3.8 GDN block apart from the hidden size. This is the
-// reason the existing GDN kernels carry most of the model.
-void linearAttentionMatchesQwen38() {
+// Three layers in four are linear attention (the shared GDN kernels), one in
+// four full attention.
+void linearAttentionLayers() {
   constexpr Qwen4ExpLayout next;
-  constexpr Qwen3_8Layout dense;
-
-  static_assert(next.convolutionDimension == dense.convolutionDimension);
-  static_assert(next.gdnKeyHeads == dense.gdnKeyHeads);
-  static_assert(next.gdnValueHeads == dense.gdnValueHeads);
-  static_assert(next.gdnHeadDimension == dense.gdnHeadDimension);
-  static_assert(next.attentionWidth == dense.attentionWidth);
-  static_assert(next.attentionHeadDimension == dense.attentionHeadDimension);
-  static_assert(next.attentionQueryHeads == dense.attentionQueryHeads);
-  static_assert(next.fullAttentionPeriod == dense.fullAttentionPeriod);
-  static_assert(next.vocabularySize == dense.vocabularySize);
-  static_assert(next.packedGdnWidth == dense.packedGdnWidth,
-                "both models pad the GDN concatenation to the same width");
 
   // 48 layers at period 4 gives 12 attention layers and 36 linear ones.
   static_assert(next.attentionLayerCount() == 12);
@@ -211,7 +196,7 @@ void stateLayoutsAreConsistent() {
 int main() {
   try {
     packedWidthsFollowFromTheConcatenation();
-    linearAttentionMatchesQwen38();
+    linearAttentionLayers();
     supportedProjectionsAreQ4Aligned();
     gdnShapeIsAlreadyCompiled();
     expertProjectionsTileAt128();

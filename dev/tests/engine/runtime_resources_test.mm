@@ -48,9 +48,19 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
   RuntimeResourcesConfig config;
   config.metallibPath = metallibPath;
   config.modelRoot = root.path;
+  // The placeholder draft the qwen4exp package declares.
+  model::DFlashDraftLayout draft;
+  draft.layers = 5;
+  draft.hiddenSize = 2560;
+  draft.dynamicSize = 768;
+  draft.qkvSize = 3072;
+  draft.attentionSize = 2048;
+  draft.intermediateSize = 8704;
+  draft.targetHiddenSize = model::Qwen4ExpLayout{}.capturedHiddenSize();
+  ops::VisionLayout vision;
+  vision.outputHiddenSize = draft.hiddenSize;
   config.model = model::makeModelDescriptor(
-      "budget-test", model::Qwen3_8Layout{}, model::DFlashDraftLayout{},
-      ops::VisionLayout{});
+      "budget-test", model::Qwen4ExpLayout{}, draft, vision);
   config.buildId = "budget-test";
 
   // Each low ceiling fits two components, so every directory must be counted.

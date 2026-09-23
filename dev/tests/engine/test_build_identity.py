@@ -15,7 +15,7 @@ class BuildIdentityTests(unittest.TestCase):
     def test_copied_input_is_stable_and_content_sensitive(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            relative = Path("runtime/model/Qwen3_8.hpp")
+            relative = Path("runtime/model/Qwen4Exp.hpp")
             destination = root / relative
             destination.parent.mkdir(parents=True)
             shutil.copy2(build_identity.ROOT / relative, destination)
@@ -161,9 +161,9 @@ class CompileConfigurationTests(unittest.TestCase):
     FLAG_SETS = (
         ("ENGINE_CXXFLAGS", "engine/engine/Status.o"),
         ("PROD_METALFLAGS", "metal/shared/rope.air"),
-        ("ENGINE_TEST_CXXFLAGS", "engine-tests/operator-tuning"),
+        ("ENGINE_TEST_CXXFLAGS", "engine-tests/protocol"),
         ("TEST_METALFLAGS", "engine-tests/metal-backend.air"),
-        ("ENGINE_SANITIZER_CXXFLAGS", "sanitizers/operator-tuning-asan-ubsan"),
+        ("ENGINE_SANITIZER_CXXFLAGS", "sanitizers/native-fd-asan-ubsan"),
     )
 
     def make(self, *arguments):
@@ -266,7 +266,7 @@ class CompileConfigurationTests(unittest.TestCase):
                 "engine-tests/vision-encoder",
                 "engine-tests/attention-sweep",
                 "engine-tests/metal-backend.metallib",
-                "sanitizers/operator-tuning-asan-ubsan",
+                "sanitizers/native-fd-asan-ubsan",
                 "engine-tests/backend-benchmark",
             )
             targets = [str(build / name) for name in outputs]

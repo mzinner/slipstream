@@ -25,13 +25,14 @@ model::ModelPackage package() {
   model::ModelPackage result;
   Weights target;
   model::DFlashDraftLayout draft;
-  if constexpr (std::is_same_v<Weights, model::Qwen3_6MoeWeights>) {
-    draft.layers = 6;
-    draft.hiddenSize = 2048;
-    draft.dynamicSize = 512;
-    draft.intermediateSize = 6144;
-    draft.targetHiddenSize = target.layout.capturedHiddenSize();
-  }
+  // The placeholder draft the qwen4exp package declares.
+  draft.layers = 5;
+  draft.hiddenSize = 2560;
+  draft.dynamicSize = 768;
+  draft.qkvSize = 3072;
+  draft.attentionSize = 2048;
+  draft.intermediateSize = 8704;
+  draft.targetHiddenSize = target.layout.capturedHiddenSize();
   ops::VisionLayout vision;
   vision.outputHiddenSize = target.layout.hiddenSize;
   result.descriptor = model::makeModelDescriptor(
@@ -127,13 +128,10 @@ void checkPackage(const model::ModelPackage &package, uint32_t family) {
 
 int main() {
   try {
-    const auto dense = package<model::Qwen3_8Weights>();
-    const auto sparse = package<model::Qwen3_6MoeWeights>();
-    for (uint32_t family : {9U, 10U}) {
-      checkPackage(dense, family);
-      checkPackage(sparse, family);
-    }
-    std::cout << "model execution plans: PASS (two paired geometries)\n";
+    const auto qwen4exp = package<model::Qwen4ExpWeights>();
+    for (uint32_t family : {9U, 10U})
+      checkPackage(qwen4exp, family);
+    std::cout << "model execution plans: PASS (qwen4exp)\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;
