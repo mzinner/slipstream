@@ -1587,9 +1587,12 @@ void Qwen4ExpTarget::addPrefill(
     }
   }
 
-  std::cerr << "[Prefill Timing] Resident 0.." << R << ": " << residentMs << " ms | Streaming Staging: "
-            << totalStageMs << " ms (misses: " << totalMisses << ", expert passes: "
-            << totalSlices << ") | Streaming GPU: " << totalGpuMs << " ms\n";
+  // Developer timing, off in normal logs: SPLASH_STEP_TIMING=1 turns it on.
+  static const bool prefillLog = std::getenv("SPLASH_STEP_TIMING") != nullptr;
+  if (prefillLog)
+    std::cerr << "[Prefill Timing] Resident 0.." << R << ": " << residentMs << " ms | Streaming Staging: "
+              << totalStageMs << " ms (misses: " << totalMisses << ", expert passes: "
+              << totalSlices << ") | Streaming GPU: " << totalGpuMs << " ms\n";
 
   if (gdnIndex != geometry.stateLayout.layers ||
       attentionIndex + geometry.extraKvLayers != kvLayers.size()) {
@@ -2727,7 +2730,8 @@ void Qwen4ExpTarget::addVerify(
       if (slot[0] == 0 && slot[1] == 0 && slot[2] == 0) slot = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
       slot[k] = drafts[k];
     }
-    if (total[0] && total[0] % 16 == 0)
+    static const bool shadowLog = std::getenv("SPLASH_STEP_TIMING") != nullptr;
+    if (shadowLog && total[0] && total[0] % 16 == 0)
       std::cerr << "[MTP shadow] guess 1: " << hits[0] << "/" << total[0]
                 << "  guess 2: " << hits[1] << "/" << total[1]
                 << "  guess 3: " << hits[2] << "/" << total[2] << "\n";
@@ -3013,9 +3017,8 @@ void Qwen4ExpTarget::addVerify(
     pendingTrace = line.str();
     pendingAnchor = lane.firstPosition + lane.rows;
   }
-  static uint32_t verifyStepCount = 0;
   static const bool everyStep = std::getenv("SPLASH_STEP_TIMING") != nullptr;
-  if (++verifyStepCount <= 10 || everyStep) {
+  if (everyStep) {
     std::cerr << "[Verify Timing] Resident 0.." << R << ": " << residentMs << " ms | Staging: "
               << totalStageMs << " ms (misses: " << totalMisses << ") | GPU Wall: " << totalGpuMs << " ms (pure GPU: " << totalPureGpuMs << " ms) | MTP: " << mtpMs << " ms"
               << " (gpu A " << mtpParts[0] << ", stage " << mtpParts[1] << ", gpu B "
