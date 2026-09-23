@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <dispatch/dispatch.h>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -2267,8 +2268,25 @@ void Qwen4ExpTarget::addVerify(
   const uint32_t maxDrafts = mtpDraftLimit();
   std::array<std::array<uint32_t, 16>, 7> draftCandidates{};
   std::array<std::array<float, 16>, 7> draftProbabilities{};
+  // SPLASH_TRACE=path appends one JSON line per verify step: the head's
+  // top-4 guesses and confidence at each depth, how many guesses the target
+  // kept, and the step's timing split. dev/benchmarks/qwen4exp/trace_report.py
+  // reads it. A step's line is written when the next step starts, since only
+  // then is it known what was kept.
+  static FILE *traceFile = [] {
+    const char *path = std::getenv("SPLASH_TRACE");
+    return path ? std::fopen(path, "a") : nullptr;
+  }();
+  struct DraftTrace {
+    uint32_t depths = 0;
+    std::array<std::array<uint32_t, 4>, 7> ids{};
+    std::array<std::array<float, 4>, 7> logits{};
+    std::array<float, 7> confidence{};
+    std::array<uint32_t, 7> chosen{};
+  } draftTrace;
   auto runMtpDraft = [&]() -> std::array<uint32_t, 7> {
     std::array<uint32_t, 7> drafts{};
+    draftTrace = DraftTrace{};
     const QwenMtpLane &mtp = buffers.mtp[0];
     const auto &head = *weights.mtpLayer;
     const auto &combiner = *weights.mtpCombiner;
@@ -2442,8 +2460,9 @@ void Qwen4ExpTarget::addVerify(
 
       // Merge the slices' candidates: the 16 best overall (ties to the lower
       // id), and the exact softmax mass from each slice's max and sum.
+      // Greedy keeps one candidate; four when tracing, for the record only.
       const uint32_t width16 = mtp.temperature > 0.0f
-          ? std::min<uint32_t>(mtp.topK ? mtp.topK : 16, 16) : 1;
+          ? std::min<uint32_t>(mtp.topK ? mtp.topK : 16, 16) : (traceFile ? 4u : 1u);
       const auto *pickIds = static_cast<const uint32_t *>(weights.mtpPickIds.contents());
       const auto *pickValues = static_cast<const float *>(weights.mtpPickValues.contents());
       const auto *pickMass = static_cast<const float *>(weights.mtpPickMass.contents());
@@ -2472,6 +2491,14 @@ void Qwen4ExpTarget::addVerify(
         if (pickMass[2 * slice + 1] > 0.0f)
           total += pickMass[2 * slice + 1] * std::exp(pickMass[2 * slice] - values[0]);
       lastConfidence = 1.0f / total;
+      if (traceFile && draftTrace.depths < 7) {
+        const uint32_t d = draftTrace.depths++;
+        for (uint32_t i = 0; i < 4; ++i) {
+          draftTrace.ids[d][i] = i < filled ? ids[i] : UINT32_MAX;
+          draftTrace.logits[d][i] = i < filled ? values[i] : 0.0f;
+        }
+        draftTrace.confidence[d] = lastConfidence;
+      }
       lastCandidates.fill(UINT32_MAX);
       lastProbabilities.fill(0.0f);
       if (mtp.temperature <= 0.0f) {
@@ -2518,11 +2545,24 @@ void Qwen4ExpTarget::addVerify(
       const char *value = std::getenv("SPLASH_MTP_P_MIN");
       return value ? static_cast<float>(std::atof(value)) : 0.3f;
     }();
+    // A guess only pays off if every guess before it is kept too, and each
+    // row checked costs ~7 ms (its experts, many read from the SSD). So
+    // guessing also stops once the product of confidences so far drops
+    // below this. trace_report.py predicted 37.6 -> 39.5 tok/s at 0.35;
+    // measured 39.1 (0.25 and 0.45: 39.1, 38.0), same outputs.
+    // SPLASH_MTP_CHAIN_MIN=0 turns it off.
+    static const float chainConfident = [] {
+      const char *value = std::getenv("SPLASH_MTP_CHAIN_MIN");
+      return value ? static_cast<float>(std::atof(value)) : 0.35f;
+    }();
+    float chainConfidence = 1.0f;
     drafted = 0;
     drafts[0] = step(mtp.firstPosition, mtp.rows, mtp.tokens.data());
+    draftTrace.chosen[0] = drafts[0];
     draftCandidates[0] = lastCandidates;
     draftProbabilities[0] = lastProbabilities;
-    if (lastConfidence < confident)
+    chainConfidence *= lastConfidence;
+    if (lastConfidence < confident || chainConfidence < chainConfident)
       return drafts;
     drafted = 1;
     // Steps 2 and 3 chain on the head's own residual. Each re-runs the rows
@@ -2548,13 +2588,16 @@ void Qwen4ExpTarget::addVerify(
         for (uint32_t r = 0; r < k; ++r)
           std::memcpy(hIn + uint64_t{r} * width, chain.data() + uint64_t{r} * width, width * 2);
         drafts[k] = step(anchorPosition, k, drafts.data());
+        draftTrace.chosen[k] = drafts[k];
       } else {
         std::memcpy(hIn, chain.data() + uint64_t{k - 1} * width, width * 2);
         drafts[k] = step(anchorPosition + k - 1, 1, drafts.data() + (k - 1));
+        draftTrace.chosen[k] = drafts[k];
       }
       draftCandidates[k] = lastCandidates;
       draftProbabilities[k] = lastProbabilities;
-      if (lastConfidence < confident)
+      chainConfidence *= lastConfidence;
+      if (lastConfidence < confident || chainConfidence < chainConfident)
         return drafts;
       drafted = k + 1;
       std::memcpy(chain.data() + uint64_t{k} * width,
@@ -2563,6 +2606,21 @@ void Qwen4ExpTarget::addVerify(
     return drafts;
   };
 
+  // Finish the previous step's trace line: this step's MTP inputs are the
+  // rows the target kept then (guesses kept + 1) and the tokens after them,
+  // the last being the target's own next token.
+  static std::string pendingTrace;
+  static uint64_t pendingAnchor = UINT64_MAX;
+  if (traceFile && !pendingTrace.empty()) {
+    const QwenMtpLane &lane = buffers.mtp[0];
+    std::string tail;
+    if (lanes == 1 && lane.rows && lane.firstPosition == pendingAnchor)
+      tail = ",\"accepted\":" + std::to_string(lane.rows - 1) +
+             ",\"next\":" + std::to_string(lane.tokens[lane.rows - 1]);
+    std::fprintf(traceFile, "%s%s}\n", pendingTrace.c_str(), tail.c_str());
+    std::fflush(traceFile);
+    pendingTrace.clear();
+  }
   double mtpMs = 0.0;
   if (buffers.mtpDrafted) {
     buffers.liveRowsPerLane = 1 + *buffers.mtpProposedOut;
@@ -2864,6 +2922,44 @@ void Qwen4ExpTarget::addVerify(
   encodeCapture(graph, lastL);
   encodeHead(graph);
 
+  if (traceFile && lanes == 1) {
+    const QwenMtpLane &lane = buffers.mtp[0];
+    std::ostringstream line;
+    line.precision(5);
+    auto list = [&](auto first, uint32_t count) {
+      line << '[';
+      for (uint32_t i = 0; i < count; ++i) line << (i ? "," : "") << first[i];
+      line << ']';
+    };
+    line << "{\"anchor_pos\":" << lane.firstPosition + lane.rows
+         << ",\"temp\":" << lane.temperature
+         << ",\"live\":" << buffers.liveRowsPerLane << ",\"drafted\":" << drafted
+         << ",\"chosen\":";
+    list(draftTrace.chosen.data(), draftTrace.depths);
+    line << ",\"cand\":[";
+    for (uint32_t d = 0; d < draftTrace.depths; ++d) {
+      line << (d ? "," : "");
+      list(draftTrace.ids[d].data(), 4);
+    }
+    line << "],\"logit\":[";
+    for (uint32_t d = 0; d < draftTrace.depths; ++d) {
+      line << (d ? "," : "");
+      list(draftTrace.logits[d].data(), 4);
+    }
+    line << "],\"conf\":";
+    list(draftTrace.confidence.data(), draftTrace.depths);
+    line << ",\"misses\":" << totalMisses << ",\"ms\":{\"verify\":"
+         << std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - verifyEnter).count()
+         << ",\"mtp\":" << mtpMs << ",\"mtp_gpu_a\":" << mtpParts[0]
+         << ",\"mtp_stage\":" << mtpParts[1] << ",\"mtp_gpu_b\":" << mtpParts[2]
+         << ",\"staging\":" << totalStageMs << ",\"gpu_wall\":" << totalGpuMs
+         << ",\"pure_gpu\":" << totalPureGpuMs << ",\"prefetch_wait\":" << hostParts[0]
+         << ",\"miss_reads\":" << hostParts[1] << ",\"host_stage\":" << hostParts[2]
+         << ",\"encode\":" << encodeMs << "}";
+    pendingTrace = line.str();
+    pendingAnchor = lane.firstPosition + lane.rows;
+  }
   static uint32_t verifyStepCount = 0;
   static const bool everyStep = std::getenv("SPLASH_STEP_TIMING") != nullptr;
   if (++verifyStepCount <= 10 || everyStep) {
