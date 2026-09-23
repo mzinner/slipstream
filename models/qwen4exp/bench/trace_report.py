@@ -20,6 +20,11 @@ Sections:
   4. Strategies, each scored at the anchors the real run visited (same text):
      tokens per step and predicted tok/s from the cost model. "Upper bound"
      rows need a tree verifier (not built); the others run on today's chain.
+
+--proposals file.jsonl scores another guesser at the same anchors: one line per
+traced step, in trace order, {"anchor_pos", "tokens": [...], "conf": [...]},
+with --draft-ms its cost per step. Guesses are kept while the running product
+of confidences stays above a threshold (each threshold is reported).
 """
 
 import argparse
@@ -92,6 +97,8 @@ def main():
     ap.add_argument("trace")
     ap.add_argument("out")
     ap.add_argument("prompts")
+    ap.add_argument("--proposals", help="another guesser's proposals (see top)")
+    ap.add_argument("--draft-ms", type=float, default=6.0, help="its cost per step")
     ap.add_argument(
         "--max-rows",
         type=int,
@@ -205,13 +212,13 @@ def main():
         results.append((name, tok, ms))
         print(f"  {name:58s} {tok:8.2f} {ms:8.1f} {1000 * tok / ms:6.1f}")
 
-    def run(name, policy):
+    def run(name, policy, step_cost=None):
         toks, mss = [], []
         for r, f, _ in known:
             truth = f[r["anchor_pos"] + 1 :]
             t, rows_checked, depths = policy(r, f, truth)
             toks.append(t)
-            mss.append(cost(rows_checked, depths))
+            mss.append((step_cost or cost)(rows_checked, depths))
         report(name, st.mean(toks), st.mean(mss))
 
     run(
@@ -249,6 +256,41 @@ def main():
 
     for tau in (0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5):
         run(f"stop when chain confidence < {tau:.2f}", stop_on_chain(tau, 0.3))
+
+    if a.proposals:
+        proposals = [json.loads(line) for line in open(a.proposals)]
+        if len(proposals) != len(steps):
+            raise SystemExit(
+                f"{len(proposals)} proposals for {len(steps)} traced steps"
+            )
+        by_step = {}
+        for (r, _, _), p in zip(steps, proposals):
+            if p["anchor_pos"] != r["anchor_pos"]:
+                raise SystemExit("proposals are not in trace order")
+            by_step[id(r)] = p
+
+        def external(tau):
+            def policy(r, f, truth):
+                p = by_step[id(r)]
+                keep, chain = 0, 1.0
+                for d, c in enumerate(p["conf"]):
+                    chain *= c
+                    if chain < tau:
+                        break
+                    keep = d + 1
+                return accepted_prefix(p["tokens"][:keep], truth) + 1, 1 + keep, 0
+
+            return policy
+
+        def drafter_cost(rows_checked, _):
+            return c0 + c1 * rows_checked + a.draft_ms
+
+        for tau in (0.0, 0.2, 0.3, 0.4, 0.5, 0.6):
+            run(
+                f"proposals, stop when chain < {tau:.1f} (+{a.draft_ms:g} ms)",
+                external(tau),
+                drafter_cost,
+            )
 
     def chain_plus_alts(alts, min_conf):
         def policy(r, f, truth):

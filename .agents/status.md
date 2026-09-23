@@ -25,10 +25,11 @@ architecture check, 10/10 identical greedy outputs vs Splash on the real model
 
 ## Next
 
-1. **Better draft head, to pass ~45 tok/s** (Nitin chose this, 2026-09-22). Start
-   with a literature survey (including https://huggingface.co/papers/2609.26796),
-   then a plan. Quality must hold: checking guesses keeps the model's exact output,
-   so re-run the identical-output check, the bf16 top-pick/KL check
+1. **Better draft head, to pass ~45 tok/s** (Nitin chose this, 2026-09-22). Survey
+   and plan done: `docs/draft-head-plan.md` (block guesser trained on the ~4.6M
+   tokens this model wrote in omp sessions; go/no-go offline before engine work).
+   Quality must hold: checking guesses keeps the model's exact output, so re-run
+   the identical-output check, the bf16 top-pick/KL check
    (`models/qwen4exp/bench/compare_logits.py`) and the benchmarks.
 2. Optional cleanup: drop Homebrew/release packaging and `install/` (wired into 13
    tests, so a step of its own); turn `QwenTarget` into an explicit model interface.

@@ -13,8 +13,11 @@
 #include "ops/Rows.hpp"
 #include "ops/Sampling.hpp"
 
+#include <dispatch/dispatch.h>
+
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -1821,6 +1824,99 @@ void Runtime::dumpPrefillLogits(uint32_t rows, const char *path) {
     }
   }
   std::fclose(file);
+}
+
+// Record, little-endian: "SLF1", then u32 rows, taps, residual width, hidden,
+// top count k; u32 layer[taps]; bf16 residual [taps][rows][width]; bf16 head
+// input [rows][hidden]; u32 top ids [rows][k]; f32 top log-probabilities
+// [rows][k] (highest first).
+void Runtime::dumpPrefillFeatures(uint32_t rows, const char *path) {
+  Impl &impl = *impl_;
+  constexpr uint32_t kTop = 8;
+  const uint32_t vocabulary = impl.geometry.target.vocabularySize;
+  const uint32_t width = impl.geometry.target.residualWidth();
+  const uint32_t hidden = impl.geometry.target.hiddenSize;
+  const CapturedPrefillLayers captured = impl.targetModel.capturedPrefillLayers();
+  if (!captured.layers.empty() && captured.rows != rows)
+    throw std::runtime_error("captured rows do not match the prefill chunk");
+  auto d = [&](DecodeTensor tensor) {
+    return impl.decodeArena->get(0, tensor);
+  };
+  std::vector<uint16_t> head(uint64_t{rows} * hidden);
+  std::vector<uint32_t> ids(uint64_t{rows} * kTop);
+  std::vector<float> logProbabilities(uint64_t{rows} * kTop);
+  uint32_t *idsOut = ids.data();
+  float *probabilitiesOut = logProbabilities.data();
+  for (uint32_t begin = 0; begin < rows; begin += kDecodeRows) {
+    const uint32_t count = std::min(kDecodeRows, rows - begin);
+    CommandGraph graph;
+    ops::Rows::gatherLast(
+        graph, impl.prefillU16(PrefillTensor::Hidden0, begin, count, width),
+        d(DecodeTensor::Hidden0), count, width);
+    impl.targetModel.addHead(graph, d(DecodeTensor::Hidden0),
+                             d(DecodeTensor::FinalHidden),
+                             d(DecodeTensor::Logits), count);
+    (void)impl.backend.submitCommand(graph.dispatches());
+    const auto *logits =
+        contents<uint16_t>(d(DecodeTensor::Logits), "feature logits");
+    std::memcpy(head.data() + uint64_t{begin} * hidden,
+                contents<uint16_t>(d(DecodeTensor::FinalHidden), "head input"),
+                uint64_t{count} * hidden * sizeof(uint16_t));
+    // Rows are independent: pick each row's top k on its own core.
+    dispatch_apply(count, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                   ^(size_t row) {
+      const uint16_t *line = logits + uint64_t{row} * vocabulary;
+      auto value = [&](uint32_t id) {
+        return std::bit_cast<float>(uint32_t{line[id]} << 16);
+      };
+      std::array<uint32_t, kTop> top{};
+      uint32_t kept = 0;
+      float maximum = -std::numeric_limits<float>::infinity();
+      for (uint32_t id = 0; id < vocabulary; ++id) {
+        const float v = value(id);
+        maximum = std::max(maximum, v);
+        if (kept < kTop || v > value(top[kept - 1])) {
+          uint32_t at = kept < kTop ? kept++ : kTop - 1;
+          while (at > 0 && value(top[at - 1]) < v) {
+            top[at] = top[at - 1];
+            --at;
+          }
+          top[at] = id;
+        }
+      }
+      double sum = 0.0;
+      for (uint32_t id = 0; id < vocabulary; ++id)
+        sum += std::exp(double(value(id)) - maximum);
+      const double logSum = maximum + std::log(sum);
+      for (uint32_t k = 0; k < kTop; ++k) {
+        idsOut[(begin + row) * kTop + k] = top[k];
+        probabilitiesOut[(begin + row) * kTop + k] =
+            static_cast<float>(value(top[k]) - logSum);
+      }
+    });
+  }
+  // Opened once and kept open, so the output can be a named pipe that a
+  // compressor reads as records arrive; closed when the process exits.
+  static std::unordered_map<std::string, FILE *> openFiles;
+  FILE *&file = openFiles[path];
+  if (!file)
+    file = std::fopen(path, "ab");
+  if (!file)
+    throw std::runtime_error(std::string("cannot open features file ") + path);
+  auto write = [&](const void *data, uint64_t bytes) {
+    if (bytes && std::fwrite(data, 1, bytes, file) != bytes)
+      throw std::runtime_error("short write to features file");
+  };
+  const uint32_t taps = static_cast<uint32_t>(captured.layers.size());
+  const uint32_t header[6] = {0x31464C53u, rows, taps, width, hidden, kTop};
+  write(header, sizeof(header));
+  write(captured.layers.data(), uint64_t{taps} * sizeof(uint32_t));
+  for (const uint16_t *tap : captured.data)
+    write(tap, uint64_t{rows} * width * sizeof(uint16_t));
+  write(head.data(), head.size() * sizeof(uint16_t));
+  write(ids.data(), ids.size() * sizeof(uint32_t));
+  write(logProbabilities.data(), logProbabilities.size() * sizeof(float));
+  std::fflush(file);
 }
 
 void Runtime::end(uint64_t requestId) {

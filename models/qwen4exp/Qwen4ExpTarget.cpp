@@ -200,6 +200,57 @@ void gatherNgramRowsOnCpu(const Qwen4ExpWeights &weights,
 }
 
 
+// SPLASH_CAPTURE_LAYERS=11,23,47 keeps the residual after those prompt layers
+// (every row of the chunk, all four streams) for guesser training. Measurement
+// only: it adds one copy per listed layer and changes no result.
+struct PrefillCapture {
+  std::vector<uint32_t> layers;
+  std::vector<metal::MetalBuffer> buffers;
+  uint32_t rows = 0;
+};
+
+PrefillCapture &prefillCapture() {
+  static PrefillCapture capture = [] {
+    PrefillCapture result;
+    if (const char *list = std::getenv("SPLASH_CAPTURE_LAYERS")) {
+      for (const char *cursor = list; *cursor;) {
+        char *end = nullptr;
+        const unsigned long layer = std::strtoul(cursor, &end, 10);
+        if (end == cursor)
+          throw std::invalid_argument("SPLASH_CAPTURE_LAYERS: expected a layer list");
+        result.layers.push_back(static_cast<uint32_t>(layer));
+        cursor = *end == ',' ? end + 1 : end;
+      }
+    }
+    return result;
+  }();
+  return capture;
+}
+
+void addPrefillCapture(metal::CommandGraph &graph, metal::MetalBackend &backend,
+                       const QwenTargetGeometry &geometry, uint32_t layerIndex,
+                       const metal::MetalBuffer &residual, uint32_t rows) {
+  PrefillCapture &capture = prefillCapture();
+  const auto found =
+      std::find(capture.layers.begin(), capture.layers.end(), layerIndex);
+  if (found == capture.layers.end())
+    return;
+  if (layerIndex >= geometry.layers)
+    throw std::invalid_argument("SPLASH_CAPTURE_LAYERS: layer out of range");
+  const size_t tap = static_cast<size_t>(found - capture.layers.begin());
+  const uint64_t rowBytes = uint64_t{geometry.residualWidth()} * sizeof(uint16_t);
+  if (capture.buffers.empty())
+    for (size_t i = 0; i < capture.layers.size(); ++i)
+      capture.buffers.push_back(backend.allocateBuffer(
+          ExecutionLimits::prefillTokenBudget * rowBytes,
+          metal::BufferStorage::Shared, "prefill-capture"));
+  const uint32_t count = rows * geometry.residualWidth();
+  graph.add("capture_rows",
+            {backend.view(residual, 0, rows * rowBytes), capture.buffers[tap]},
+            count, {256, 1, 1}, {256, 1, 1});
+  capture.rows = rows;
+}
+
 // SPLASH_ROUTE_LOG=path appends every routed expert choice, one line per
 // (phase, layer, row): "P|D layer e0 e1 ... e9". Measurement only; it lets
 // cache sizes and policies be replayed offline against real routing.
@@ -544,6 +595,18 @@ void Qwen4ExpTarget::addEmbedding(
             {std::min(groups, 64U), 1, 1}, {256, 1, 1});
 }
 
+CapturedPrefillLayers
+Qwen4ExpTarget::capturedPrefillLayers(const QwenTargetGeometry &geometry) {
+  const PrefillCapture &capture = prefillCapture();
+  CapturedPrefillLayers result{capture.layers, {}, capture.rows,
+                               geometry.residualWidth()};
+  for (const metal::MetalBuffer &buffer : capture.buffers)
+    result.data.push_back(static_cast<const uint16_t *>(buffer.contents()));
+  if (result.data.size() != result.layers.size())
+    result.rows = 0;
+  return result;
+}
+
 void Qwen4ExpTarget::addHead(
     const Qwen4ExpWeights &weights,
     const QwenTargetGeometry &geometry,
@@ -845,6 +908,7 @@ void Qwen4ExpTarget::addPrefill(
     g.add("hyper_connection_update_out",
           {input, output, buffers.gdnOutput, buffers.hyperInjection},
           hcParams, {64, 1, 1}, {256, 1, 1});
+    addPrefillCapture(g, backend, geometry, layerIndex, output, rows);
   };
 
 

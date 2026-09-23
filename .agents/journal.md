@@ -1,5 +1,15 @@
 # Journal — qwen4exp port
 
+## 2026-09-22 22:30 PDT — claude-code
+
+Draft-head work, step 1–2 of docs/draft-head-plan.md. Survey: today's head is
+already at FastMTP's level; 50 tok/s needs ~9-in-10 per guess (DFlash-class).
+Built: session corpus (5.6M model-written tokens), engine recording mode
+(SPLASH_CAPTURE_LAYERS + SPLASH_DUMP_PREFILL_FEATURES, byte-identical across
+runs), compressed store, MLX trainer, proposal scorer. The guard killed one
+recording when I extracted weights alongside it - nothing heavy next to the engine.
+Smoke test: learns, but slowly from scratch; the 3M-token pilot decides.
+
 ## 2026-09-22 21:40 PDT — claude-code
 
 Phase 3 removed the placeholder DFlash draft (−1.45 GB). Phase 4 moved all

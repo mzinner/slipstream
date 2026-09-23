@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <variant>
+#include <vector>
 
 namespace splash::model {
 
@@ -382,6 +383,15 @@ struct QwenTargetCommitBuffers final {
 [[nodiscard]] QwenTargetGeometry
 qwenTargetGeometry(const Qwen4ExpWeights &weights);
 
+// Measurement only: the residual rows a model kept from the last prompt chunk
+// (SPLASH_CAPTURE_LAYERS), one bf16 [rows x width] block per layer.
+struct CapturedPrefillLayers {
+  std::vector<uint32_t> layers;
+  std::vector<const uint16_t *> data;
+  uint32_t rows = 0;
+  uint32_t width = 0;
+};
+
 // Builds the shared Qwen GDN/attention layer graph with the target's dense
 // or sparse-MoE FFN. Architecture-specific loaders supply the package tensors.
 class QwenTarget final {
@@ -410,6 +420,7 @@ public:
                     metal::MetalBuffer hidden, uint32_t rows) const;
   void addStateCommit(metal::CommandGraph &graph,
                       QwenTargetCommitBuffers buffers, uint32_t lanes) const;
+  [[nodiscard]] CapturedPrefillLayers capturedPrefillLayers() const;
 
 private:
   using WeightView = std::variant<const Qwen4ExpWeights *>;

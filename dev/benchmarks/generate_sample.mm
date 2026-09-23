@@ -8,6 +8,7 @@
 
 #import <Foundation/Foundation.h>
 
+#include <fstream>
 #include <algorithm>
 #include <array>
 #include <map>
@@ -91,7 +92,18 @@ int main(int argc, char **argv) {
       if (argc >= 5) {
         // Several prompts, separated by ';', run one after another on the
         // same engine, as a server would see them: caches stay warm.
-        std::string_view all(argv[4]);
+        // "@path" reads the same ';'-separated prompts from a file, for
+        // prompts too long for the command line.
+        std::string fromFile;
+        if (argv[4][0] == '@') {
+          std::ifstream in(argv[4] + 1);
+          if (!in)
+            throw std::runtime_error(std::string("cannot read ") + (argv[4] + 1));
+          fromFile.assign(std::istreambuf_iterator<char>(in), {});
+          while (!fromFile.empty() && std::isspace(static_cast<unsigned char>(fromFile.back())))
+            fromFile.pop_back();
+        }
+        std::string_view all = fromFile.empty() ? std::string_view(argv[4]) : fromFile;
         for (size_t start = 0; start <= all.size();) {
           const size_t end = std::min(all.find(';', start), all.size());
           prompts.push_back(parseTokens(all.substr(start, end - start)));
@@ -218,6 +230,9 @@ int main(int argc, char **argv) {
           // Scoring runs ask for the logits of every prompt position.
           if (const char *dump = std::getenv("SPLASH_DUMP_PREFILL_LOGITS"))
             executor.dumpPrefillLogits(count, dump);
+          // Guesser training: inner state and top picks per prompt row.
+          if (const char *dump = std::getenv("SPLASH_DUMP_PREFILL_FEATURES"))
+            executor.dumpPrefillFeatures(count, dump);
           offset += count;
 
           for (uint32_t token : results[0].outputTokens) {

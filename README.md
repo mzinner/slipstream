@@ -67,4 +67,5 @@ watchdog restarts it (this happened twice on 2026-09-22).
 | [docs/architecture.md](docs/architecture.md) | How the pieces fit: Metal backend, kernels, model, engine, server |
 | [docs/new-model-playbook.md](docs/new-model-playbook.md) | Bringing up the next model, step by step, with the checks that catch mistakes |
 | [docs/profiling.md](docs/profiling.md) | Every measurement tool: what it tells you and how to read it |
+| [docs/draft-head-plan.md](docs/draft-head-plan.md) | The plan toward 50 tok/s: a block guesser trained on your own sessions |
 | [.agents/status.md](.agents/status.md) | Current state and next steps (shared with other coding agents) |

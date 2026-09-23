@@ -58,6 +58,11 @@ public:
       metal::CommandGraph &graph, const QwenTargetCommitBuffers &buffers,
       uint32_t lanes);
 
+  // Measurement only: the layers SPLASH_CAPTURE_LAYERS kept from the last
+  // prompt chunk. Valid once that chunk's GPU work has finished.
+  static CapturedPrefillLayers
+  capturedPrefillLayers(const QwenTargetGeometry &geometry);
+
   static void addEmbedding(
       const Qwen4ExpWeights &weights,
       const QwenTargetGeometry &geometry,

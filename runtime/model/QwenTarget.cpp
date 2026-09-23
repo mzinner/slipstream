@@ -195,6 +195,10 @@ void QwenTarget::addHead(metal::CommandGraph &graph,
                           headNormalized_, headReduced_, normalizedRows);
 }
 
+CapturedPrefillLayers QwenTarget::capturedPrefillLayers() const {
+  return Qwen4ExpTarget::capturedPrefillLayers(geometry_);
+}
+
 void QwenTarget::addEmbedding(metal::CommandGraph &graph,
                               metal::MetalBuffer tokens,
                               metal::MetalBuffer hidden,

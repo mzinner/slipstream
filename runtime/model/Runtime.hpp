@@ -39,6 +39,11 @@ public:
   // [rows x vocabulary] to `path`. It reuses decode scratch, so a request is
   // not safe to continue decoding afterwards; scoring tools end it instead.
   void dumpPrefillLogits(uint32_t rows, const char *path);
+  // Measurement only, for guesser training: appends one record for the prefill
+  // chunk that just completed on lane 0 - the layers SPLASH_CAPTURE_LAYERS kept,
+  // the head's input, and the head's top picks per row (format in Runtime.mm).
+  // Same decode-scratch caveat as dumpPrefillLogits.
+  void dumpPrefillFeatures(uint32_t rows, const char *path);
   [[nodiscard]] std::shared_ptr<const CompositeState>
   snapshot(uint64_t requestId) override;
   [[nodiscard]] uint64_t reclaimIdleState() noexcept override;
