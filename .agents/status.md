@@ -36,6 +36,16 @@ update BENCHMARKS.md and the hub.
 
 ## Next
 
+00. **Upstream fixes (Nitin chose A, 2026-09-23):** branch `upstream-fixes`
+    (worktree `../slipstream-port`) has #31 composed tool schemas, #92's
+    required-first tool-argument fix (the bug is real here: its test fails on the
+    old grammar), #120 per-request `timings`. Not ported, on purpose: #40 (needs
+    four other upstream features; escapes are valid JSON), #44 (never hit here;
+    our submission code is rewritten), #92's token reuse (38 ms on a 60K prompt)
+    and its mixed-batch sampling tweak. Server tests 170 + 26 OK, lint OK.
+    After round 2: merge into main, rebuild, all gates, identical output, live
+    tool-call checks via omp and pi; then `git worktree remove ../slipstream-port`.
+
 0. **After round 2 finishes:** rebuild (`make`) and run the gates on the change in
    `models/qwen4exp/Qwen4ExpTarget.cpp` (committed in 4d28f69 by accident with a
    status edit; it compiles, but has not been built or run yet): `[MTP shadow]`, `[Prefill Timing]` and
