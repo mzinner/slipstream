@@ -36,10 +36,11 @@ update BENCHMARKS.md and the hub.
 
 ## Next
 
-0. **After round 2 finishes:** rebuild (`make`) and test the uncommitted change in
-   `models/qwen4exp/Qwen4ExpTarget.cpp`: `[MTP shadow]`, `[Prefill Timing]` and
+0. **After round 2 finishes:** rebuild (`make`) and run the gates on the change in
+   `models/qwen4exp/Qwen4ExpTarget.cpp` (committed in 4d28f69 by accident with a
+   status edit; it compiles, but has not been built or run yet): `[MTP shadow]`, `[Prefill Timing]` and
    the first 10 `[Verify Timing]` lines now print only with SPLASH_STEP_TIMING=1,
-   so the server log shows just requests, loading and memory. Then commit.
+   so the server log shows just requests, loading and memory.
    Launch scripts: `~/models/bin/slipstream-{server,log,stop}.sh` (README "Run it").
 
 1. **Cheaper check steps (Nitin chose this, 2026-09-23).** Done so far:
