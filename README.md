@@ -133,10 +133,24 @@ use the per-request `prompt` figure instead.
 8090, model id `local/qwen3.8-flash-next-splash`, defined in `~/.omp/agent/models.yml`).
 Slipstream and Splash serve the same id, so whichever is running answers.
 
+**The optimized command (the one to copy):**
+
 ```zsh
-omp --model splash-flashnext/local/qwen3.8-flash-next-splash                  # interactive
-omp --model splash-flashnext/local/qwen3.8-flash-next-splash --thinking=low   # less thinking, faster answers
-omp --model splash-flashnext/local/qwen3.8-flash-next-splash -p "Reply with exactly: OK"   # quick check
+omp --model splash-flashnext/local/qwen3.8-flash-next-splash --tools=read,write,edit,bash,grep,glob,todo --approval-mode=yolo
+```
+
+| Flag | What it does |
+|---|---|
+| `--tools=read,write,edit,bash,grep,glob,todo` | Only these 7 tools. omp describes every enabled tool in its system prompt, so fewer tools means a shorter prompt and a faster first turn |
+| `--approval-mode=yolo` | Runs tools without asking first. Use it only in folders where that is safe |
+| `--thinking=low` (optional) | Less thinking, faster answers; also `off`, `medium` (default), `xhigh`. Note the `=` |
+
+Other forms:
+
+```zsh
+omp --model splash-flashnext/local/qwen3.8-flash-next-splash --thinking=low --tools=read,write,edit,bash,grep,glob,todo --approval-mode=yolo
+omp --model splash-flashnext/local/qwen3.8-flash-next-splash            # plain: all tools, asks before writes
+omp --model splash-flashnext/local/qwen3.8-flash-next-splash -p "Reply with exactly: OK" < /dev/null   # quick check
 ```
 
 - **Thinking levels:** `low`, `medium` (omp's default for this model), `xhigh`;
