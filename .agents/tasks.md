@@ -74,6 +74,8 @@
 - [x] Phase 2: text only
 - [x] Phase 3: DFlash placeholder removed (−1.45 GB)
 - [x] Phase 4: `models/qwen4exp/` layout, checker rules, lint clean
-- [ ] Draft head: literature survey (incl. huggingface.co/papers/2609.26796), then plan
+- [x] Draft head: survey and plan (docs/draft-head-plan.md)
+- [x] Draft head pilot: corpus, recording mode, trainer, scoring - no-go (25 vs 39 tok/s)
+- [ ] Next track - Nitin's choice: cheaper rows / rent GPUs for a guesser / benchmark round
 - [ ] Optional: drop `install/` and Homebrew/release packaging
 - [ ] Optional: explicit model interface in place of `QwenTarget`

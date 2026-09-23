@@ -56,9 +56,11 @@ class Split:
             np.memmap(folder / f"{t}.f16", np.float16, "r", shape=(self.rows, dims[t]))
             for t in taps
         ]
-        self.top = np.fromfile(folder / "top_ids.u32", "<u4").reshape(self.rows, -1)[
-            :, 0
-        ]
+        self.top8 = np.fromfile(folder / "top_ids.u32", "<u4").reshape(self.rows, -1)
+        self.top8_logprobs = np.fromfile(folder / "top_logprobs.f32", "<f4").reshape(
+            self.rows, -1
+        )
+        self.top = self.top8[:, 0]
         samples = json.loads((folder / "samples.json").read_text())
         if (folder / "ids.npy").exists():
             corpus = np.load(folder / "ids.npy")
@@ -86,12 +88,11 @@ class Split:
         for s in samples:
             end[s["row"] : s["row"] + s["length"]] = s["row"] + s["length"]
         position = np.arange(self.rows)
-        self.anchors = np.flatnonzero(
-            self.written
-            & follows
-            & (position + BLOCK <= end)
-            & (position - self.sample_start >= 16)
-        )
+        inside = (position + BLOCK <= end) & (position - self.sample_start >= 16)
+        self.anchors = np.flatnonzero(self.written & follows & inside)
+        # Training anchors: every position. The model's pick after it is a
+        # correct first-slot label wherever the text came from.
+        self.train_anchors = np.flatnonzero(inside)
 
     def labels(self, anchors):
         """[n, BLOCK-1] model picks for the slots, and a mask of valid ones."""
@@ -109,6 +110,12 @@ class Split:
         )
         return labels, valid
 
+    def soft_labels(self, anchors):
+        """[n, BLOCK-1, 8] the model's top-8 ids and their probabilities."""
+        rows = anchors[:, None] + np.arange(BLOCK - 1)[None, :]
+        probabilities = np.exp(self.top8_logprobs[rows])
+        return self.top8[rows], probabilities / probabilities.sum(-1, keepdims=True)
+
     def features(self, begin, end):
         parts = [self.head[begin:end]] + [t[begin:end] for t in self.taps]
         return np.concatenate(parts, 1)
@@ -116,11 +123,12 @@ class Split:
 
 def window_batches(split: Split, window: int, anchors_per_window: int, rng):
     """Endless (window features, anchors relative to the window) pairs."""
+    pool = split.train_anchors
     while True:
-        a = int(split.anchors[rng.integers(len(split.anchors))])
+        a = int(pool[rng.integers(len(pool))])
         start = max(int(split.sample_start[a]), a - window // 2)
         end = min(start + window, split.rows)
-        inside = split.anchors[(split.anchors >= start + 1) & (split.anchors < end)]
+        inside = pool[(pool >= start + 1) & (pool < end)]
         inside = inside[split.sample_start[inside] == split.sample_start[a]]
         if len(inside) > anchors_per_window:
             inside = np.sort(rng.choice(inside, anchors_per_window, replace=False))
@@ -180,8 +188,15 @@ def rope_at(rope, t, positions):
 
 
 class Drafter(nn.Module):
-    def __init__(self, part_dims, hidden, d=1024, layers=3, heads=8, ffn=2816):
+    """Works in the model's own head-input space (width = hidden). Every slot
+    starts from the model's latest state (the row before the anchor); the
+    layers learn only the change. All new paths start at zero, so before any
+    training the guess is exactly that state."""
+
+    def __init__(self, part_dims, hidden, d=2560, layers=3, heads=20, ffn=4096):
         super().__init__()
+        if d != hidden:
+            raise ValueError("the guesser runs at the model's width")
         # Each recorded part has its own scale; normalize them before mixing.
         self.part_dims = list(part_dims)
         self.part_norms = [nn.RMSNorm(n) for n in self.part_dims]
@@ -192,12 +207,18 @@ class Drafter(nn.Module):
         self.layers = [Layer(d, heads, ffn) for _ in range(layers)]
         self.norm_out = nn.RMSNorm(d)
         self.out = nn.Linear(d, hidden, bias=False)
+        for linear in [self.last_in, self.token_in, self.out] + [
+            m for layer in self.layers for m in (layer.o, layer.down)
+        ]:
+            linear.weight = mx.zeros_like(linear.weight)
 
     def __call__(self, features, anchor_embeddings, anchors, window_start):
         """features [C, F] for window rows; anchors [A] absolute rows.
         Returns head-input guesses [A, BLOCK-1, hidden]."""
         count = anchors.shape[0]
         bounds = np.cumsum([0] + self.part_dims)
+        rel = anchors - window_start  # anchor's row within the window
+        base = features[rel - 1, : self.part_dims[0]]  # the model's own latest state
         features = mx.concatenate(
             [
                 norm(features[:, a:b])
@@ -206,7 +227,6 @@ class Drafter(nn.Module):
             1,
         )
         context = self.feature_in(features)
-        rel = anchors - window_start  # anchor's row within the window
         # Like the draft head, every slot starts from the latest recorded state
         # (the row before the anchor), not only what attention finds.
         last = self.last_in(features[rel - 1])
@@ -217,7 +237,9 @@ class Drafter(nn.Module):
             ],
             1,
         )
-        x = (self.token_in(slots) + last[:, None, :]).reshape(count * BLOCK, -1)
+        x = (base[:, None, :] + self.token_in(slots) + last[:, None, :]).reshape(
+            count * BLOCK, -1
+        )
         x_pos = (rel[:, None] + mx.arange(BLOCK)[None, :]).reshape(-1)
         c_pos = mx.arange(features.shape[0])
         # Slots see recorded state strictly before their anchor, and their own block.
@@ -228,7 +250,7 @@ class Drafter(nn.Module):
         mask = mx.where(allowed, 0.0, -1e9).astype(x.dtype)
         for layer in self.layers:
             x = layer(x, context, x_pos, c_pos, mask)
-        x = self.out(self.norm_out(x)).reshape(count, BLOCK, -1)
+        x = (x + self.out(self.norm_out(x))).reshape(count, BLOCK, -1)
         return x[:, 1:, :]
 
 
@@ -253,7 +275,7 @@ def main():
     parser.add_argument("--window", type=int, default=2048)
     parser.add_argument("--anchors", type=int, default=64)
     parser.add_argument("--lr", type=float, default=6e-4)
-    parser.add_argument("--d", type=int, default=1024)
+    parser.add_argument("--d", type=int, default=2560)
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--no-taps", action="store_true", help="head input only")
     parser.add_argument("--eval-every", type=int, default=500)
@@ -271,7 +293,7 @@ def main():
     slot_of[draft_ids] = np.arange(len(draft_ids))
     part_dims = [train.head.shape[1]] + [t.shape[1] for t in train.taps]
     model = Drafter(part_dims, embedding.shape[1], d=args.d, layers=args.layers)
-    model.set_dtype(mx.bfloat16)
+    # Weights stay float32: bfloat16 keeps ~3 digits and swallows small updates.
     optimizer = optim.AdamW(
         learning_rate=optim.join_schedules(
             [
@@ -293,18 +315,31 @@ def main():
         slots = slot_of[labels]
         valid &= slots >= 0
         return (
-            mx.array(split.features(start, end)).astype(mx.bfloat16),
-            embedding[mx.array(split.tokens[anchors])].astype(mx.bfloat16),
+            mx.array(split.features(start, end)).astype(mx.float32),
+            embedding[mx.array(split.tokens[anchors])].astype(mx.float32),
             mx.array(anchors),
             start,
             mx.array(np.maximum(slots, 0)),
             mx.array(valid),
         )
 
-    def loss_fn(model, features, anchor_emb, anchors, start, slots, valid):
+    def train_batch(split, start, end, anchors):
+        ids, probabilities = split.soft_labels(anchors)
+        soft_slots = slot_of[ids]
+        probabilities = np.where(soft_slots >= 0, probabilities, 0.0).astype(np.float32)
+        return batch(split, start, end, anchors) + (
+            mx.array(np.maximum(soft_slots, 0)),
+            mx.array(probabilities),
+        )
+
+    def loss_fn(
+        model, features, anchor_emb, anchors, start, slots, valid, soft_slots, soft_p
+    ):
         guess = model(features, anchor_emb, anchors, start)
         logits = (guess @ head.T.astype(guess.dtype)).astype(mx.float32)
-        ce = nn.losses.cross_entropy(logits, slots, reduction="none")
+        log_q = logits - mx.logsumexp(logits, -1, keepdims=True)
+        # Cross-entropy against the model's top-8 probabilities (soft labels).
+        ce = -(mx.take_along_axis(log_q, soft_slots, -1) * soft_p).sum(-1)
         w = valid.astype(mx.float32) * weights[None, :]
         return (ce * w).sum() / mx.maximum(w.sum(), 1.0)
 
@@ -326,11 +361,15 @@ def main():
     batches = window_batches(train, args.window, args.anchors, rng)
     log = open(args.out / "log.jsonl", "a")
     clock = time.time()
+    print(
+        json.dumps({"step": 0, **evaluate(model, test, batch, head, args.window)}),
+        flush=True,
+    )
     for step in range(1, args.steps + 1):
         start, end, anchors = next(batches)
         if not len(anchors):
             continue
-        loss, grads = grad_fn(model, *batch(train, start, end, anchors))
+        loss, grads = grad_fn(model, *train_batch(train, start, end, anchors))
         grads, _ = optim.clip_grad_norm(grads, 1.0)
         optimizer.update(model, grads)
         mx.eval(model.parameters(), optimizer.state, loss)

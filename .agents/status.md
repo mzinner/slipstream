@@ -1,6 +1,6 @@
 # Status — Slipstream
 
-**Updated:** 2026-09-22 21:40 PDT by claude-code
+**Updated:** 2026-09-23 by claude-code
 **Branch:** `main` (local only; no remote. Never push to `incoai/splash`.)
 
 ## In one line
@@ -25,16 +25,20 @@ architecture check, 10/10 identical greedy outputs vs Splash on the real model
 
 ## Next
 
-1. **Better draft head, to pass ~45 tok/s** (Nitin chose this, 2026-09-22). Survey
-   and plan done: `docs/draft-head-plan.md` (block guesser trained on the ~4.6M
-   tokens this model wrote in omp sessions; go/no-go offline before engine work).
-   Quality must hold: checking guesses keeps the model's exact output, so re-run
-   the identical-output check, the bf16 top-pick/KL check
-   (`models/qwen4exp/bench/compare_logits.py`) and the benchmarks.
-2. Optional cleanup: drop Homebrew/release packaging and `install/` (wired into 13
-   tests, so a step of its own); turn `QwenTarget` into an explicit model interface.
-3. Launcher: `~/models/bin/splash-flashnext-server.sh` serves Slipstream with
-   `REPO=<this folder>`.
+1. **Draft-head pilot: no-go (2026-09-23).** A block guesser trained on this Mac
+   (3M positions of session text) scored 25 tok/s vs today's 39 at the same
+   anchors; today's head stays. Full write-up: `docs/draft-head-plan.md`. Tools
+   kept: engine recording mode, `models/qwen4exp/tools/{session_corpus,
+   feature_store,record_features,train_drafter,drafter_proposals}.py`,
+   `trace_report --proposals`. Data: `~/models/qwen38-flash-next-drafter-data`
+   (~27 GB; safe to delete, 3 h to regenerate).
+2. **Waiting on Nitin:** which way next - cheaper rows on the Mac (no training;
+   estimate ~42-44 tok/s), rent GPUs to train a guesser on far more text, or stop
+   at ~39-40 and resume the paused benchmark round.
+3. Re-measure speed on a cool machine: the last check read 38.3 tok/s after hours
+   of engine work (39.9 before; noise ±2%).
+4. Optional cleanup: drop `install/` and Homebrew packaging; explicit model
+   interface in place of `QwenTarget`.
 
 ## Memory
 

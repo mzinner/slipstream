@@ -223,3 +223,13 @@ files (`ModelDescriptor.hpp`, `ModelFactory.hpp`, `QwenTarget.cpp`, `Runtime.mm`
 Kept `runtime/` as the shared root (no rename to `core/`): the rename adds churn
 and no checkable boundary. The installer and Homebrew packaging stay for now:
 they are wired into 13 tests, so removing them is its own step.
+
+## 2026-09-23 — Keep the built-in draft head; the Mac-trained block guesser lost
+
+A DFlash-style block guesser, trained with MLX on 3M positions of the model's own
+session text, scored 25 tok/s against today's head's 39 at the same anchors
+(first guess right 56% vs 84%). Built-in heads are trained on far more text;
+beating one needs 20-100x more data than this Mac can produce quickly. The
+recording mode, corpus, trainer and `trace_report --proposals` stay for a
+future attempt. Guesser design lessons: work at the model's width, start from
+its latest state, test with a copy task first. See docs/draft-head-plan.md.

@@ -43,7 +43,7 @@ def main():
     model = td.Drafter(
         config["part_dims"], config["hidden"], d=config["d"], layers=config["layers"]
     )
-    model.set_dtype(mx.bfloat16)
+    # Weights stay float32: bfloat16 keeps ~3 digits and swallows small updates.
     model.load_weights(str(args.run / "drafter.safetensors"))
 
     trace = [json.loads(line) for line in open(args.trace)]
@@ -67,8 +67,8 @@ def main():
             anchor = row0 + record["anchor_pos"]
             start = max(row0, anchor - args.window + 1)
             guess = model(
-                mx.array(split.features(start, anchor + 1)).astype(mx.bfloat16),
-                embedding[mx.array([int(split.tokens[anchor])])].astype(mx.bfloat16),
+                mx.array(split.features(start, anchor + 1)).astype(mx.float32),
+                embedding[mx.array([int(split.tokens[anchor])])].astype(mx.float32),
                 mx.array([anchor]),
                 start,
             )

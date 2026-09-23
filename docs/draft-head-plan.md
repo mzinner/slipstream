@@ -1,5 +1,24 @@
 # Plan: a better guesser, toward 50 tok/s
 
+> **Result (2026-09-23): step 3 said no-go. Today's draft head stays.** A block
+> guesser trained on this Mac from 3M tokens of your sessions guesses far worse
+> than the head the model shipped with. Scored at the same points of the same
+> text (the model's own greedy output, replayed through the same cost model):
+>
+> | Text | Today's head | Trained block guesser |
+> |---|---|---|
+> | Held-out sessions (17 cut points) | **3.28 tokens a step, 38.9 tok/s** | 1.55, 25.2 tok/s |
+> | 10-prompt suite | **2.82, 39.8 tok/s** | 1.16, 23.9 tok/s |
+>
+> First guess right: 84% for today's head, 56% for the trained guesser (still
+> rising slowly). **Why:** the built-in head was trained by Qwen on vastly more
+> text; 3M tokens is not enough to catch up from scratch. Two early design bugs
+> were found and fixed on the way (a 1024-wide bottleneck, and no start from the
+> model's own latest state), which took the guesser from 32% to 56%; they are not
+> the reason for the gap. What was built stays useful: the engine's recording
+> mode, the corpus, the compressed store, the trainer, and the report's
+> proposal scoring. Details: "What we learned" at the end.
+
 **The point:** 50 tok/s needs a guesser that is right about **9 times in 10 at each
 of 5–7 guesses in a row**. Today's draft head is right 8 in 10 on the first guess,
 falling to 6 in 10 by the fourth. That is already as good as the best published
@@ -109,3 +128,25 @@ alongside.
   can't run at the same time; the memory guard refuses to start a second engine.
 - **If step 3 fails:** renting GPUs to train on far more text is the next lever.
   It costs money and needs the 338 GB model uploaded, so it would be your call.
+
+---
+
+## What we learned (2026-09-23)
+
+| Step | Outcome |
+|---|---|
+| 1. Collect text | 5.6M model-written tokens from 237 sessions; the model's own top pick matches the session text on 73% of those tokens (they were written by llama.cpp's 4-bit version, sometimes sampled) |
+| 2. Record the inner state | 3.0M training positions + 0.3M held-out in ~2.7 h (~330 positions/s on 60K-token sessions), 23 GB. Recording is byte-identical run to run, and off by default |
+| 3. Train and judge | No-go (table at the top). Losses kept falling slowly: this is a data-size limit, not a ceiling of the design |
+
+**Mistakes worth not repeating:**
+- **Nothing memory-heavy next to the engine.** Loading 2.5 GB of weights during a
+  recording made the guard stop the engine (it did its job).
+- **Test the training pipeline with a task whose answer is in the input** (copy
+  the model's own last pick). It exposed the width bottleneck at once.
+- **Guessers must work at the model's width and start from its latest state**:
+  32% → 56% on the first guess.
+
+**What would change the answer:** 20–100× more text written by this model
+(DFlash used ~800K answers), which on this Mac means weeks of generation. Renting
+GPUs could do it in days, at a cost; see status.md for the choice.

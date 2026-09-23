@@ -1,5 +1,13 @@
 # Journal — qwen4exp port
 
+## 2026-09-23 — claude-code
+
+Recorded 3M training + 0.3M held-out positions (2.7 h) and two greedy evaluation
+sets (17 session cut points: today's head 3.28 tok/step, 38.9 tok/s). Trained the
+block guesser: 32% first-guess (bottleneck bug) -> 56% after moving it to the
+model's width with a start from the model's latest state. Scored at the same
+anchors: 25 tok/s vs 39. No-go; today's head stays. Nitin to choose the next track.
+
 ## 2026-09-22 22:30 PDT — claude-code
 
 Draft-head work, step 1–2 of docs/draft-head-plan.md. Survey: today's head is
