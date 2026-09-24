@@ -104,6 +104,11 @@ worked on the merged build.
 
 ## Known issues
 
+- **The model sometimes thinks until the length cap** (both engines; a model
+  habit, worst at temperature 0): 1-8% of benchmark answers. In omp/pi it shows as
+  a very long thinking phase with no answer; a lower thinking level or asking
+  again gets past it. Details and counts: BENCHMARKS.md, round 2 notes.
+
 - A second git worktree exists at `.kilo/worktrees/magical-antimony` (made by
   the Kilo Code VS Code extension, not by claude-code). Leave it unless Nitin says.
 - `/metrics` `splash_prefill_tokens_per_second` reads far too high (GPU work
