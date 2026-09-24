@@ -23,7 +23,7 @@ what this model needs.
 | **Quality** | Greedy output identical to Splash token for token; 91% same top pick as the bf16 reference |
 | **Removed from Splash** | two other models, the kernel tuner, the vision encoder, the unused DFlash draft (~19,300 lines, 1.45 GB less memory) |
 | **Layout** | Everything specific to this model is in `models/qwen4exp/`; the rest is shared (`docs/architecture.md`) |
-| **Now** | Benchmark round 2: Slipstream vs llama.cpp V3 vs Qwen3.8-27B (`.agents/status.md`) |
+| **Quality vs llama.cpp V3** | Same on every paired test (knowledge, math, harder knowledge, long-context lookup); full table in `.agents/status.md` |
 
 ## Words we can't avoid
 

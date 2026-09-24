@@ -80,6 +80,13 @@
 - [x] Read-ahead 6 + uneven cache slots: +3-4%, outputs identical
 - [x] Smarter read-ahead (multi-row consensus): no gain, left off
 - [x] Larger expert cache: declined - memory margin too thin for ~2%
-- [ ] Resume the paused benchmark round (Slipstream vs llama.cpp V3 vs 27B HQ)
+- [x] Benchmark round 2, Slipstream: all 9 suites except sessions (2026-09-23)
+- [x] Paired vs llama.cpp V3: mmlu, gsm8k, mmlu_pro, needle - all "same"
+- [x] Upstream fixes #31/#92/#120 merged; live omp/pi tool calls OK
+- [ ] llama.cpp V3: humaneval (may be partial), ifeval, math500
+- [ ] Both engines: sessions, then Nitin judges blind (bench.judge)
+- [ ] 27B HQ round (Nitin to decide)
+- [ ] Decide default expert cache (34 vs 30 GiB): measure speed cost first
+- [ ] Optional: full-precision reference via a hosted API (Nitin's key)
 - [ ] Optional: drop `install/` and Homebrew/release packaging
 - [ ] Optional: explicit model interface in place of `QwenTarget`
