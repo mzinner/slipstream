@@ -7,9 +7,8 @@ first, then `.agents/next-session.md`.**
 ## In one line
 
 Slipstream is our lean fork of Splash that serves Qwen3.8-Flash-Next on this
-64 GB M5 Pro at **~41 tok/s**, with answers identical to Splash, and it is the
-engine to use. Quality is confirmed against Splash (below); the paired
-comparison against llama.cpp V3 is being run today.
+64 GB M5 Pro at **~41 tok/s** (about 2x llama.cpp V3), and it is the engine to
+use. **Its quality equals llama.cpp V3's** on every paired test run (below).
 
 ---
 
@@ -55,7 +54,7 @@ notes: `benchmarking/model-quality-bench/BENCHMARKS.md` (Results log, round 2).
 | Long-context lookup (`needle`, 27) | 100% | 100% | same |
 | Code (`humaneval`, 164) | 90.2% | not run yet | — |
 | Competition math (`math500`, 200) | 90.0% | not run yet | — |
-| Instructions (`ifeval`, 541) | FILL IN | not run yet | — |
+| Instructions (`ifeval`, 541) | 87.8% | not run yet | — |
 
 Decode speed on the same math questions: Slipstream 46.8 tok/s, llama.cpp 23.1
 (llama.cpp at a 30 GiB cache that day).
@@ -89,23 +88,24 @@ Chrome open, only ~6 GiB stayed free and Slipstream refused 16K-32K prompts
 
 See `.agents/next-session.md` for the exact steps and commands.
 
-1. **Merge branch `upstream-fixes`** (worktree `../slipstream-port`): upstream
-   #31 composed tool schemas, #92 required-first tool arguments (a real bug
-   here), #120 per-request `timings`. Server tests pass; needs the full gates.
-   STATUS: FILL IN.
-2. **Build and check the quieter-log change** (commit 4d28f69):
-   `[MTP shadow]` / `[Prefill Timing]` / `[Verify Timing]` only with
-   `SPLASH_STEP_TIMING=1`. STATUS: FILL IN.
-3. **Live tool-call checks through omp and pi.** STATUS: FILL IN.
-4. **Finish the benchmark comparison** that did not fit today: llama.cpp on the
-   remaining suites, the 27B on all, blind judging of `sessions`, then
-   `BENCHMARKS.md` and the hub.
-5. Optional: drop `install/` and Homebrew packaging; explicit model interface.
+1. **Finish the benchmark comparison** that did not fit today: llama.cpp on
+   `humaneval` (started 20:10 on 2026-09-23; may be partial, resume it),
+   `ifeval` and `math500`; the 27B on all; `sessions` on both, then Nitin
+   judges blind. Update `BENCHMARKS.md` and the hub after each suite.
+2. **Decisions for Nitin** (see next-session.md, Task 2): default cache 34 vs
+   30 GiB; full-precision reference via a hosted API; the 27B round.
+3. Optional: drop `install/` and Homebrew packaging; explicit model interface.
+
+**Done today (2026-09-23 evening), no longer pending:** upstream fixes merged
+(2e4a4c8: #31 composed tool schemas, #92 required-first tool arguments, #120
+per-request `timings`; all gates, 10/10 identical at 39.7 tok/s); quieter log
+built and checked (0 developer lines); live tool calls through omp and pi both
+worked on the merged build.
 
 ## Known issues
 
-- `bench.compare --a <model> --suite mmlu` picks the newest `mmlu*` file, which
-  can be `mmlu_pro`; pass run files instead (`--a runs/<model>/mmlu__<time>.jsonl`).
+- A second git worktree exists at `.kilo/worktrees/magical-antimony` (made by
+  the Kilo Code VS Code extension, not by claude-code). Leave it unless Nitin says.
 - `/metrics` `splash_prefill_tokens_per_second` reads far too high (GPU work
   only); use the per-request `prompt … tok/s` in the log.
 - Google Drive syncing this folder uses a full core and makes timed runs ~3%

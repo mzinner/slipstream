@@ -1,5 +1,16 @@
 # Journal — qwen4exp port
 
+## 2026-09-23 20:15 PDT — claude-code
+
+Quality confirmed against llama.cpp V3 on paired tests: mmlu 89.0/89.2, gsm8k
+96.8/97.2, mmlu_pro 64.2/64.6, needle 100/100 (all p>0.05); Slipstream alone:
+humaneval 90.2, math500 90.0, ifeval 87.8. Disagreements show no pattern.
+Found: at a 34 GiB cache with Chrome open, 16K-32K prompts are refused
+(resource_timeout; 6.4 GiB host reserve) - Chrome closed or CACHE_GIB=30 fixes
+it. Merged upstream fixes #31/#92/#120, all gates + live omp/pi tool calls.
+Fixed two harness bugs (suite-name matching; --resume kept failed items).
+Speed of the benchmark was the limit: greedy answers that loop to 8,192 tokens.
+
 ## 2026-09-23 06:10 PDT — claude-code
 
 Nitin chose "cheaper check steps". Found most SSD reads were read-ahead, a third
