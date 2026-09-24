@@ -186,7 +186,9 @@ pi --model slipstream/local/qwen3.8-flash-next-splash -p "Reply with exactly: OK
 
 ## Other clients
 
-Any OpenAI-compatible client works too:
+Any OpenAI-compatible client works too. Chat responses (and the last chunk of a
+stream) carry llama.cpp-style `timings`: `prompt_n`, `cache_n`, `prompt_per_second`
+(new prompt tokens only), `predicted_n`, `predicted_per_second`.
 
 ```zsh
 curl -s localhost:8090/v1/chat/completions -H 'content-type: application/json' -d '{
