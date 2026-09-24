@@ -1,6 +1,6 @@
 # Status — Slipstream (handoff)
 
-**Updated:** 2026-09-23 11:00 PDT by claude-code. **Next agent: read this file
+**Updated:** 2026-09-23 20:00 PDT by claude-code. **Next agent: read this file
 first, then `.agents/next-session.md`.**
 **Branch:** `main` (local only, no remote). Never push to `github.com/incoai/splash`.
 
@@ -43,23 +43,32 @@ comparison against llama.cpp V3 is being run today.
 
 ## Quality: what is confirmed (2026-09-23)
 
-Greedy decoding (temperature 0), same questions and seed as Splash's run of
-2026-09-22 (`benchmarking/model-quality-bench`, `runs/<model>/`).
+**Slipstream's quality equals llama.cpp V3's (Nitin's daily setup).** Paired on the
+same questions (seed 1234, greedy); "same" = McNemar p >= 0.05. Full table and
+notes: `benchmarking/model-quality-bench/BENCHMARKS.md` (Results log, round 2).
 
-| Test | Slipstream vs Splash | Scores |
-|---|---|---|
-| Continuations (`agreement`, 200 prompts) | **199/200 identical**; the one differs from the first word (likely a near-tie) | — |
-| Knowledge (`mmlu`, 400) | **400/400 same outcome** | 89.0% both |
-| Grade-school math (`gsm8k`, 250) | **same outcome on every question both finished**; Splash's 7 misses were answers cut off at its old 1,024-token cap | Slipstream 96.8%, Splash 94.0% |
-| Harder knowledge (`mmlu_pro`, 500) | Splash never ran it | see results table below |
-| Competition math (`math500`, 200) | Splash never ran it | see results table below |
-| Code, instructions, long context, sessions | FILL IN when today's runs finish | |
+| Test | Slipstream | llama.cpp V3 | Paired |
+|---|---:|---:|---|
+| Knowledge (`mmlu`, 400) | 89.0% | 89.2% | same |
+| Grade-school math (`gsm8k`, 250) | 96.8% | 97.2% | same |
+| Harder knowledge (`mmlu_pro`, 500) | 64.2% | 64.6% | same |
+| Long-context lookup (`needle`, 27) | 100% | 100% | same |
+| Code (`humaneval`, 164) | 90.2% | not run yet | — |
+| Competition math (`math500`, 200) | 90.0% | not run yet | — |
+| Instructions (`ifeval`, 541) | FILL IN | not run yet | — |
 
-Also from 2026-09-22 (unchanged since, outputs identical): 91% same top pick as
-the full-precision reference, KL 0.12 (llama.cpp V3: 89%, 0.18).
+Decode speed on the same math questions: Slipstream 46.8 tok/s, llama.cpp 23.1
+(llama.cpp at a 30 GiB cache that day).
 
-**Paired against llama.cpp V3:** FILL IN (running today; see next-session.md if
-it did not finish).
+Other evidence: 91% same top pick as the full-precision model, KL 0.12
+(llama.cpp V3: 89%, 0.18); today's Slipstream and today's Splash give identical
+answers, including on the code questions that differed from Splash's 2026-09-22
+run (that run was the odd one out).
+
+**Memory finding (reliability, not quality):** at the 34 GiB default cache with
+Chrome open, only ~6 GiB stayed free and Slipstream refused 16K-32K prompts
+(`resource_timeout`; it keeps 6.4 GiB free for macOS). With Chrome closed, or
+`CACHE_GIB=30`, they run. Nitin to choose the default (see journal).
 
 ---
 
