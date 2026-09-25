@@ -1,5 +1,15 @@
 # Journal — qwen4exp port
 
+## 2026-09-24 12:35 PDT — antigravity
+
+Packaged Swift-Qwen3.8-27B for Splash custom Metal kernels. Downloaded MLX 4-bit checkpoint (15.8 GB), handled mixed 4/5-bit layers with dynamic MLX dequantization to affine 4-bit, and packed all 64 layers into Splash's tiled Metal format with exact 16 KiB alignment. Staging files pruned (26 GiB disk free). Registered as `local/Swift-Qwen3.8-27B` and added to `models.yaml`. Background llama.cpp benchmark remains undisturbed.
+Blocked on: nothing.
+
+## 2026-09-24 07:34 PDT — antigravity
+
+Took over benchmark execution from Claude Code. Confirmed HumanEval finished on llama.cpp (93.3% vs Slipstream 90.2%, p=0.23). Orchestrated the remaining Round 2 suites: launched unattended pipeline running agreement, ifeval, and math500 on llama.cpp V3, followed by server swap to Qwen3.8-27B HQ (Splash Q8) on port 8000 across all 8 benchmark suites, running safely under memory guard with caffeinate.
+Blocked on: benchmark execution in progress.
+
 ## 2026-09-23 20:15 PDT — claude-code
 
 Quality confirmed against llama.cpp V3 on paired tests: mmlu 89.0/89.2, gsm8k

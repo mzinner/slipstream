@@ -55,13 +55,11 @@
 - [ ] 50 tok/s: needs ~4.1 tokens a step (tree drafting / better draft head)
 - [ ] Uneven cache slots per layer (~9% fewer misses in replay)
 - [ ] Draft head: process only live rows (~0.5 ms)
-- [ ] Resume the paused quality round: Splash vs llama.cpp V3 vs 27B HQ
-      (benchmarking/model-quality-bench, run_splash_vs_llamacpp.sh then run_27b_hq.sh;
-      re-run Splash suites since the engine changed)
+- [/] Resume the paused quality round: Splash vs llama.cpp V3 vs 27B HQ
+      (In progress: running agreement, ifeval, math500 on llama.cpp, then 27B HQ all suites via run_remaining_round2.sh)
 - [ ] Code-prompt drift: 79% same pick vs llama.cpp 89%
 - [ ] Short-prompt reading speed (87 vs ~110 tok/s)
-- [ ] Sparse indexer for >2K context
-- [ ] 27B regression check (needs a 4-bit 27B package)
+- [x] 27B 4-bit package prepared: Swift-Qwen3.8-27B converted to Splash format (local/Swift-Qwen3.8-27B, 16.9 GB)
 
 ## Deferred by Nitin
 

@@ -1,0 +1,1402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slipstream — A Visual Tutorial</title>
+<style>
+  :root {
+    --paper: #fafaf8;
+    --ink: #1a1a1a;
+    --muted: #666;
+    --line: #e3e1dc;
+    --code-bg: #14161a;
+    --code-ink: #e6e8ee;
+    --chip-bg: #eeece7;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0;
+    background: var(--paper); color: var(--ink);
+    font: 15px/1.65 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 1000px; margin: 0 auto; padding: 40px 28px 120px; }
+  h1 { font-size: 30px; line-height: 1.2; margin: 0 0 6px; }
+  h2 { font-size: 22px; margin: 56px 0 10px; padding-top: 18px; border-top: 2px solid var(--line); }
+  h3 { font-size: 17px; margin: 30px 0 8px; }
+  p { margin: 10px 0; }
+  .lead { font-size: 17px; color: #333; }
+  .muted { color: var(--muted); }
+  code {
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: var(--chip-bg); padding: 1px 5px; border-radius: 4px;
+  }
+  pre {
+    background: var(--code-bg); color: var(--code-ink);
+    padding: 14px 18px; border-radius: 10px; overflow-x: auto;
+    font: 12.5px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  pre code { background: none; padding: 0; color: inherit; }
+  .fig {
+    background: #fff; border: 1px solid var(--line); border-radius: 12px;
+    padding: 18px; margin: 18px 0;
+  }
+  .fig svg { display: block; width: 100%; height: auto; }
+  .figcap { font-size: 12.5px; color: var(--muted); margin-top: 10px; }
+  .callout {
+    border-left: 4px solid #3b82f6; background: #f0f6ff;
+    border-radius: 0 8px 8px 0; padding: 10px 16px; margin: 16px 0;
+  }
+  .callout.warn { border-color: #f97316; background: #fff5ec; }
+  .callout.tip  { border-color: #22c55e; background: #f0fdf4; }
+  .callout p:first-child { margin-top: 4px; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 13.5px; }
+  th, td { border: 1px solid var(--line); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: #f1efe9; }
+  .toc { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 16px 22px; }
+  .toc ol { margin: 6px 0; padding-left: 20px; }
+  .toc a { color: #2563eb; text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .nums { display: flex; gap: 12px; flex-wrap: wrap; margin: 16px 0; }
+  .num {
+    flex: 1 1 150px; background: #fff; border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px 14px;
+  }
+  .num b { display: block; font-size: 19px; }
+  .num span { font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Slipstream — a visual tutorial</h1>
+<p class="lead">
+How one big model runs fast on one Mac: the architecture, the request path, the decode step,
+and — in detail — <strong>how the GPU kernels are written</strong>. Every claim below points at
+real code in this repository.
+</p>
+
+<div class="nums">
+  <div class="num"><b>~40 tok/s</b><span>greedy decode, M5 Pro 64 GB</span></div>
+  <div class="num"><b>~100 GB</b><span>weights; 34 GiB cached in RAM, rest on SSD</span></div>
+  <div class="num"><b>2.8–3.1</b><span>tokens per decode step (draft head + verify)</span></div>
+  <div class="num"><b>4</b><span>shared files a new model registers into</span></div>
+</div>
+
+<div class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#s0">How to read this tutorial</a></li>
+    <li><a href="#s1">The big picture: seven layers</a></li>
+    <li><a href="#s2">A request's journey</a></li>
+    <li><a href="#s3">One decode step</a> — incl. the pipelined step</li>
+    <li><a href="#s4">The GPU runtime</a> — what a dispatch becomes</li>
+    <li><a href="#s5">How kernels are created</a> — the long, detailed section</li>
+    <li><a href="#s6">The kernel catalog</a> — what each family computes</li>
+    <li><a href="#s7">Bringing up a new model</a></li>
+    <li><a href="#s8">Quick reference</a></li>
+  </ol>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s0">0 · How to read this tutorial</h2>
+<p>
+Pointers look like <code>runtime/ops/Linear.cpp</code> or
+<code>models/qwen4exp/kernels/mtp_pick.metal:15</code> — a file path, optionally with a line
+number. They are relative to the repository root. Open each file as you go; snippets are copied
+from the code (long bodies are summarized; line numbers point at the originals).
+</p>
+<div class="callout tip">
+<p><strong>One sentence to keep in mind:</strong> a Python server turns chat requests into tokens
+and pipes them to one native engine process; the engine schedules; a shared runtime runs the decode
+loop; and <strong>everything specific to one model lives in one folder, <code>models/qwen4exp/</code></strong>.</p>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s1">1 · The big picture: seven layers</h2>
+<p>
+The system is a stack. Requests flow down; each layer owns a narrow job and knows nothing about
+layers above it. The diagram below is the entire architecture — everything else in this tutorial
+zooms into one of these boxes.
+</p>
+
+<div class="fig">
+<svg viewBox="0 0 960 640" role="img" aria-label="Seven-layer architecture stack">
+  <defs>
+    <marker id="a1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 z" fill="#888"/>
+    </marker>
+  </defs>
+  <!-- client -->
+  <rect x="120" y="10" width="640" height="56" rx="10" fill="#f3f4f6" stroke="#9ca3af" stroke-width="1.5"/>
+  <text x="440" y="33" text-anchor="middle" font-size="14" font-weight="600">Client</text>
+  <text x="440" y="52" text-anchor="middle" font-size="12" fill="#555">omp · pi · curl — any OpenAI-compatible client</text>
+  <line x1="440" y1="66" x2="440" y2="86" stroke="#888" stroke-width="1.5" marker-end="url(#a1)"/>
+  <!-- server -->
+  <rect x="120" y="88" width="640" height="56" rx="10" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="440" y="111" text-anchor="middle" font-size="14" font-weight="600">server/ — Python</text>
+  <text x="440" y="130" text-anchor="middle" font-size="12" fill="#555">OpenAI + Anthropic shapes · chat template · thinking levels · tool grammar · streaming</text>
+  <line x1="440" y1="144" x2="440" y2="164" stroke="#888" stroke-width="1.5" marker-end="url(#a1)"/>
+  <!-- engine -->
+  <rect x="120" y="166" width="640" height="56" rx="10" fill="#eef2ff" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="440" y="189" text-anchor="middle" font-size="14" font-weight="600">runtime/engine/ — C++, model-agnostic</text>
+  <text x="440" y="208" text-anchor="middle" font-size="12" fill="#555">Scheduler · KV prefix cache · memory plan + governor</text>
+  <line x1="440" y1="222" x2="440" y2="242" stroke="#888" stroke-width="1.5" marker-end="url(#a1)"/>
+  <!-- model runtime -->
+  <rect x="120" y="244" width="640" height="56" rx="10" fill="#faf5ff" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="440" y="267" text-anchor="middle" font-size="14" font-weight="600">runtime/model/ — shared model runtime</text>
+  <text x="440" y="286" text-anchor="middle" font-size="12" fill="#555">decode loop · guess checking · per-request recurrent state</text>
+  <line x1="440" y1="300" x2="440" y2="320" stroke="#888" stroke-width="1.5" marker-end="url(#a1)"/>
+  <!-- model folder -->
+  <rect x="120" y="322" width="640" height="56" rx="10" fill="#fff7ed" stroke="#f97316" stroke-width="2"/>
+  <text x="440" y="345" text-anchor="middle" font-size="14" font-weight="700">models/qwen4exp/ — this model only</text>
+  <text x="440" y="364" text-anchor="middle" font-size="12" fill="#555">layout · package loader · expert cache plan · forward pass · its own kernels</text>
+  <text x="775" y="352" font-size="12" font-weight="600" fill="#f97316">everything model-specific</text>
+  <text x="775" y="368" font-size="12" font-weight="600" fill="#f97316">lives here (swappable)</text>
+  <line x1="440" y1="378" x2="440" y2="398" stroke="#888" stroke-width="1.5" marker-end="url(#a1)"/>
+  <!-- ops -->
+  <rect x="120" y="400" width="640" height="56" rx="10" fill="#f0fdfa" stroke="#14b8a6" stroke-width="1.5"/>
+  <text x="440" y="423" text-anchor="middle" font-size="14" font-weight="600">runtime/ops/ — one entry point per shared kernel family</text>
+  <text x="440" y="442" text-anchor="middle" font-size="12" fill="#555">Linear · MoE · PagedAttention · GDN · Sampling</text>
+  <line x1="440" y1="456" x2="440" y2="476" stroke="#888" stroke-width="1.5" marker-end="url(#a1)"/>
+  <!-- metal -->
+  <rect x="120" y="478" width="640" height="56" rx="10" fill="#f0fdf4" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="440" y="501" text-anchor="middle" font-size="14" font-weight="600">runtime/metal/ — GPU backend</text>
+  <text x="440" y="520" text-anchor="middle" font-size="12" fill="#555">MetalBackend · CommandGraph · shared kernels · pipelined submission</text>
+  <line x1="440" y1="534" x2="310" y2="554" stroke="#888" stroke-width="1.5" marker-end="url(#a1)"/>
+  <line x1="440" y1="534" x2="570" y2="554" stroke="#888" stroke-width="1.5" marker-end="url(#a1)"/>
+  <!-- gpu + ssd -->
+  <rect x="160" y="556" width="300" height="56" rx="10" fill="#111827" stroke="#111827"/>
+  <text x="310" y="579" text-anchor="middle" font-size="14" font-weight="600" fill="#fff">Apple M5 Pro GPU</text>
+  <text x="310" y="598" text-anchor="middle" font-size="12" fill="#bbb">compute + 34 GiB expert cache</text>
+  <rect x="500" y="556" width="300" height="56" rx="10" fill="#111827" stroke="#111827"/>
+  <text x="650" y="579" text-anchor="middle" font-size="14" font-weight="600" fill="#fff">SSD</text>
+  <text x="650" y="598" text-anchor="middle" font-size="12" fill="#bbb">missing experts stream in on demand</text>
+</svg>
+<div class="figcap">Figure 1 — The stack. Full description in <code>docs/architecture.md</code>.</div>
+</div>
+
+<h3>What each part owns</h3>
+<table>
+  <tr><th>Layer</th><th>Owns</th><th>Open these files</th></tr>
+  <tr>
+    <td><code>server/</code></td>
+    <td>OpenAI and Anthropic request shapes, chat template, thinking levels, tool-call grammar, streaming</td>
+    <td><code>server/api_shapes.py</code>, <code>server/frontend.py</code>, <code>server/protocol.py</code></td>
+  </tr>
+  <tr>
+    <td><code>runtime/engine/</code></td>
+    <td>Admitting requests within memory, batching, prompt chunks, reusing cached prompt prefixes, status</td>
+    <td><code>runtime/engine/Engine.cpp</code>, <code>Scheduler.cpp</code>, <code>Cache.cpp</code>, <code>MemoryPlan.cpp</code>, <code>MemoryGovernor.cpp</code></td>
+  </tr>
+  <tr>
+    <td><code>runtime/model/</code></td>
+    <td>The decode loop, guess checking, per-request recurrent state, buffers</td>
+    <td><code>runtime/model/Runtime.mm</code>, <code>QwenTarget.cpp</code>, <code>ModelDescriptor.hpp</code>, <code>ModelFactory.hpp</code></td>
+  </tr>
+  <tr>
+    <td><code>models/qwen4exp/</code></td>
+    <td>Everything only this model has</td>
+    <td><code>Qwen4Exp.cpp</code> (layout + loader), <code>Qwen4ExpTarget.cpp</code> (forward pass), <code>kernels/</code>, <code>tools/</code>, <code>bench/</code></td>
+  </tr>
+  <tr>
+    <td><code>runtime/ops/</code></td>
+    <td>Launching shared kernels with the right sizes and variant</td>
+    <td><code>runtime/ops/Linear.cpp</code>, <code>MoE.cpp</code>, <code>PagedAttention.cpp</code>, <code>GDN.cpp</code>, <code>Sampling.cpp</code></td>
+  </tr>
+  <tr>
+    <td><code>runtime/metal/</code></td>
+    <td>Talking to the GPU: allocations, pipelines, events, pipelined submission</td>
+    <td><code>runtime/metal/MetalBackend.mm</code>, <code>CommandGraph.hpp</code>, <code>kernels/</code></td>
+  </tr>
+</table>
+
+<div class="callout">
+<p><strong>The rule that makes this maintainable</strong> — enforced by a program, not a convention:
+<code>dev/tools/check_architecture.py</code>. A model folder may launch its own kernels; shared code
+never depends on a model folder; the engine never names a concrete model. That is why adding a model
+means adding a folder, not patching the engine.</p>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s2">2 · A request's journey</h2>
+<p>
+Follow one chat completion request from the wire to the GPU. Six hops; each hop has one file to open.
+</p>
+
+<div class="fig">
+<svg viewBox="0 0 960 580" role="img" aria-label="Request journey, six hops">
+  <defs>
+    <marker id="a2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 z" fill="#888"/>
+    </marker>
+  </defs>
+  <rect x="280" y="10" width="400" height="64" rx="10" fill="#f3f4f6" stroke="#9ca3af" stroke-width="1.5"/>
+  <text x="480" y="36" text-anchor="middle" font-size="14" font-weight="600">1 · HTTP request</text>
+  <text x="480" y="55" text-anchor="middle" font-size="12" fill="#555">POST /v1/chat/completions · port 8090</text>
+  <line x1="480" y1="74" x2="480" y2="94" stroke="#888" stroke-width="1.5" marker-end="url(#a2)"/>
+
+  <rect x="280" y="96" width="400" height="64" rx="10" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="480" y="122" text-anchor="middle" font-size="14" font-weight="600">2 · server/ (Python)</text>
+  <text x="480" y="141" text-anchor="middle" font-size="12" fill="#555">shape check → chat template → tokens</text>
+  <line x1="480" y1="160" x2="480" y2="180" stroke="#888" stroke-width="1.5" marker-end="url(#a2)"/>
+
+  <rect x="280" y="182" width="400" height="64" rx="10" fill="#fff" stroke="#bbb" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="480" y="208" text-anchor="middle" font-size="14" font-weight="600">3 · binary pipe</text>
+  <text x="480" y="227" text-anchor="middle" font-size="12" fill="#555">server/protocol.py ↔ runtime/engine/Protocol.cpp</text>
+  <line x1="480" y1="246" x2="480" y2="266" stroke="#888" stroke-width="1.5" marker-end="url(#a2)"/>
+
+  <rect x="280" y="268" width="400" height="64" rx="10" fill="#eef2ff" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="480" y="294" text-anchor="middle" font-size="14" font-weight="600">4 · runtime/engine/</text>
+  <text x="480" y="313" text-anchor="middle" font-size="12" fill="#555">admit within memory · batch · chunk the prompt · reuse KV prefix</text>
+  <line x1="480" y1="332" x2="480" y2="352" stroke="#888" stroke-width="1.5" marker-end="url(#a2)"/>
+
+  <rect x="280" y="354" width="400" height="64" rx="10" fill="#faf5ff" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="480" y="380" text-anchor="middle" font-size="14" font-weight="600">5 · decode loop + forward pass</text>
+  <text x="480" y="399" text-anchor="middle" font-size="12" fill="#555">runtime/model/Runtime.mm → models/qwen4exp/Qwen4ExpTarget.cpp</text>
+  <line x1="480" y1="418" x2="480" y2="438" stroke="#888" stroke-width="1.5" marker-end="url(#a2)"/>
+  <text x="700" y="392" font-size="12" fill="#a855f7">one step = Figure 3</text>
+
+  <rect x="280" y="440" width="400" height="64" rx="10" fill="#f0fdf4" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="480" y="466" text-anchor="middle" font-size="14" font-weight="600">6 · runtime/metal/ → GPU</text>
+  <text x="480" y="485" text-anchor="middle" font-size="12" fill="#555">MetalBackend.mm submits command graphs to the GPU</text>
+</svg>
+<div class="figcap">Figure 2 — One request, six hops.</div>
+</div>
+
+<p>Two details worth knowing:</p>
+<ul>
+  <li><strong>The pipe, not RPC.</strong> The Python server and the native engine are separate
+  processes talking over a pipe with a binary protocol. The Python side never touches GPU code.
+  (<code>server/protocol.py</code> ↔ <code>runtime/engine/Protocol.cpp</code>.)</li>
+  <li><strong>Startup is assembled in one place:</strong> load package → plan memory → allocate,
+  in <code>runtime/engine/RuntimeResources.mm</code> and <code>runtime/engine/Bootstrap.mm</code>.</li>
+</ul>
+
+<!-- ================================================================ -->
+<h2 id="s3">3 · One decode step</h2>
+<p>
+This is the heart of the speed. Instead of the full model producing one token at a time,
+a <strong>small draft head built into the model</strong> guesses the next few tokens first,
+and the <strong>full model checks all of them in a single pass</strong>.
+</p>
+
+<div class="fig">
+<svg viewBox="0 0 960 360" role="img" aria-label="One decode step timeline">
+  <defs>
+    <marker id="a3" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 z" fill="#888"/>
+    </marker>
+  </defs>
+  <!-- time axis -->
+  <line x1="48" y1="28" x2="912" y2="28" stroke="#ccc" stroke-width="1"/>
+  <text x="48" y="18" font-size="11" fill="#888">0 ms</text>
+  <text x="132" y="18" font-size="11" fill="#888">7 ms</text>
+  <text x="900" y="18" font-size="11" fill="#888">~72 ms</text>
+  <!-- lane labels -->
+  <text x="10" y="70" font-size="13" font-weight="600">Draft head</text>
+  <text x="10" y="160" font-size="13" font-weight="600">Full model</text>
+  <text x="10" y="248" font-size="13" font-weight="600">SSD</text>
+  <!-- draft bar -->
+  <rect x="48" y="52" width="84" height="30" rx="6" fill="#a855f7"/>
+  <text x="90" y="72" text-anchor="middle" font-size="11" fill="#fff">≤5 tokens</text>
+  <text x="144" y="72" font-size="12" fill="#555">own attention layer + experts + 64K-token output layer (~7 ms); stops early when confidence &lt; 0.35</text>
+  <!-- verify bar -->
+  <rect x="132" y="138" width="780" height="40" rx="6" fill="#6366f1"/>
+  <text x="522" y="163" text-anchor="middle" font-size="13" fill="#fff">full model checks anchor + ALL guesses in ONE pass — ~65 ms</text>
+  <text x="132" y="200" font-size="12" fill="#555">per layer: router picks 10 of 512 experts → cached experts run on the GPU…</text>
+  <!-- ssd arrow -->
+  <line x1="500" y1="240" x2="500" y2="184" stroke="#22c55e" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#a3)"/>
+  <text x="516" y="250" font-size="12" fill="#555">…while missing experts stream in from the SSD ("waves")</text>
+  <!-- result -->
+  <rect x="48" y="284" width="864" height="44" rx="8" fill="#fff7ed" stroke="#f97316" stroke-width="1.5"/>
+  <text x="480" y="311" text-anchor="middle" font-size="13" font-weight="600">keep the guesses the model agrees with + 1 token of its own → ≈ 2.8–3.1 tokens/step → ~40 tok/s</text>
+</svg>
+<div class="figcap">Figure 3 — One decode step. Draft ~7 ms, verify ~65 ms; both numbers from <code>docs/architecture.md</code>.</div>
+</div>
+
+<p>
+Why this is safe: the draft head is an extra layer <em>inside the checkpoint</em> (the MTP head).
+The full model verifies every guess, so the output is token-for-token identical to running the full
+model alone — the draft only changes <em>speed</em>, never the answer.
+</p>
+<p class="muted">
+Open <code>models/qwen4exp/Qwen4ExpTarget.cpp:2493</code> to see the real dispatch that launches
+the draft head's pick kernel — it is the running example of section 5.
+</p>
+
+<h3>3.1 · The pipelined step: SSD reads under the GPU</h3>
+<p>
+A step touches ~100 GB of weights; 34 GiB sit in RAM and the rest lives on SSD. The naive loop is
+serial — for each layer: find the missing experts, read them, run them, repeat — and the GPU idles
+through every read. Pipelined decode removes the serialization by <strong>encoding the whole
+step as one multi-stage submission before it starts</strong>
+(<code>models/qwen4exp/Qwen4ExpTarget.cpp:2755-2910</code>):
+</p>
+<ul>
+  <li><strong>The resident prefix goes first.</strong> The embedding and the current layer's path
+  up to its router are encoded into one graph and submitted immediately
+  (<code>:2759-2769</code>). There is deliberately <em>no</em> read-ahead of the previous step's
+  experts: “after a long prompt that is nearly every expert, ~68 GB the OS then reads in the
+  background for minutes, stalling decode” (<code>:2770-2772</code>). Misses are fetched on demand.</li>
+  <li><strong>Every remaining layer becomes stages of one pipeline.</strong> All the layer
+  dispatches are appended to one list with a stage boundary at each router
+  (<code>:2798-2800</code>), and the whole list leaves in a single
+  <code>submitPipelineAsync</code> call (<code>:2869-2871</code>): one command buffer per stage,
+  all committed at once. The GPU runs each stage the moment the host releases it —
+  <em>the GPU never waits for a submission, only for a host signal</em> (section 4.2).</li>
+  <li><strong>Between stages, the host reads.</strong> The host loop (<code>:2876-2905</code>)
+  waits for the event “layer <em>L</em>−1's compute is done”, reads that router's scores out of GPU
+  memory, picks the 10 experts per row (<code>hostSelect</code>), stages the experts already
+  cached, releases their stage, reads the <em>missing</em> experts from SSD into cache slots, then
+  releases the rest of the layer.</li>
+</ul>
+<p>
+With <strong>waves</strong> (on by default; <code>SPLASH_DECODE_WAVES=0</code> turns it off) every
+layer after the first is <em>two</em> stages, straight from the code comment
+(<code>:2804-2810</code>):
+</p>
+<pre><code>// Waves: every layer after the first is two stages. A runs the experts
+// already cached while the host reads the missing ones; B runs those,
+// then the rest of the layer as before. A is quiet (raises no event), so
+// the host starts B as soon as its reads land. Same outputs; 84.6 -> 79.6
+// ms a step on the 10-prompt suite. SPLASH_DECODE_WAVES=0 turns it off.</code></pre>
+<p>
+<strong>Lookahead</strong> shrinks the reads themselves: stage <em>L</em> also encodes the router
+scores for layer <em>L</em>+2, so the host can prefetch that layer's experts early — but only the
+predicted <strong>top 6 of each row's 10</strong>, a number measured, not guessed
+(<code>:2081-2086</code>):
+</p>
+<pre><code>// The predicted top 6 of each row's 10. The prediction is right for
+// ~2/3 of its top 10, and every wrong guess is a wasted SSD read that
+// competes with the reads that matter: 10 -> 6 cut reads 133 -> 95 a
+// step and gave 38.6 -> 40.3 tok/s on the 10-prompt suite (5-8 tie;
+// 12 and none are slower). SPLASH_LOOKAHEAD_EXPERTS overrides.</code></pre>
+<p>
+The reads themselves are plain <code>pread</code>s — one per expert matrix, all in flight on a GCD
+queue: “The SSD reaches ~15 GB/s this way; faulting pages in one at a time reached ~1.5”, and
+splitting each read into four smaller in-flight reads measured <em>slower</em> (staging 30 → 39 ms
+a step) — <code>readMissedExperts</code>, <code>Qwen4ExpTarget.cpp:385-400</code>.
+</p>
+
+<div class="fig">
+<svg viewBox="0 0 960 460" role="img" aria-label="Pipelined decode: host SSD reads run under GPU stages, released by event signals">
+  <defs>
+    <marker id="a5" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 z" fill="#888"/>
+    </marker>
+    <marker id="a5b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 z" fill="#f97316"/>
+    </marker>
+  </defs>
+  <text x="20" y="34" font-size="13" font-weight="700">GPU</text>
+  <text x="20" y="316" font-size="13" font-weight="700">host + SSD</text>
+  <line x1="16" y1="150" x2="944" y2="150" stroke="#d4d0c8" stroke-width="1"/>
+  <text x="944" y="142" text-anchor="end" font-size="11" fill="#999">time →</text>
+
+  <rect x="16" y="52" width="140" height="76" rx="10" fill="#f3f4f6" stroke="#9ca3af" stroke-width="1.5"/>
+  <text x="86" y="76" text-anchor="middle" font-size="12" font-weight="600">resident graph</text>
+  <text x="86" y="94" text-anchor="middle" font-size="10.5" fill="#555">embed + layer R to its router</text>
+  <text x="86" y="112" text-anchor="middle" font-size="10.5" fill="#555">submitted first · raises base+1</text>
+  <line x1="156" y1="90" x2="176" y2="90" stroke="#888" stroke-width="1.5" marker-end="url(#a5)"/>
+
+  <rect x="176" y="52" width="158" height="76" rx="10" fill="#eef2ff" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="255" y="76" text-anchor="middle" font-size="12" font-weight="600">stage: layer R experts</text>
+  <text x="255" y="94" text-anchor="middle" font-size="10.5" fill="#555">+ layer R+1 router scores</text>
+  <text x="255" y="112" text-anchor="middle" font-size="10.5" fill="#555">raises base+3 when done</text>
+  <line x1="334" y1="90" x2="354" y2="90" stroke="#888" stroke-width="1.5" marker-end="url(#a5)"/>
+
+  <rect x="354" y="52" width="150" height="76" rx="10" fill="#f0fdf4" stroke="#22c55e" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="429" y="76" text-anchor="middle" font-size="12" font-weight="600">wave A · layer R+1</text>
+  <text x="429" y="94" text-anchor="middle" font-size="10.5" fill="#555">cached experts only</text>
+  <text x="429" y="112" text-anchor="middle" font-size="10.5" fill="#555">quiet: raises no event</text>
+  <line x1="504" y1="90" x2="524" y2="90" stroke="#888" stroke-width="1.5" marker-end="url(#a5)"/>
+
+  <rect x="524" y="52" width="178" height="76" rx="10" fill="#eef2ff" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="613" y="76" text-anchor="middle" font-size="12" font-weight="600">wave B · layer R+1</text>
+  <text x="613" y="94" text-anchor="middle" font-size="10.5" fill="#555">streamed experts + rest of layer</text>
+  <text x="613" y="112" text-anchor="middle" font-size="10.5" fill="#555">raises base+5 · predicts layer R+2</text>
+  <line x1="702" y1="90" x2="722" y2="90" stroke="#888" stroke-width="1.5" marker-end="url(#a5)"/>
+
+  <rect x="722" y="52" width="150" height="76" rx="10" fill="#eef2ff" stroke="#c7d2fe" stroke-width="1.5"/>
+  <text x="797" y="76" text-anchor="middle" font-size="12" font-weight="600" fill="#888">waves · layer R+2 …</text>
+  <text x="797" y="94" text-anchor="middle" font-size="10.5" fill="#999">one pipeline for all 47 stages</text>
+
+  <line x1="255" y1="128" x2="255" y2="272" stroke="#f97316" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#a5b)"/>
+  <text x="263" y="176" font-size="10.5" fill="#c2410c">event base+3</text>
+  <text x="263" y="190" font-size="10.5" fill="#c2410c">= layer R compute done</text>
+
+  <rect x="176" y="276" width="158" height="84" rx="10" fill="#fff7ed" stroke="#f97316" stroke-width="1.5"/>
+  <text x="255" y="300" text-anchor="middle" font-size="12" font-weight="600">hostSelect(R+1)</text>
+  <text x="255" y="318" text-anchor="middle" font-size="10.5" fill="#555">read router scores · pick 10 of 512</text>
+  <text x="255" y="336" text-anchor="middle" font-size="10.5" fill="#555">stage cached experts · signal</text>
+  <line x1="334" y1="290" x2="400" y2="134" stroke="#f97316" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#a5b)"/>
+  <text x="352" y="212" font-size="10.5" fill="#c2410c">signal base+4 → wave A starts</text>
+
+  <rect x="354" y="276" width="348" height="84" rx="10" fill="#fff7ed" stroke="#f97316" stroke-width="1.5"/>
+  <text x="528" y="300" text-anchor="middle" font-size="12" font-weight="600">readMissedExperts: one pread per matrix, SSD → cache slots</text>
+  <text x="528" y="318" text-anchor="middle" font-size="10.5" fill="#555">runs under wave A on the GPU — ~15 GB/s of reads nobody waits for</text>
+  <text x="528" y="336" text-anchor="middle" font-size="10.5" fill="#555">then signal base+2k → wave B starts on the arriving experts</text>
+  <line x1="640" y1="276" x2="622" y2="134" stroke="#f97316" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#a5b)"/>
+
+  <text x="16" y="410" font-size="12" fill="#555">Every stage was <tspan font-weight="700">encoded and committed up front</tspan>; the GPU only waits on the shared event counter, never on the host's submission.</text>
+  <text x="16" y="432" font-size="12" fill="#555">Waves: same kernels in the same order — outputs identical — measured 84.6 → 79.6 ms a step (<code style="font-size:11px">Qwen4ExpTarget.cpp:2804-2810</code>).</text>
+</svg>
+<div class="figcap">Figure 4 — The pipelined decode step. One submission for the whole step; a shared event counter hands off between GPU stages and host work (routing + SSD expert reads) once per layer. Protocol: <code>MetalBackend.hpp:346-356</code>.</div>
+</div>
+
+<div class="callout tip">
+<p><strong>Same numbers, different overlap.</strong> Waves change <em>when</em> experts arrive,
+never <em>what</em> the GPU computes: kernels, order, and grids are identical with waves on and
+off — which is why the comment can quote a speed delta as a measured fact. Determinism is a
+property of the kernels themselves (section 6.7).</p>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s4">4 · The GPU runtime: what a dispatch becomes</h2>
+<p>
+Section 5 shows the call that launches a kernel. This section is what receives it —
+<code>runtime/metal/MetalBackend.mm</code> — and the three pieces of machinery the pipelined step
+of section 3.1 leans on: a lazy pipeline cache, an event counter shared between GPU and host, and
+a residency set.
+</p>
+
+<h3>5.1 · Submit: validate, resolve, chunk, commit</h3>
+<p>
+<code>submitCommand</code> is thin — <code>submitCommandAsync(dispatches).wait()</code>
+(<code>MetalBackend.mm:1216-1219</code>). The async path, before it commits anything
+(<code>:1342-1520</code>):
+</p>
+<ul>
+  <li><strong>Validates</strong> every dispatch: no empty buffers, no duplicate binding indices,
+  threads-per-threadgroup within the pipeline's own limit (<code>:1385-1421</code>). A typo in a
+  binding index is an exception, not a silent garbage kernel.</li>
+  <li><strong>Resolves pipelines lazily.</strong> The metallib is loaded once at startup
+  (section 5.7); a kernel's compiled pipeline is created on its <em>first use</em> and cached by
+  name (<code>MetalBackend.mm:500-525</code>):</li>
+</ul>
+<pre><code>id&lt;MTLComputePipelineState&gt; cached = [pipelines objectForKey:key];
+if (cached) return cached;
+id&lt;MTLFunction&gt; function = [library newFunctionWithName:key];
+if (!function)
+    throw MetalBackendError("missing Metal function: " + std::string(name));
+... newComputePipelineStateWithFunction ...
+[pipelines setObject:result forKey:key];</code></pre>
+<p>
+So a misspelled kernel name throws at the first dispatch that uses it — with the name in the
+message — not at load time.
+</p>
+<ul>
+  <li><strong>Chunks by working set.</strong> A long dispatch list is split into command buffers
+  whose buffers total at most <code>max(4 GiB, recommendedMaxWorkingSetBytes / 2)</code>
+  (<code>:1447-1452</code>, overridable with <code>SPLASH_CHUNK_WORKING_SET_GIB</code>). A prefill
+  that touches tens of GB of weights becomes many commits the GPU drains continuously, instead of
+  one commit the driver must fit.</li>
+</ul>
+<p>
+Every submission returns a <code>CommandTicket</code>, and a watchdog catches a command that never
+comes back: default 120 s, and “A completed GPU command stops this clock even if its model ticket
+continues waiting for CPU work” (<code>runtime/metal/CommandWatchdog.hpp:10-13</code>).
+</p>
+
+<h3>5.2 · Pipeline events: a counter the GPU and host take turns raising</h3>
+<p>
+The whole protocol is the doc comment on the API (<code>runtime/metal/MetalBackend.hpp:346-352</code>):
+</p>
+<pre><code>// A pipeline: the dispatches split into stages at `stageStarts`, one
+// command buffer each, committed together. Stage k &gt; 0 waits for the
+// pipeline event to reach base + 2k and raises it to base + 2k + 1 when it
+// completes (stage 0 raises base + 1). The caller does host work between
+// stages: waitPipelineEvent(base + 2k - 1), then signalPipelineEvent(base +
+// 2k). The GPU never waits for a submission, only for that signal.</code></pre>
+<p>
+It is one monotonic 64-bit <code>MTLSharedEvent</code> counter shared by all pipelines
+(<code>reservePipelineEvents</code> hands out a fresh base and advances it by
+<code>2·stages + 2</code>, <code>MetalBackend.mm:1260-1270</code>), so an event value can never be
+reused while a previous step is still in flight. The host waits are <em>poll-first</em>, with the
+reason measured (<code>MetalBackend.mm:1272-1275</code>):
+</p>
+<pre><code>// Poll first: a pipeline hands off once per layer, and a blocking wait's
+// wake-up latency, paid 47 times a token, cost ~9 ms. Spinning costs one
+// core for the few hundred microseconds a stage takes.</code></pre>
+<p>
+One refinement makes waves possible: a <strong>quiet stage</strong> waits for its event
+(<code>base + 2k</code>) but raises nothing when it ends
+(<code>MetalBackend.hpp:362-365</code>) — “the host can then start stage k + 1 without waiting for
+stage k: the event only ever moves forward”. That is wave A of section 3.1: the cached-expert stage
+runs, the host's reads land, the host raises the next value, wave B starts — the quiet stage's
+completion is never on the critical path.
+</p>
+
+<div class="fig">
+<svg viewBox="0 0 960 330" role="img" aria-label="Pipeline event protocol: one counter, GPU raises odd values, host raises even values">
+  <defs>
+    <marker id="a6" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 z" fill="#888"/>
+    </marker>
+  </defs>
+  <text x="20" y="30" font-size="13" font-weight="700">the GPU — every stage's command buffer committed at once</text>
+  <rect x="16" y="44" width="170" height="58" rx="10" fill="#f3f4f6" stroke="#9ca3af" stroke-width="1.5"/>
+  <text x="101" y="68" text-anchor="middle" font-size="12" font-weight="600">stage 0</text>
+  <text x="101" y="88" text-anchor="middle" font-size="10.5" fill="#555">runs at once · raises base+1</text>
+  <rect x="226" y="44" width="196" height="58" rx="10" fill="#eef2ff" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="324" y="68" text-anchor="middle" font-size="12" font-weight="600">stage k (GPU)</text>
+  <text x="324" y="88" text-anchor="middle" font-size="10.5" fill="#555">waits base+2k · runs · raises base+2k+1</text>
+  <rect x="462" y="44" width="196" height="58" rx="10" fill="#f0fdf4" stroke="#22c55e" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="560" y="68" text-anchor="middle" font-size="12" font-weight="600">quiet stage (wave A)</text>
+  <text x="560" y="88" text-anchor="middle" font-size="10.5" fill="#555">waits base+2k · runs · raises nothing</text>
+  <rect x="698" y="44" width="196" height="58" rx="10" fill="#eef2ff" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="796" y="68" text-anchor="middle" font-size="12" font-weight="600">stage k+1 (wave B)</text>
+  <text x="796" y="88" text-anchor="middle" font-size="10.5" fill="#555">waits base+2k+2 · runs · raises base+2k+3</text>
+  <line x1="186" y1="73" x2="226" y2="73" stroke="#888" stroke-width="1.5" marker-end="url(#a6)"/>
+  <line x1="422" y1="73" x2="462" y2="73" stroke="#888" stroke-width="1.5" marker-end="url(#a6)"/>
+  <line x1="658" y1="73" x2="698" y2="73" stroke="#888" stroke-width="1.5" marker-end="url(#a6)"/>
+
+  <line x1="16" y1="150" x2="944" y2="150" stroke="#d4d0c8" stroke-width="1"/>
+
+  <text x="20" y="186" font-size="13" font-weight="700">the host — host work between stages</text>
+  <rect x="226" y="200" width="432" height="66" rx="10" fill="#fff7ed" stroke="#f97316" stroke-width="1.5"/>
+  <text x="442" y="224" text-anchor="middle" font-size="12" font-weight="600">waitPipelineEvent(base+2k−1) → host work → signalPipelineEvent(base+2k)</text>
+  <text x="442" y="244" text-anchor="middle" font-size="10.5" fill="#555">polls the counter 20 ms first, then blocks (MetalBackend.mm:1272-1275)</text>
+  <line x1="324" y1="102" x2="324" y2="200" stroke="#f97316" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#a6)"/>
+  <text x="332" y="176" font-size="10.5" fill="#c2410c">GPU raised 2k−1</text>
+  <line x1="560" y1="200" x2="560" y2="102" stroke="#f97316" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#a6)"/>
+  <text x="568" y="132" font-size="10.5" fill="#c2410c">host raises 2k</text>
+  <text x="16" y="308" font-size="12" fill="#555">One shared counter: <tspan font-family="ui-monospace, monospace">reservePipelineEvents(stages)</tspan> returns a fresh base and advances it by 2·stages+2 — a value is never reused while old work is in flight.</text>
+</svg>
+<div class="figcap">Figure 5 — The pipeline-event protocol. Odd values: a GPU stage finished. Even values: the host released the next stage. Quiet stages take part without raising, so the host controls release.</div>
+</div>
+
+<h3>5.3 · Residency: pinning the expert cache</h3>
+<p>
+Metal maps buffers into the GPU's page tables lazily. For a normal app that is a feature; for a
+34 GiB expert cache touched every layer it is a stall, as the call site spells out
+(<code>models/qwen4exp/Qwen4Exp.cpp:727-730</code>):
+</p>
+<pre><code>// Keep every expert cache resident on the GPU. Otherwise the driver maps
+// each layer's cache on first use - ~14 ms a layer, ~0.7 s for a step -
+// and again after a long prompt, streamed through whole layer files,
+// evicted them.</code></pre>
+<p>
+<code>backend.keepResident(resident)</code> (<code>Qwen4Exp.cpp:742</code>) puts the cache buffers
+in a residency set attached to the queue; the backend adds each allocation and calls
+<code>requestResidency</code> once (<code>MetalBackend.mm:1240-1258</code>) — “instead of the
+driver making them resident when a command first uses them — and again after something large
+evicted them” (<code>MetalBackend.hpp:353-356</code>). The host-side staging buffers for streamed
+experts are additionally <code>mlock</code>ed (<code>Qwen4Exp.cpp:738-740</code>) so the pages the
+SSD reads land where the GPU is already looking. <code>SPLASH_NO_RESIDENCY_SET=1</code> disables
+it for A/B measurement.
+</p>
+
+<h3>5.4 · The knobs that change runtime behavior</h3>
+<p>All of section 3.1 is env-var switchable — every optimization is a measured delta with an off switch:</p>
+<table>
+  <tr><th>Environment variable</th><th>Default</th><th>Effect</th><th>Cited at</th></tr>
+  <tr><td><code>SPLASH_NO_PIPELINE</code></td><td>off</td><td>pipelined decode step → plain synchronous submit</td><td><code>Qwen4ExpTarget.cpp:2782</code></td></tr>
+  <tr><td><code>SPLASH_DECODE_WAVES</code></td><td>on</td><td>turn the two-stage (A/B) wave split off</td><td><code>Qwen4ExpTarget.cpp:2810</code></td></tr>
+  <tr><td><code>SPLASH_NO_LOOKAHEAD</code></td><td>off</td><td>no layer L+2 route prediction / prefetch</td><td><code>Qwen4ExpTarget.cpp:2786</code></td></tr>
+  <tr><td><code>SPLASH_LOOKAHEAD_EXPERTS</code></td><td>6</td><td>how many predicted experts to prefetch</td><td><code>Qwen4ExpTarget.cpp:2087</code></td></tr>
+  <tr><td><code>SPLASH_TRACE_STAGES</code></td><td>off</td><td>print per-stage host waits for the first 3 steps</td><td><code>Qwen4ExpTarget.cpp:2873</code></td></tr>
+  <tr><td><code>SPLASH_NO_RESIDENCY_SET</code></td><td>off</td><td>don't pin the expert cache (section 4.3)</td><td><code>Qwen4Exp.cpp:741</code></td></tr>
+  <tr><td><code>SPLASH_CHUNK_WORKING_SET_GIB</code></td><td>auto</td><td>command-buffer working-set cap (section 4.1)</td><td><code>MetalBackend.mm:1447</code></td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="s5">5 · How kernels are created</h2>
+<p>
+A <em>kernel</em> is a function that runs on the GPU: thousands of its copies execute at once,
+each doing a small slice of the work. This section walks through the whole lifecycle of one,
+using real kernels from this repository, in the order you would create them.
+</p>
+
+<h3>5.1 · The six-stage lifecycle</h3>
+
+<div class="fig">
+<svg viewBox="0 0 960 210" role="img" aria-label="Kernel lifecycle, six stages">
+  <defs>
+    <marker id="a4" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 z" fill="#888"/>
+    </marker>
+  </defs>
+  <rect x="12"  y="36" width="136" height="90" rx="10" fill="#f3f4f6" stroke="#9ca3af" stroke-width="1.5"/>
+  <text x="80" y="62" text-anchor="middle" font-size="13" font-weight="600">1 · Decide</text>
+  <text x="80" y="80" text-anchor="middle" font-size="11" fill="#555">shared kernel or</text>
+  <text x="80" y="94" text-anchor="middle" font-size="11" fill="#555">model-only kernel?</text>
+  <line x1="148" y1="81" x2="166" y2="81" stroke="#888" stroke-width="1.5" marker-end="url(#a4)"/>
+
+  <rect x="168" y="36" width="136" height="90" rx="10" fill="#fff7ed" stroke="#f97316" stroke-width="1.5"/>
+  <text x="236" y="62" text-anchor="middle" font-size="13" font-weight="600">2 · ABI struct</text>
+  <text x="236" y="80" text-anchor="middle" font-size="11" fill="#555">the C++/Metal contract</text>
+  <text x="236" y="94" text-anchor="middle" font-size="11" fill="#555">abi/*.h</text>
+  <line x1="304" y1="81" x2="322" y2="81" stroke="#888" stroke-width="1.5" marker-end="url(#a4)"/>
+
+  <rect x="324" y="36" width="136" height="90" rx="10" fill="#fff7ed" stroke="#f97316" stroke-width="1.5"/>
+  <text x="392" y="62" text-anchor="middle" font-size="13" font-weight="600">3 · Kernel</text>
+  <text x="392" y="80" text-anchor="middle" font-size="11" fill="#555">the GPU function</text>
+  <text x="392" y="94" text-anchor="middle" font-size="11" fill="#555">kernels/*.metal</text>
+  <line x1="460" y1="81" x2="478" y2="81" stroke="#888" stroke-width="1.5" marker-end="url(#a4)"/>
+
+  <rect x="480" y="36" width="136" height="90" rx="10" fill="#f0fdf4" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="548" y="62" text-anchor="middle" font-size="13" font-weight="600">4 · Build</text>
+  <text x="548" y="80" text-anchor="middle" font-size="11" fill="#555">make → .air →</text>
+  <text x="548" y="94" text-anchor="middle" font-size="11" fill="#555">build/splash.metallib</text>
+  <line x1="616" y1="81" x2="634" y2="81" stroke="#888" stroke-width="1.5" marker-end="url(#a4)"/>
+
+  <rect x="636" y="36" width="136" height="90" rx="10" fill="#f0fdf4" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="704" y="62" text-anchor="middle" font-size="13" font-weight="600">5 · Dispatch</text>
+  <text x="704" y="80" text-anchor="middle" font-size="11" fill="#555">g.add("name", buffers,</text>
+  <text x="704" y="94" text-anchor="middle" font-size="11" fill="#555">params, grid, threads)</text>
+  <line x1="772" y1="81" x2="790" y2="81" stroke="#888" stroke-width="1.5" marker-end="url(#a4)"/>
+
+  <rect x="792" y="36" width="136" height="90" rx="10" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="860" y="62" text-anchor="middle" font-size="13" font-weight="600">6 · Test</text>
+  <text x="860" y="80" text-anchor="middle" font-size="11" fill="#555">must match numpy/torch</text>
+  <text x="860" y="94" text-anchor="middle" font-size="11" fill="#555">on random inputs</text>
+
+  <path d="M 860 126 L 860 168 L 392 168 L 392 128" fill="none" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#a4)"/>
+  <text x="626" y="162" text-anchor="middle" font-size="11" fill="#3b82f6">fix &amp; retest</text>
+</svg>
+<div class="figcap">Figure 6 — The kernel lifecycle. Stages 1–3 are writing; 4–5 are plumbing the build gives you; 6 is the part that catches bugs.</div>
+</div>
+
+<h3>5.2 · Stage 1: shared kernel, or model-only kernel?</h3>
+<table>
+  <tr><th></th><th>Shared</th><th>Model-only</th></tr>
+  <tr>
+    <td><strong>Location</strong></td>
+    <td><code>runtime/metal/kernels/{prefill,decode,shared}/*.metal</code></td>
+    <td><code>models/qwen4exp/kernels/*.metal</code></td>
+  </tr>
+  <tr>
+    <td><strong>ABI</strong></td>
+    <td><code>runtime/metal/abi/</code> + <code>runtime/metal/kernels/common/</code></td>
+    <td><code>models/qwen4exp/abi/</code></td>
+  </tr>
+  <tr>
+    <td><strong>Launched from</strong></td>
+    <td><code>runtime/ops/</code> (e.g. <code>operators.linear().addDecode(...)</code>)</td>
+    <td>directly by the model's forward pass (<code>Qwen4ExpTarget.cpp</code>)</td>
+  </tr>
+  <tr>
+    <td><strong>Examples</strong></td>
+    <td>4-bit/8-bit matmul, paged KV attention, MoE tiles, GDN linear attention, sampling</td>
+    <td>hyper-connections, per-layer n-gram embedding, sparse-attention picker, MTP draft pick</td>
+  </tr>
+</table>
+<p>
+Rule of thumb: if a future model in the same family would want the same computation,
+it is shared; if it encodes a quirk of <em>this</em> checkpoint, it is model-only.
+The build picks up <strong>both</strong> folders automatically (see 5.6).
+</p>
+
+<h3>5.3 · Stage 3 first: what a kernel actually looks like</h3>
+<p>
+Start with the simplest real kernel in the repo — RMS normalization,
+<code>runtime/metal/kernels/shared/normalization.metal</code> (20 lines, the whole file):
+</p>
+<pre><code>kernel void norm_rms(device const bfloat *input  [[buffer(0)]],
+                     device const bfloat *weight [[buffer(1)]],
+                     device bfloat *output       [[buffer(2)]],
+                     constant uint &amp;width       [[buffer(3)]],
+                     uint row         [[threadgroup_position_in_grid]],
+                     uint thread_index [[thread_index_in_threadgroup]],
+                     uint lane        [[thread_index_in_simdgroup]],
+                     uint simd_group  [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float reductions[8];
+  float inverse_rms = rms_inverse(input + row * width, width, reductions,
+                                  thread_index, lane, simd_group);
+  for (uint column = thread_index; column &lt; width; column += 256) {
+    output[row * width + column] =
+        bfloat(float(input[row * width + column]) * inverse_rms *
+               float(weight[column]));
+  }
+}</code></pre>
+<p>Read it top to bottom — every line is a pattern you will reuse:</p>
+<table>
+  <tr><th>Line</th><th>What it means</th></tr>
+  <tr><td><code>kernel void norm_rms(...)</code></td>
+      <td>A GPU function. Its <strong>name is the dispatch name</strong> used later by C++.</td></tr>
+  <tr><td><code>device const bfloat *input [[buffer(0)]]</code></td>
+      <td>A pointer into GPU memory, bound at <strong>index 0</strong>. The C++ side passes buffers
+      in a list; buffer <em>i</em> in the list is <code>[[buffer(i)]]</code> here.</td></tr>
+  <tr><td><code>constant uint &amp;width [[buffer(3)]]</code></td>
+      <td>A small scalar parameter, bound <strong>after</strong> the device buffers.</td></tr>
+  <tr><td><code>uint row [[threadgroup_position_in_grid]]</code></td>
+      <td>"Which piece of the work am I?" Here: <strong>one threadgroup per row</strong>, so
+      threadgroup X normalizes row X.</td></tr>
+  <tr><td><code>uint thread_index</code> (0…255)</td>
+      <td>Which of the 256 threads inside my threadgroup am I.</td></tr>
+  <tr><td><code>lane</code> / <code>simd_group</code></td>
+      <td>My position inside a 32-lane SIMD group — used by the fast 32-wide reductions.</td></tr>
+  <tr><td><code>threadgroup float reductions[8]</code></td>
+      <td>Scratch memory <strong>shared by the 256 threads</strong> of this threadgroup.</td></tr>
+  <tr><td><code>for (column = thread_index; column &lt; width; column += 256)</code></td>
+      <td>The universal loop: 256 threads each stride through the row, 256 elements apart.</td></tr>
+</table>
+
+<h3>5.4 · The parallelism model</h3>
+<p>
+Everything in a kernel is one of three coordination levels. Learn these three and every kernel in
+this repo becomes readable:
+</p>
+
+<div class="fig">
+<svg viewBox="0 0 960 330" role="img" aria-label="Thread hierarchy: grid, threadgroup, simdgroup, lane">
+  <rect x="40" y="30" width="560" height="270" rx="12" fill="#eef2ff" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="60" y="58" font-size="13" font-weight="600">Grid of threadgroups</text>
+  <text x="60" y="76" font-size="11" fill="#555">e.g. 64 in mtp_pick — one per vocabulary slice</text>
+  <rect x="80" y="96" width="480" height="170" rx="12" fill="#faf5ff" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="100" y="124" font-size="13" font-weight="600">one threadgroup = 256 threads</text>
+  <text x="100" y="142" font-size="11" fill="#555">shares `threadgroup` scratch memory</text>
+  <rect x="120" y="160" width="400" height="80" rx="12" fill="#fff7ed" stroke="#f97316" stroke-width="1.5"/>
+  <text x="140" y="188" font-size="13" font-weight="600">one simdgroup = 32 lanes</text>
+  <text x="140" y="206" font-size="11" fill="#555">registers only — reduced with simd_*</text>
+  <rect x="160" y="216" width="320" height="80" rx="10" fill="#f0fdf4" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="320" y="262" text-anchor="middle" font-size="13" font-weight="600">one lane = one thread</text>
+  <text x="640" y="110" font-size="12.5">strided loop:</text>
+  <text x="640" y="128" font-size="12.5" font-family="ui-monospace, monospace" fill="#444">for (i = tid; i &lt; n; i += 256)</text>
+  <text x="640" y="170" font-size="12.5">inside one simdgroup (32 lanes):</text>
+  <text x="640" y="188" font-size="12.5" font-family="ui-monospace, monospace" fill="#444">simd_max · simd_sum</text>
+  <text x="640" y="206" font-size="12.5" font-family="ui-monospace, monospace" fill="#444">simd_shuffle_down</text>
+  <text x="640" y="248" font-size="12.5">across the whole threadgroup:</text>
+  <text x="640" y="266" font-size="12.5" font-family="ui-monospace, monospace" fill="#444">threadgroup_barrier(…)</text>
+</svg>
+<div class="figcap">Figure 7 — The hierarchy. A 256-thread threadgroup = 8 simdgroups × 32 lanes.</div>
+</div>
+
+<table>
+  <tr><th>You want to…</th><th>Use</th><th>Scope</th></tr>
+  <tr><td>Split work across many threads</td><td>strided loop with <code>thread_index</code></td><td>all 256 threads</td></tr>
+  <tr><td>Reduce across 32 lanes fast</td><td><code>simd_max</code>, <code>simd_sum</code>, <code>simd_shuffle_down</code></td><td>one simdgroup</td></tr>
+  <tr><td>Share values between threads</td><td><code>threadgroup</code> memory</td><td>one threadgroup</td></tr>
+  <tr><td>Make sure everyone wrote before someone reads</td><td><code>threadgroup_barrier(mem_flags::mem_threadgroup)</code></td><td>one threadgroup</td></tr>
+</table>
+
+<h3>5.5 · Stage 2: the ABI — the contract between C++ and Metal</h3>
+<p>
+Kernels receive their parameters as one plain struct. That struct must have the exact same
+layout on both sides of the GPU boundary, so it is written <strong>once</strong> and included by
+both the C++ dispatcher and the <code>.metal</code> file.
+Example — <code>models/qwen4exp/abi/HyperConnection.h</code> (whole file):
+</p>
+<pre><code>#pragma once
+// Parameter layouts shared by host dispatch code and Metal kernels.
+#ifdef __METAL_VERSION__
+#include &lt;metal_stdlib&gt;
+#else
+#include &lt;stdint.h&gt;
+#endif
+
+struct HyperConnectionParams {
+  uint32_t rows;
+  uint32_t hidden;
+  uint32_t count;
+  uint32_t low_rank;
+  float epsilon;
+  uint32_t with_inject;   // 1 = also compute injection gates
+  uint32_t row_step;      // logical row r lives at physical row r * row_step
+  uint32_t splits;        // 0 or 1 = no split
+};
+
+static_assert(sizeof(HyperConnectionParams) == 32,
+              "HyperConnectionParams must be 32 bytes on both sides");</code></pre>
+<ul>
+  <li><code>#ifdef __METAL_VERSION__</code> — the <em>same file</em> compiles under both the
+  C++ toolchain and the Metal compiler.</li>
+  <li><code>static_assert(sizeof(...) == 32)</code> — if the layouts ever drift, the build fails.
+  This is the whole safety mechanism.</li>
+  <li>Only plain data (<code>uint32_t</code>, <code>float</code>) — the dispatcher
+  <code>memcpy</code>s the struct straight into the command stream (see 5.8).</li>
+</ul>
+
+<h3>5.6 · Stage 4: the build — three make rules</h3>
+<p>
+You do not write any build glue. <code>Makefile</code> compiles <strong>every</strong>
+<code>.metal</code> file in both kernel folders into one library:
+</p>
+<pre><code># Makefile:30-34 — which files count as kernels
+PRODUCTION_KERNEL_SOURCES := $(sort $(wildcard \
+    runtime/metal/kernels/prefill/*.metal \
+    runtime/metal/kernels/decode/*.metal \
+    runtime/metal/kernels/shared/*.metal))
+MODEL_KERNEL_SOURCES := $(sort $(wildcard models/*/kernels/*.metal))
+
+# Makefile:163 — one .air per .metal file
+$(METAL_BUILD)/%.air: runtime/metal/kernels/%.metal $(KERNEL_HEADERS)
+    $(METAL) $(PROD_METALFLAGS) -c $&lt; -o $@      # xcrun -sdk macosx metal, -std=metal4.0 -O3 -Werror
+
+# Makefile:173 — all .air files into one library
+$(LIB): $(PRODUCTION_AIRS)
+    $(METALLIB) $(BUILD_INPUTS) -o $@             # → build/splash.metallib</code></pre>
+<p>
+So the moment you drop <code>models/qwen4exp/kernels/my_kernel.metal</code> in the folder,
+<code>make</code> picks it up and it is in <code>build/splash.metallib</code>.
+That one metallib contains <em>every</em> kernel, shared and model-specific.
+</p>
+
+<h3>5.7 · The loading side — what happens at startup</h3>
+<p>
+<code>runtime/metal/MetalBackend.mm</code> reads that single file once, when the engine starts
+(around lines 660–710):
+</p>
+<pre><code>NSData *fileData = [NSData dataWithContentsOfFile:path ...];        // build/splash.metallib
+CC_SHA256(bytes, byteCount, impl_-&gt;metallibSha256.data());          // hash exactly what Metal gets
+impl_-&gt;library = [impl_-&gt;device newLibraryWithData:mapped error:&amp;error];  // MetalBackend.mm:702
+impl_-&gt;pipelines = [NSMutableDictionary dictionary];                 // name → pipeline, created lazily</code></pre>
+<p>
+A <em>pipeline</em> is the compiled form of one kernel (function + threadgroup size), created on
+first use and cached by name. That is why dispatching is just a <strong>string</strong>:
+</p>
+
+<h3>5.8 · Stage 5: dispatching — one function call</h3>
+<p>
+The whole dispatch API is <code>runtime/metal/CommandGraph.hpp</code>. You collect dispatches
+into a graph, then submit it:
+</p>
+<pre><code>// CommandGraph.hpp — the two overloads
+void add(std::string pipeline, std::vector&lt;MetalBuffer&gt; buffers,
+         DispatchSize groups, DispatchSize threads = {256, 1, 1});
+
+template &lt;class Params&gt;
+void add(std::string pipeline, std::vector&lt;MetalBuffer&gt; buffers,
+         const Params &amp;params, DispatchSize groups,
+         DispatchSize threads = {256, 1, 1});
+// rules: buffers bind at [[buffer(0..n-1)]]; params binds at [[buffer(n)]];
+//        params must be trivially copyable (it is memcpy'd into the graph)</code></pre>
+<p>
+A real call — the draft-head pick from <code>models/qwen4exp/Qwen4ExpTarget.cpp:2499</code>:
+</p>
+<pre><code>b.add("mtp_pick_slices",
+      {backend.view(buffers.logits, (live - 1) * scored * 2, scored * 2),  // [[buffer(0)]]
+       weights.mtpPickIds,                                                  // [[buffer(1)]]
+       weights.mtpPickValues,                                               // [[buffer(2)]]
+       weights.mtpPickMass},                                                // [[buffer(3)]]
+      scored,             // the vocabulary size → constant uint &amp; [[buffer(4)]]
+      {kSlices, 1, 1},    // grid: 64 threadgroups
+      {256, 1, 1});       // 256 threads per threadgroup
+...
+(void)backend.submitCommand(b.dispatches());   // → GPU, pipelined</code></pre>
+<p>
+Read the C++ call against the kernel signature in <code>models/qwen4exp/kernels/mtp_pick.metal:15-23</code>
+— the buffer order, the scalar parameter, and the grid all line up one-for-one.
+<code>submitCommand</code> encodes the list into Metal command buffers on a queue with 256 buffers
+in flight, so decode stages overlap (section 4.1; the comment at <code>MetalBackend.mm:661-665</code> explains
+why the queue is sized that way).
+</p>
+
+<h3>5.9 · Walkthrough of a real kernel: <code>mtp_pick.metal</code></h3>
+<p>
+Now you have the vocabulary. Let's read a kernel that does something non-trivial:
+<strong>find the 16 largest values among 248K logits</strong> — the draft head's "what do I guess?"
+step. The problem with the obvious approach: scanning 248K logits on the CPU means copying them
+out of the GPU, which is slow. The kernel's trick: <strong>64 threadgroups each keep only their 16
+best candidates</strong>; the host merges 64 × 16 = 1024 candidates in a few microseconds.
+The file header says exactly this (<code>mtp_pick.metal:6-9</code>).
+</p>
+
+<p><strong>The signature</strong> (<code>mtp_pick.metal:15-23</code>):</p>
+<pre><code>kernel void mtp_pick_slices(device const bfloat *logits [[buffer(0)]],
+                            device uint *ids     [[buffer(1)]],
+                            device float *values [[buffer(2)]],
+                            device float *mass   [[buffer(3)]],
+                            constant uint &amp;vocabulary [[buffer(4)]],
+                            uint slice        [[threadgroup_position_in_grid]],
+                            uint thread_index [[thread_index_in_threadgroup]],
+                            uint simd_lane   [[thread_index_in_simdgroup]],
+                            uint simd_group  [[simdgroup_index_in_threadgroup]]) {</code></pre>
+<p>
+Grid = 64 threadgroups; threadgroup <em>s</em> owns vocabulary slice <em>s</em>
+(3,880 logits each — 248,320 vocabulary ÷ 64 slices, <code>Qwen4Exp.hpp:43</code>). Output: per slice, the 16 largest (ids + values) plus the slice's max and
+softmax mass — enough for the host to compute the exact top token <em>and</em> its probability.
+</p>
+
+<p><strong>Phase 1 — max and mass</strong> (<code>mtp_pick.metal:30-53</code>):</p>
+<pre><code>threadgroup float staged[kPickSliceMax];        // scratch: my slice, in shared memory
+float local_max = -INFINITY;
+for (uint i = thread_index; i &lt; count; i += kPickThreads) {
+  const float v = float(logits[first + i]);
+  staged[i] = v;                                 // park it in scratch
+  local_max = max(local_max, v);
+}
+local_max = simd_max(local_max);                 // reduce across my 32 lanes
+if (simd_lane == 0) best_value[simd_group] = local_max;   // lane 0 of each simdgroup writes scratch
+threadgroup_barrier(mem_flags::mem_threadgroup); // all 8 simdgroups done writing?
+// thread 0 reads the 8 per-simdgroup maxima → slice max m; second pass computes
+// sum += exp(staged[i] - m) the same way → mass[2*slice] = m, mass[2*slice+1] = total</code></pre>
+<p>
+Every pattern from Figure 7 appears here: strided loop → <code>simd_max</code> → lane 0 writes
+threadgroup scratch → <code>threadgroup_barrier</code> → thread 0 combines the 8 simdgroups.
+</p>
+
+<p><strong>Phase 2 — sixteen rounds of argmax</strong> (<code>mtp_pick.metal:54-82</code>):</p>
+<pre><code>// Sixteen rounds of (value, lowest index) argmax, removing each winner.
+for (uint round = 0; round &lt; kPickCandidates; ++round) {
+  // strided scan for (max value, lowest index) across my slice...
+  for (uint i = thread_index; i &lt; count; i += kPickThreads)
+    if (staged[i] &gt; v) { v = staged[i]; index = i; }
+  // ...then a 32-lane tournament:
+  for (uint offset = 16; offset &gt; 0; offset /= 2) {
+    const float other_v = simd_shuffle_down(v, offset);
+    const uint  other_i = simd_shuffle_down(index, offset);
+    if (other_v &gt; v || (other_v == v &amp;&amp; other_i &lt; index)) { v = other_v; index = other_i; }
+  }
+  // barrier; lane 0 of each simdgroup publishes; thread 0 picks the overall winner:
+  ids[slice * 16 + round] = bi == 0xFFFFFFFFu ? 0xFFFFFFFFu : first + bi;  // sentinel when a slice is short
+  values[slice * 16 + round] = bv;
+  if (bi != 0xFFFFFFFFu) staged[bi] = -INFINITY;   // erase the winner → next round finds the next max
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}</code></pre>
+<p>
+Note the trick in the last line: there is no "remove element" in shared memory — the winner is
+just <strong>erased by setting it to −∞</strong>, so the next round's argmax finds the next-largest.
+Ties break toward the lower token id (determinism — the engine's output must be reproducible).
+</p>
+<p>
+And the C++ half of the contract (<code>Qwen4ExpTarget.cpp:2530-2560</code>) reads the 1024
+candidates back, merges them into the top 16, and computes the exact confidence from each slice's
+<code>(max, sum-of-exp)</code> pair — no second GPU pass needed.
+</p>
+
+<h3>5.10 · The ops layer: how shared kernels get launched</h3>
+<p>
+Model code never names shared kernels directly. It calls an op, e.g.
+<code>operators.linear().addDecodeBatch(graph, input, weights, output, ...)</code>, and the op
+chooses the right <em>variant</em>. Look at <code>runtime/ops/Linear.cpp</code>:
+</p>
+<ul>
+  <li><strong>Variant selection</strong> — the <code>LinearPlan</code> constructor (~line 124)
+  maps (phase, rows, epilogue, tile) to a pipeline name like
+  <code>"decode_linear_q4_n128_m24"</code> or <code>"prefill_linear_q4_n256_up_silu_sums"</code>.
+  Dozens of hand-tuned variants live in <code>runtime/metal/kernels/{prefill,decode}/linear_q4.metal</code>.</li>
+  <li><strong>Grid sizing</strong> — <code>decodeGroups()</code> (~line 236) computes how many
+  threadgroups to launch so the GPU cores stay balanced; the thresholds are <em>measured</em> on
+  Apple9/Apple10 GPUs, as the comments say.</li>
+  <li><strong>Validation</strong> — <code>validate()</code> rejects workloads the kernels cannot
+  express (e.g. sizes not divisible by the quantization group), loudly, at plan time.</li>
+</ul>
+<p>
+That is the pattern for any shared kernel family: <em>the .metal file has the variants;
+the op has the policy; the model folder just asks</em>.
+</p>
+
+<h3>5.11 · Stage 6: proving a kernel is right</h3>
+<p>
+Each kernel has a test that runs it on the GPU and compares against a CPU implementation
+(numpy/torch) on random inputs. They live in <code>dev/tests/engine/</code>:
+</p>
+<p>
+<code>hyper_connection_metal_test.mm</code> · <code>per_layer_embedding_metal_test.mm</code> ·
+<code>qsa_indexer_metal_test.mm</code> · <code>qsa_select_metal_test.mm</code> ·
+<code>moe_route_512_metal_test.mm</code> · <code>q8_paged_kv_metal_test.mm</code> ·
+<code>gdn_decode_metal_test.mm</code> · <code>q4_batched_projection_metal_test.mm</code> —
+and more.
+</p>
+<div class="callout warn">
+<p><strong>The discipline that matters</strong> (from <code>docs/new-model-playbook.md</code>):
+a test that agrees with itself proves nothing. One port here wrote a synthetic package with the
+<em>same wrong assumption</em> as the loader — the test passed, every real package would have
+failed. Compare against the original model, or against the checkpoint's own tensors, never
+against a copy of your own assumption.</p>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s6">6 · The kernel catalog</h2>
+<p>
+Section 5 showed <em>how</em> a kernel is written. This section is an index of <em>which</em>
+kernels exist and the one idea each is built on. Every family below is in the metallib (section
+5.6); every name is grep-able. Read it as a map: family → file → the representative entry point →
+how it uses threads.
+</p>
+
+<div class="fig">
+<svg viewBox="0 0 960 560" role="img" aria-label="Kernel families: files, representative entries, parallelism">
+  <defs>
+    <marker id="a7" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 z" fill="#888"/>
+    </marker>
+  </defs>
+  <text x="20" y="34" font-size="13" font-weight="700">six families — runtime/metal/kernels/ (shared) + models/qwen4exp/kernels/ (model)</text>
+
+  <rect x="16" y="56" width="300" height="140" rx="10" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="166" y="82" text-anchor="middle" font-size="13" font-weight="700">Q4 matmul</text>
+  <text x="166" y="102" text-anchor="middle" font-size="10.5" fill="#555">decode/ + prefill/linear_q4.metal</text>
+  <text x="166" y="118" text-anchor="middle" font-size="10.5" fill="#555">tile engine: common/q4_mpp_tiles.h</text>
+  <text x="166" y="138" text-anchor="middle" font-size="10.5" font-family="ui-monospace, monospace">decode_linear_q4_n128_m24 …</text>
+  <text x="166" y="158" text-anchor="middle" font-size="10.5" fill="#555">one 8-row × TileN output tile per threadgroup;</text>
+  <text x="166" y="174" text-anchor="middle" font-size="10.5" fill="#555">persistent tiles, K walked in 64-col groups</text>
+
+  <rect x="330" y="56" width="300" height="140" rx="10" fill="#eef2ff" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="480" y="82" text-anchor="middle" font-size="13" font-weight="700">MoE</text>
+  <text x="480" y="102" text-anchor="middle" font-size="10.5" fill="#555">shared/moe.metal (810 lines)</text>
+  <text x="480" y="122" text-anchor="middle" font-size="10.5" font-family="ui-monospace, monospace">moe_route_select_q8_n512</text>
+  <text x="480" y="138" text-anchor="middle" font-size="10.5" font-family="ui-monospace, monospace">moe_group_routes_512 · moe_gather_rows</text>
+  <text x="480" y="154" text-anchor="middle" font-size="10.5" font-family="ui-monospace, monospace">moe_expert_gate_up/down_q4_*( _range)</text>
+  <text x="480" y="174" text-anchor="middle" font-size="10.5" fill="#555">tokens bucketed by expert → tile descriptors</text>
+
+  <rect x="644" y="56" width="300" height="140" rx="10" fill="#faf5ff" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="794" y="82" text-anchor="middle" font-size="13" font-weight="700">Attention</text>
+  <text x="794" y="102" text-anchor="middle" font-size="10.5" fill="#555">decode/ + prefill/attention_q8.metal</text>
+  <text x="794" y="118" text-anchor="middle" font-size="10.5" fill="#555">tile: common/q8_attention_tile.h</text>
+  <text x="794" y="138" text-anchor="middle" font-size="10.5" font-family="ui-monospace, monospace">verify_attention_q8_split_kv2_g8</text>
+  <text x="794" y="154" text-anchor="middle" font-size="10.5" font-family="ui-monospace, monospace">…_reduce · …_cooperative_scale</text>
+  <text x="794" y="174" text-anchor="middle" font-size="10.5" fill="#555">threadgroup = (KV head, query tile, history split)</text>
+
+  <rect x="16" y="214" width="300" height="140" rx="10" fill="#fff7ed" stroke="#f97316" stroke-width="1.5"/>
+  <text x="166" y="240" text-anchor="middle" font-size="13" font-weight="700">GDN (gated delta net)</text>
+  <text x="166" y="260" text-anchor="middle" font-size="10.5" fill="#555">decode/gdn.metal · prefill/gdn.metal</text>
+  <text x="166" y="280" text-anchor="middle" font-size="10.5" font-family="ui-monospace, monospace">verify_gdn_fused(_vh32)</text>
+  <text x="166" y="296" text-anchor="middle" font-size="10.5" font-family="ui-monospace, monospace">verify_gdn_commit(_vh32)</text>
+  <text x="166" y="312" text-anchor="middle" font-size="10.5" font-family="ui-monospace, monospace">prefill_gdn_prepare/scan/gate</text>
+  <text x="166" y="332" text-anchor="middle" font-size="10.5" fill="#555">128 state rows over 8 simdgroups; grid_completion</text>
+  <text x="166" y="346" text-anchor="middle" font-size="10.5" fill="#555">barrier between phases</text>
+
+  <rect x="330" y="214" width="300" height="140" rx="10" fill="#f0fdf4" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="480" y="240" text-anchor="middle" font-size="13" font-weight="700">Sampling</text>
+  <text x="480" y="260" text-anchor="middle" font-size="10.5" fill="#555">decode/sampling.metal (563 lines)</text>
+  <text x="480" y="280" text-anchor="middle" font-size="10.5" font-family="ui-monospace, monospace">decode_sample_top32_sharded(_batch)</text>
+  <text x="480" y="296" text-anchor="middle" font-size="10.5" font-family="ui-monospace, monospace">decode_sample_sparse_draw · _top1</text>
+  <text x="480" y="312" text-anchor="middle" font-size="10.5" font-family="ui-monospace, monospace">decode_accept_dflash · verify_input_tokens</text>
+  <text x="480" y="332" text-anchor="middle" font-size="10.5" fill="#555">vocabulary slices per threadgroup; sorted</text>
+  <text x="480" y="346" text-anchor="middle" font-size="10.5" fill="#555">shards merged in fixed order</text>
+
+  <rect x="644" y="214" width="300" height="140" rx="10" fill="#f3f4f6" stroke="#9ca3af" stroke-width="1.5"/>
+  <text x="794" y="240" text-anchor="middle" font-size="13" font-weight="700">Model kernels</text>
+  <text x="794" y="260" text-anchor="middle" font-size="10.5" fill="#555">models/qwen4exp/kernels/*.metal</text>
+  <text x="794" y="280" text-anchor="middle" font-size="10.5" font-family="ui-monospace, monospace">mtp_pick_slices · hyper_connection</text>
+  <text x="794" y="296" text-anchor="middle" font-size="10.5" font-family="ui-monospace, monospace">qsa_indexer · qsa_select</text>
+  <text x="794" y="312" text-anchor="middle" font-size="10.5" font-family="ui-monospace, monospace">per_layer_embedding · ngram_embedding · capture</text>
+  <text x="794" y="332" text-anchor="middle" font-size="10.5" fill="#555">this model only; loaded from the same metallib</text>
+  <text x="794" y="348" text-anchor="middle" font-size="10.5" fill="#555">(section 5.6)</text>
+
+  <text x="480" y="392" text-anchor="middle" font-size="12" fill="#555">plus shared/normalization.metal: one tiny kernel, <tspan font-family="ui-monospace, monospace">norm_rms</tspan>, section 5.3 — one threadgroup per row.</text>
+  <text x="480" y="424" text-anchor="middle" font-size="12" fill="#555">Names encode their shape: n128/n256 = tile width · m16/m24/m32 = rows · _sg4 = 4-simdgroup variant · _residual/_gate_up/_up_silu = fused epilogues.</text>
+  <text x="480" y="448" text-anchor="middle" font-size="11" fill="#999">Variant selection lives in the ops layer (runtime/ops/Linear.cpp:144-192), not in model code — section 5.10.</text>
+</svg>
+<div class="figcap">Figure 8 — The kernel families. Files under <code>runtime/metal/kernels/</code> are shared (prefill/decode/shared/common); <code>models/qwen4exp/kernels/</code> is this model only.</div>
+</div>
+
+<h3>6.1 · Q4 matmul: one tile engine, twenty variants</h3>
+<p>
+Every 4-bit projection in the model runs through one tile engine,
+<code>runtime/metal/kernels/common/q4_mpp_tiles.h</code> (349 lines). A threadgroup computes an
+8-row × TileN block of the output with one Metal tensor op per 64-column quant group:
+<code>matmul2d_descriptor(8, TileN, 64)</code> with <code>execution_simdgroups&lt;8&gt;</code>. The
+4-bit weights are read as a typed tensor view — one aligned read of a 64×TileN tile at
+<code>(quant_group*StorageN + tile_offset)*64/2</code> (<code>q4_mpp_tiles.h:149-155</code>);
+weights are stored in blocks of <code>StorageN = 256</code> output columns, with one bf16
+scale+bias pair per weight row per 64-column group.
+</p>
+<p>
+The epilogue is the part worth reading (<code>q4_mpp_tiles.h:170-178</code>):
+</p>
+<pre><code>accum += partial * scale + input_sums[row] * bias;   // per row, per quant group</code></pre>
+<p>
+Dequantizing with a bias means adding <code>bias × (sum of the group's inputs)</code> — so the bias
+enters as one multiply by a <em>precomputed row sum of the input</em>, never by re-reading weights.
+Those input sums are staged into threadgroup memory one quad of quant groups at a time,
+double-buffered — <code>sum_offset = ((quant_group &gt;&gt; 2) &amp; 1)*32 + (quant_group &amp; 3)*8</code>
+(<code>:171-185</code>) — and the template's <code>Pipelined</code> mode runs two groups' matmuls
+before both epilogues, “bit-identical” per the comment at <code>:190-195</code>. Grids are
+<em>persistent</em>: one threadgroup per (core, wave), each walking output tiles with
+<code>tile += persistent_groups</code>, with a trailing <code>threadgroup_barrier</code> so the next
+tile's prologue cannot overwrite input sums the current epilogue still reads (comment at
+<code>:230-238</code>).
+</p>
+<p>The variants are macros over this engine (<code>decode/linear_q4.metal:8-133</code>):</p>
+<table>
+  <tr><th>name part</th><th>meaning</th><th>example</th></tr>
+  <tr><td><code>n128</code> / <code>n256</code></td><td>TileN — output columns per tile</td><td><code>decode_linear_q4_n128_m24</code></td></tr>
+  <tr><td><code>_m16</code> / <code>_m24</code> / <code>_m32</code></td><td>rows per tile (batch lanes × 8)</td><td><code>…_m32</code></td></tr>
+  <tr><td><code>_sg4</code></td><td>4-simdgroup variant for 3-row lanes (the shape that tile rows leave over)</td><td><code>decode_linear_q4_n128_m24_sg4</code></td></tr>
+  <tr><td><code>_paired</code></td><td>single-lane tiles paired per threadgroup</td><td><code>decode_linear_q4_n128_paired</code></td></tr>
+  <tr><td><code>_residual</code></td><td>fused residual add in the epilogue</td><td><code>decode_linear_q4_n128_residual_m24</code></td></tr>
+  <tr><td><code>_gate_up</code> / <code>_up_silu</code></td><td>fused gate+up matmul / gate·SiLU(up) epilogue: <code>gate/(1+exp2(−1.442695·gate))·up</code></td><td><code>prefill_linear_q4_n256_gate_up</code></td></tr>
+  <tr><td><code>_sums</code></td><td>also writes the input row sums the bias trick needs</td><td><code>prefill_linear_q4_n128_up_silu_sums</code></td></tr>
+</table>
+
+<div class="fig">
+<svg viewBox="0 0 960 320" role="img" aria-label="The Q4 tile: 8 rows by TileN columns, K walked in 64-column quant groups with scale and bias folded in">
+  <defs>
+    <marker id="a8" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 z" fill="#888"/>
+    </marker>
+  </defs>
+  <text x="20" y="34" font-size="13" font-weight="700">one threadgroup, one output tile — loop over K in 64-column quant groups</text>
+
+  <rect x="24" y="56" width="150" height="110" rx="10" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="99" y="84" text-anchor="middle" font-size="12" font-weight="600">inputs</text>
+  <text x="99" y="104" text-anchor="middle" font-size="10.5" fill="#555">8 rows × 64 cols</text>
+  <text x="99" y="120" text-anchor="middle" font-size="10.5" fill="#555">(bf16 activations)</text>
+  <text x="99" y="146" text-anchor="middle" font-size="10.5" fill="#555">+ row sums per group</text>
+
+  <line x1="174" y1="111" x2="212" y2="111" stroke="#888" stroke-width="1.5" marker-end="url(#a8)"/>
+
+  <rect x="212" y="56" width="200" height="110" rx="10" fill="#fff7ed" stroke="#f97316" stroke-width="1.5"/>
+  <text x="312" y="80" text-anchor="middle" font-size="12" font-weight="600">weights: 64 cols × TileN rows</text>
+  <text x="312" y="100" text-anchor="middle" font-size="10.5" fill="#555">4-bit, one aligned tensor read</text>
+  <text x="312" y="116" text-anchor="middle" font-size="10.5" fill="#555">scale + bias: bf16 per row per group</text>
+  <text x="312" y="132" text-anchor="middle" font-size="10.5" fill="#555">stored in StorageN = 256-row blocks</text>
+  <text x="312" y="152" text-anchor="middle" font-size="10.5" fill="#555">at (group·256 + tile_offset)·64/2 bytes</text>
+
+  <line x1="412" y1="111" x2="450" y2="111" stroke="#888" stroke-width="1.5" marker-end="url(#a8)"/>
+
+  <rect x="450" y="56" width="210" height="110" rx="10" fill="#eef2ff" stroke="#6366f1" stroke-width="1.5"/>
+  <text x="555" y="84" text-anchor="middle" font-size="12" font-weight="600">matmul2d(8, TileN, 64)</text>
+  <text x="555" y="104" text-anchor="middle" font-size="10.5" fill="#555">execution_simdgroups&lt;8&gt;</text>
+  <text x="555" y="120" text-anchor="middle" font-size="10.5" fill="#555">one tensor op per group</text>
+  <text x="555" y="146" text-anchor="middle" font-size="10.5" fill="#555">fp32 partial</text>
+
+  <line x1="660" y1="111" x2="698" y2="111" stroke="#888" stroke-width="1.5" marker-end="url(#a8)"/>
+
+  <rect x="698" y="56" width="238" height="110" rx="10" fill="#f0fdf4" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="817" y="80" text-anchor="middle" font-size="12" font-weight="600">epilogue, per group</text>
+  <text x="817" y="100" text-anchor="middle" font-size="11" font-family="ui-monospace, monospace">accum += partial·scale</text>
+  <text x="817" y="118" text-anchor="middle" font-size="11" font-family="ui-monospace, monospace">       + sums[row]·bias</text>
+  <text x="817" y="140" text-anchor="middle" font-size="10.5" fill="#555">bias folded via input row sums —</text>
+  <text x="817" y="154" text-anchor="middle" font-size="10.5" fill="#555">refreshed per 4-group quad, double-buffered</text>
+
+  <text x="24" y="204" font-size="12" fill="#555">Repeat for K/64 groups into the same fp32 accumulator; the threadgroup then writes its 8×TileN tile — with fused epilogues when the name says so (_residual, _up_silu).</text>
+  <text x="24" y="228" font-size="12" fill="#555">Persistent grids: tile += persistent_groups — threadgroups keep taking tiles until the layer's tiles run out; a barrier closes each tile so the next prologue can't race the epilogue.</text>
+  <text x="24" y="266" font-size="11" fill="#999">q4_mpp_tiles.h: descriptor :64 · weight read :149-155 · epilogue :170-185 · pipelined pair :190-195 · barrier comment :230-238</text>
+</svg>
+<div class="figcap">Figure 9 — The Q4 tile engine. The same engine, instantiated ~20 ways (section 6.1's table), runs every 4-bit projection: attention, gating, and all 512 experts.</div>
+</div>
+
+<h3>6.2 · MoE: routing, bucketing, tiles</h3>
+<p><code>runtime/metal/kernels/shared/moe.metal</code> turns “10 of 512 experts per token” into
+grouped GPU work:</p>
+<ul>
+  <li><code>moe_route_select_q8</code> (<code>_n512</code> for this model): top-10 experts + weights
+  from Q8 router scores. Its K-slices are summed in fixed order and ties break to the lower expert
+  id, so the host mirror <code>topExperts</code>
+  (<code>models/qwen4exp/Qwen4ExpTarget.cpp:419</code>) reproduces the GPU's choice bit-for-bit —
+  required, because the host must stage from SSD exactly the experts the GPU picked (section 3.1).</li>
+  <li><code>moe_group_routes</code> (<code>_512</code>): buckets token ids by selected expert and
+  produces the tile descriptors — (which expert, which token rows) — that the tile kernels consume.</li>
+  <li><code>moe_gather_rows</code>: copies selected rows so each expert tile sees a dense block.</li>
+  <li><code>moe_expert_gate_up_q4_*</code> / <code>moe_expert_down_q4_*</code>
+  (<code>m8/m32</code>, <code>n128/n256</code>, <code>_up_silu</code>): the very same Q4 tile engine
+  of section 6.1, pointed at per-expert weights by the descriptors. The <code>_range</code>
+  variants take an expert-range view — the kernels behind wave staging
+  (<code>MoE::addExpertTilesInRange</code>).</li>
+  <li><code>moe_combine</code> (<code>_no_residual</code>): weighted sum of the experts' outputs
+  back into the token stream.</li>
+</ul>
+
+<h3>6.3 · Attention: split-KV over a paged 8-bit cache</h3>
+<p>
+The KV cache is paged in 32-token pages (<code>abi/ExecutionGeometry.h:16</code>) quantized to
+8 bits; verify rows are padded to 8 (<code>abi/ExecutionGeometry.h:7</code>). The shared tile
+header states the parallel contract (<code>runtime/metal/kernels/common/q8_attention_tile.h:15-19</code>):
+</p>
+<pre><code>// A threadgroup owns one KV head, query tile and history split …
+// GQA group as M = rows x query heads per KV head. Each split writes fp32
+// partials and statistics for a fixed-order reduce. Prefill and verify
+// share this device-operand page loop.</code></pre>
+<p>
+So the grid is (KV head × query tile × history-split): long contexts get parallelism by cutting
+the history into splits, each writing fp32 partials plus its (max, sum) statistics; a paired
+<code>_reduce</code> kernel combines them <em>in fixed order</em>, which is what makes split-KV
+bit-reproducible. Inside the tile, the running row-max rescale uses threadgroup atomics
+(<code>q8_attention_tile.h:84</code>). The variants — <code>verify_attention_q8_split</code>,
+<code>_split_cooperative_scale</code>, <code>_split_kv2_g8</code>, <code>_split_kv2_g12</code> and
+their matching <code>_reduce</code>s (<code>decode/attention_q8.metal:142-150, 185+</code>) — trade
+heads-per-threadgroup and page-quantization groups against context length; prefill has mirrored
+kernels over the same page loop.
+</p>
+
+<h3>6.4 · GDN: three phases, one barrier</h3>
+<p>
+The gated-delta-net layers carry a recurrent state per token stream. Decode runs all three phases —
+prologue (4-tap causal conv + SiLU, then q/k RMSNorm,
+<code>common/gdn_primitives.h:5-21</code>), the scan (128 state rows spread over 8 simdgroups),
+and the gate — <strong>inside one kernel launch</strong> for a batch of four requests
+(<code>decode/gdn.metal</code>: <code>verify_gdn_fused</code>/<code>_vh32</code>,
+<code>verify_gdn_commit</code>/<code>_vh32</code>, lanes <code>current0..3/next0..3</code>). The
+phases are separated by a device-side grid barrier, <code>grid_completion</code>
+(<code>decode/gdn.metal:9-20</code>): an atomic arrival counter, and the last thread to arrive
+resets it and bumps a generation counter so the barrier is reusable. Prefill keeps three separate
+kernels (<code>prefill_gdn_prepare/scan/gate</code>) — with many tokens per request, launch
+overhead amortizes away.
+</p>
+
+<h3>6.5 · Sampling: top-K without materializing softmax</h3>
+<p>
+The same shard-and-merge pattern as <code>mtp_pick_slices</code> (section 5.9) runs the sampler.
+Sorted-insert into a fixed top-K list with ties to the lower id
+(<code>top_insert</code>, <code>decode/sampling.metal:4-19</code>), 8 sorted per-simdgroup lists
+merged by <code>top_shard_store</code>, and per-slice (max, sum-of-exp) so the host gets exact
+probabilities. <code>decode_sample_top32_sharded(_batch)</code> and the <code>_probs</code>
+variants fill the top-32 buffer from section 2; <code>decode_sample_sparse_draw</code> samples from
+it; <code>decode_sample_argmax_sharded</code> + <code>_reduce</code> is greedy;
+<code>decode_accept_dflash</code> compares draft guesses against the target's top-1 and counts
+accepted tokens (<code>runtime/ops/Sampling.cpp:191</code>); <code>verify_input_tokens</code>
+commits the accepted run (<code>Sampling.cpp:208</code>).
+</p>
+
+<h3>6.6 · The model's own kernels</h3>
+<ul>
+  <li><code>hyper_connection.metal</code> — the residual-mixing layers. Header states the math:
+  streams are one row of Count×Hidden each;
+  <code>xn = rms_per_stream(x)*(1+gain)</code>; <code>w = silu(down(xn)/Count)</code>;
+  <code>w = sigmoid(up(w))</code>; <code>input = mean over streams of reshape(w)*reshape(xn)</code>;
+  injections scaled by <code>2*sigmoid(block_inject(xn)/Count)</code>.</li>
+  <li><code>qsa_indexer.metal</code> — scores for the sparse-attention block selection: visible keys
+  are compressed into <code>CompressRatio</code>-token blocks (fp32 mean, then
+  <code>rms*(1+k_gain)</code> and RoPE); a block's score is
+  <code>Σ relu(dot(q, rotated_key))/√D</code> over query rows.</li>
+  <li><code>qsa_select.metal</code> — keeps 512 blocks (512 × 128 tokens = 65,536 context) by
+  k-th-largest score. Scores are non-negative, so their IEEE bit patterns sort exactly like the
+  values — a binary search over bit patterns finds the 512th largest, ties broken by block index
+  ascending. No sort, no atomics.</li>
+  <li><code>mtp_pick_slices</code> — section 5.9's walkthrough; <code>per_layer_embedding</code> /
+  <code>ngram_embedding</code> — the embedding lookups of section 3; <code>capture.metal</code> —
+  the capture path of section 2.</li>
+</ul>
+
+<div class="callout tip">
+<p><strong>6.7 · One rule runs through every family: fixed order.</strong> Router K-slices summed
+in a stated order; ties to the lower id in routing, sampling, and block selection; k-th-largest by
+bit pattern; split-KV partials reduced in fixed order. The same GPU inputs produce the same token
+stream, which is what lets the tests in section 5.11 — and the porting playbook's token-for-token
+comparison — mean anything.</p>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s7">7 · Bringing up a new model</h2>
+<p>
+The framework was designed so a new model is <strong>one folder + four registrations</strong>.
+The full procedure is <code>docs/new-model-playbook.md</code>; here is the shape of it.
+</p>
+
+<div class="fig">
+<svg viewBox="0 0 960 440" role="img" aria-label="New model playbook, 11 steps in three phases">
+  <rect x="20" y="20" width="296" height="380" rx="12" fill="#fff" stroke="#e3e1dc"/>
+  <rect x="20" y="20" width="296" height="44" rx="12" fill="#eff6ff" stroke="#3b82f6"/>
+  <text x="168" y="48" text-anchor="middle" font-size="14" font-weight="700">Phase A — prove the reference</text>
+  <rect x="36" y="80" width="264" height="56" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="48" y="104" font-size="12.5" font-weight="600">1 · Read the model</text>
+  <text x="48" y="122" font-size="11.5" fill="#555">every tensor, its shape, forward order</text>
+  <rect x="36" y="148" width="264" height="56" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="48" y="172" font-size="12.5" font-weight="600">2 · Make the reference</text>
+  <text x="48" y="190" font-size="11.5" fill="#555">bf16 CPU logits on fixed prompts, saved</text>
+
+  <rect x="332" y="20" width="296" height="380" rx="12" fill="#fff" stroke="#e3e1dc"/>
+  <rect x="332" y="20" width="296" height="44" rx="12" fill="#fff7ed" stroke="#f97316"/>
+  <text x="480" y="48" text-anchor="middle" font-size="14" font-weight="700">Phase B — build the engine side</text>
+  <rect x="348" y="80" width="264" height="56" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="360" y="104" font-size="12.5" font-weight="600">3 · Layout struct</text>
+  <text x="360" y="122" font-size="11.5" fill="#555">constants + compile-time size checks</text>
+  <rect x="348" y="144" width="264" height="56" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="360" y="168" font-size="12.5" font-weight="600">4 · Converter</text>
+  <text x="360" y="186" font-size="11.5" fill="#555">checkpoint → quantized package; dry-run loads</text>
+  <rect x="348" y="208" width="264" height="56" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="360" y="232" font-size="12.5" font-weight="600">5 · New kernels</text>
+  <text x="360" y="250" font-size="11.5" fill="#555">each matches numpy/torch on random inputs</text>
+  <rect x="348" y="272" width="264" height="56" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="360" y="296" font-size="12.5" font-weight="600">6 · One layer at a time</text>
+  <text x="360" y="314" font-size="11.5" fill="#555">layer 0 vs reference, then layer N</text>
+  <rect x="348" y="336" width="264" height="56" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="360" y="360" font-size="12.5" font-weight="600">7 · Whole model</text>
+  <text x="360" y="378" font-size="11.5" fill="#555">top-pick agreement + KL vs reference</text>
+
+  <rect x="644" y="20" width="296" height="380" rx="12" fill="#fff" stroke="#e3e1dc"/>
+  <rect x="644" y="20" width="296" height="44" rx="12" fill="#f0fdf4" stroke="#22c55e"/>
+  <text x="792" y="48" text-anchor="middle" font-size="14" font-weight="700">Phase C — speed &amp; serve</text>
+  <rect x="660" y="80" width="264" height="56" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="672" y="104" font-size="12.5" font-weight="600">8 · Memory plan</text>
+  <text x="672" y="122" font-size="11.5" fill="#555">real package at target context, with margin</text>
+  <rect x="660" y="144" width="264" height="56" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="672" y="168" font-size="12.5" font-weight="600">9 · Decode speed</text>
+  <text x="672" y="186" font-size="11.5" fill="#555">measured per part, with a draft method</text>
+  <rect x="660" y="208" width="264" height="56" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="672" y="232" font-size="12.5" font-weight="600">10 · Server</text>
+  <text x="672" y="250" font-size="11.5" fill="#555">template, thinking levels, tools via real client</text>
+  <rect x="660" y="272" width="264" height="56" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="672" y="296" font-size="12.5" font-weight="600">11 · Quality benchmarks</text>
+  <text x="672" y="314" font-size="11.5" fill="#555">paired against the best existing engine</text>
+  <text x="792" y="378" text-anchor="middle" font-size="11.5" fill="#888">qwen4exp example for each step: playbook table</text>
+</svg>
+<div class="figcap">Figure 10 — The 11-step playbook. Each step has a "done when" check; the qwen4exp column of the playbook table names the exact files used.</div>
+</div>
+
+<h3>Where the code goes</h3>
+<table>
+  <tr><th><code>models/&lt;name&gt;/</code></th><th>What it holds</th><th>qwen4exp example</th></tr>
+  <tr><td><code>&lt;Name&gt;.hpp/.cpp</code></td><td>layout, package loader, cache plan</td><td><code>Qwen4Exp.cpp</code></td></tr>
+  <tr><td><code>&lt;Name&gt;Target.cpp</code></td><td>the forward pass</td><td><code>Qwen4ExpTarget.cpp</code></td></tr>
+  <tr><td><code>kernels/</code> + <code>abi/</code></td><td>model-only GPU code</td><td><code>hyper_connection.metal</code>, <code>mtp_pick.metal</code>, …</td></tr>
+  <tr><td><code>tools/</code></td><td>converter + verification scripts</td><td><code>convert_qwen4exp.py</code>, <code>checks/</code></td></tr>
+  <tr><td><code>bench/</code></td><td>speed and quality tools</td><td><code>reference_logits.py</code>, <code>speed_suite.py</code></td></tr>
+</table>
+
+<h3>The four registrations</h3>
+<p>A new model then registers itself in exactly four shared files (the checker allows no others):</p>
+<table>
+  <tr><th>File</th><th>What the model adds</th></tr>
+  <tr><td><code>runtime/model/ModelDescriptor.hpp</code></td><td>its layout, as one alternative in <code>TargetLayout</code></td></tr>
+  <tr><td><code>runtime/model/ModelFactory.hpp</code></td><td>its weights, as one alternative in <code>TargetWeights</code></td></tr>
+  <tr><td><code>runtime/model/QwenTarget.cpp</code></td><td>calls to its <code>addPrefill / addVerify / addHead / addEmbedding</code></td></tr>
+  <tr><td><code>runtime/model/Runtime.mm</code></td><td>whether it has a draft head (<code>mtpDrafting()</code>)</td></tr>
+</table>
+
+<h3>Known limit (stated honestly in the docs)</h3>
+<div class="callout">
+<p>The shared runtime assumes the <strong>Qwen hybrid family</strong>: linear-attention (GDN) and
+full-attention layers, an 8-bit paged KV cache, and one recurrent state per request. A model from
+this family plugs in as above. A model outside it (e.g. pure attention with a different cache)
+also needs the runtime's buffers and state generalized — that work is not done
+(<code>docs/architecture.md</code>, "Honest limit").</p>
+</div>
+
+<h3>Pitfalls the playbook records (each one actually happened)</h3>
+<table>
+  <tr><th>Pitfall</th><th>Guard</th></tr>
+  <tr><td>Self-agreeing tests prove nothing</td><td>always compare against the reference / checkpoint tensors</td></tr>
+  <tr><td>Totals hide wrong shapes (320,001,536 × 160 vs 20M × 2560 — same byte count)</td><td>check shapes, not bytes</td></tr>
+  <tr><td>Quiet wrong answers from a malformed package</td><td>fixed-boundary sections; loading must consume the file exactly</td></tr>
+  <tr><td>Stale binary looks like a working fix</td><td>confirm the build succeeded before reading a result</td></tr>
+  <tr><td>Two engines at once freeze the Mac</td><td>run experiments through <code>dev/benchmarks/guarded.py -- &lt;cmd&gt;</code></td></tr>
+</table>
+
+<!-- ================================================================ -->
+<h2 id="s8">8 · Quick reference</h2>
+<h3>The file map</h3>
+<table>
+  <tr><th>I want to understand…</th><th>Start at</th></tr>
+  <tr><td>the architecture and its rules</td><td><code>docs/architecture.md</code> + <code>dev/tools/check_architecture.py</code></td></tr>
+  <tr><td>a request end-to-end</td><td><code>server/protocol.py</code> → <code>runtime/engine/Protocol.cpp</code> → <code>runtime/engine/Engine.cpp</code></td></tr>
+  <tr><td>the decode loop</td><td><code>runtime/model/Runtime.mm</code></td></tr>
+  <tr><td>the forward pass</td><td><code>models/qwen4exp/Qwen4ExpTarget.cpp</code> (3,037 lines — the MTP head is around line 2420)</td></tr>
+  <tr><td>the pipelined decode step</td><td><code>models/qwen4exp/Qwen4ExpTarget.cpp:2755-2910</code></td></tr>
+  <tr><td>expert-cache residency</td><td><code>models/qwen4exp/Qwen4Exp.cpp:725-744</code></td></tr>
+  <tr><td>how kernels are built</td><td><code>Makefile:30-34, 163, 173</code></td></tr>
+  <tr><td>how kernels are dispatched</td><td><code>runtime/metal/CommandGraph.hpp</code> (74 lines)</td></tr>
+  <tr><td>the GPU runtime</td><td><code>runtime/metal/MetalBackend.mm</code> — queue 661-665 · pipeline cache 500-525 · pipeline events 1260-1295 · <code>CommandWatchdog.hpp</code></td></tr>
+  <tr><td>all the kernels at a glance</td><td>section 6 — <code>runtime/metal/kernels/</code> + <code>models/qwen4exp/kernels/</code></td></tr>
+  <tr><td>a simple kernel</td><td><code>runtime/metal/kernels/shared/normalization.metal</code> (20 lines)</td></tr>
+  <tr><td>a real algorithmic kernel</td><td><code>models/qwen4exp/kernels/mtp_pick.metal</code> (82 lines)</td></tr>
+  <tr><td>kernel variants + grid policy</td><td><code>runtime/ops/Linear.cpp</code></td></tr>
+  <tr><td>kernel tests</td><td><code>dev/tests/engine/*_metal_test.mm</code></td></tr>
+  <tr><td>bringing up a new model</td><td><code>docs/new-model-playbook.md</code></td></tr>
+  <tr><td>measurement tools</td><td><code>docs/profiling.md</code></td></tr>
+</table>
+
+<h3>Suggested reading order for a kernel beginner</h3>
+<ol>
+  <li><code>runtime/metal/kernels/shared/normalization.metal</code> — the whole parallelism pattern in 20 lines.</li>
+  <li><code>runtime/metal/CommandGraph.hpp</code> — the entire dispatch API, 74 lines.</li>
+  <li><code>models/qwen4exp/kernels/mtp_pick.metal</code> — a real algorithm; re-read with section 5.9 above.</li>
+  <li><code>models/qwen4exp/Qwen4ExpTarget.cpp:2493-2510</code> — the dispatch of the kernel you just read.</li>
+  <li><code>runtime/metal/MetalBackend.hpp:346-373</code> + <code>Qwen4ExpTarget.cpp:2804-2905</code> — the pipeline-event protocol and the host loop that drives it (section 3.1 + 4.2).</li>
+  <li><code>runtime/ops/Linear.cpp</code> — how a whole kernel family gets variants and a grid policy.</li>
+  <li><code>dev/tests/engine/hyper_connection_metal_test.mm</code> — how a kernel is proven correct.</li>
+</ol>
+
+<p class="muted" style="margin-top:40px">
+Generated from the repository on 2026-09-25. All line numbers refer to the checked-out tree.
+</p>
+
+</main>
+</body>
+</html>

@@ -952,6 +952,11 @@ def main() -> int:
         help="comma-separated layer indices to convert, or 'all'",
     )
     parser.add_argument(
+        "--non-layers-only",
+        action="store_true",
+        help="convert head, embedding, ngram, and MTP without reconverting layers",
+    )
+    parser.add_argument(
         "--release-source",
         action="store_true",
         help="delete each shard once no remaining layer reads it; needed when "
@@ -1005,15 +1010,21 @@ def main() -> int:
         print(f"mtp head        {written / 2**30:.2f} GiB")
         return 0
     if arguments.release_source:
-        # Deleting shards out from under a running download would lose data
-        # and confuse the fetcher, so refuse unless the checkpoint is whole.
         index = arguments.source / "model.safetensors.index.json"
         if not index.exists():
             parser.error(
-                "--release-source needs a complete checkpoint; its index is "
+                "--release-source needs a checkpoint index; its index is "
                 "not downloaded yet"
             )
-        wanted = set(json.loads(index.read_text())["weight_map"].values())
+        idx_data = json.loads(index.read_text())["weight_map"]
+        if arguments.non_layers_only:
+            needed_tensors = [
+                name for name in idx_data
+                if ".ple." in name or "mtp." in name or ".layers." not in name
+            ]
+            wanted = {idx_data[name] for name in needed_tensors}
+        else:
+            wanted = set(idx_data.values())
         present = {path.name for path in arguments.source.glob("*.safetensors")}
         if wanted - present:
             parser.error(
@@ -1025,7 +1036,9 @@ def main() -> int:
 
     target = arguments.destination / "target"
     target.mkdir(parents=True, exist_ok=True)
-    if arguments.layers == "all":
+    if arguments.non_layers_only:
+        indices = []
+    elif arguments.layers == "all":
         indices = list(range(LAYOUT["layers"]))
     elif "-" in arguments.layers and "," not in arguments.layers:
         start, end = map(int, arguments.layers.split("-"))
@@ -1046,11 +1059,15 @@ def main() -> int:
             still_needed = set()
             for later in range(index + 1, LAYOUT["layers"]):
                 still_needed |= source.shards_for(
+                    [name for name in source._where if f".layers.{later}." in name]
+                )
+            if arguments.layers == "all":
+                still_needed |= source.shards_for(
                     [
                         name
                         for name in source._where
-                        if f".layers.{later}." in name
-                        or ".ple." in name
+                        if ".ple." in name
+                        or "mtp." in name
                         or ".layers." not in name
                     ]
                 )
@@ -1058,13 +1075,17 @@ def main() -> int:
             if freed:
                 note = f"  (released {freed / 2**30:.1f} GiB of source)"
         print(f"  layer-{index}.bin {written / 2**30:.2f} GiB{note}")
-    if arguments.layers == "all":
+    if arguments.layers == "all" or arguments.non_layers_only:
         total += write_head(source, target)
         print("  head.bin")
         total += write_embedding(source, target)
         print("  embedding.bin")
         total += write_per_layer_embedding(source, target)
         print("  ngram.bin")
+        total += write_mtp(source, target)
+        print("  mtp-layer.bin & mtp-combiner.bin")
+        if arguments.release_source and not arguments.non_layers_only:
+            source.release(set())
         draft = write_placeholder_draft(arguments.destination / "draft")
         write_placeholder_vision(arguments.destination / "vision")
         write_manifest(arguments.destination)
