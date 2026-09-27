@@ -75,15 +75,15 @@ Completed 2026-09-26 across 145 paired items (seed 1234, temperature 0.0), run s
 | Built high-performance CPU Prompt Lookup Engine (49.1 ns/query, 0 heap allocations) | `runtime/ops/PromptLookup.{hpp,cpp}`, `dev/tools/benchmark_prompt_lookup.cpp` |
 | Integrated hybrid MTP + Prompt Lookup drafting into engine forward pass & request lifecycle | `models/qwen4exp/Qwen4ExpTarget.cpp`, `runtime/model/Runtime.mm` |
 | Validated 20-item benchmark under `SPLASH_EXPERT_CACHE_GIB=30` (10,268 accepted speculative tokens, 100% accuracy on GSM8K/HumanEval/Systems) | `dev/benchmarks/benchmark_drafting.py` |
+| Integrated Prompt Lookup Decoding into Swift-27B runtime (`splash2`), bypassing GPU DFlash on exact matches | `splash2/runtime/model/Runtime.mm`, installed to `Splash-Q8/current/engine/splash` |
 
 ---
 
 ## Active Status & Next Steps
 
 1. **Speculative Drafting Status**:
-   - Hybrid linear MTP + Prompt Lookup speculation is fully operational.
-   - Microbenchmarked Prompt Lookup at **49.1 ns per query** (15x faster than Tirmazi's fastest benchmark).
-   - Across 20 standardized items, candidate proposals grew to 14,729 tokens with 10,268 accepted tokens, maintaining 100% quality parity on math, code, and systems.
-   - Server runs under memory guard (`SPLASH_EXPERT_CACHE_GIB=30`), preserving >46 GiB free host memory.
+   - Hybrid linear MTP + Prompt Lookup speculation is fully operational on Swift-V3.
+   - Prompt Lookup Decoding engine is integrated into Swift-27B (`splash2/q8`), enabling 49 ns CPU drafting and bypassing DFlash on exact n-gram matches.
+   - User is currently running Swift-Flash-Next-V3 on port 8090 with `omp`.
 2. **Next Steps**:
-   - Evaluate Swift-27B pure Prompt Lookup decoding on tasks with repetitive context (coding, JSON, document Q&A).
+   - When user completes their `omp` session, benchmark Swift-27B with Prompt Lookup enabled on repetitive context tasks.

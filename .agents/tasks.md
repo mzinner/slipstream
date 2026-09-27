@@ -58,6 +58,7 @@
 - [x] Standalone CPU Prompt Lookup engine (`runtime/ops/PromptLookup.hpp`, 49.1 ns/query, 0 allocations)
 - [x] Hybrid MTP + Prompt Lookup fallback for Swift-V3 on low-confidence tokens (integrated in `Qwen4ExpTarget.cpp`)
 - [x] Full CPU test suite verification (`make test-engine-cpu` 18/18 targets PASS)
+- [x] Prompt Lookup Decoding engine integrated into Swift-27B (`splash2/runtime/model/Runtime.mm`, bypasses DFlash on n-gram match >= 2 tokens; installed to Splash-Q8 and pushed to `fork/q8`)
 - [ ] Uneven cache slots per layer (~9% fewer misses in replay)
 - [ ] Draft head: process only live rows (~0.5 ms)
 - [x] Quality round: Swift-Qwen3.8-27B-Splash-HQ vs Swift-Qwen3.8-Flash-Next-V3 (145 items across 6 domains: AIME 2025, MATH-500, GPQA Diamond, GSM8K, HumanEval, Hard Systems & Logic; Flash-Next leads 70.3% vs 67.6% with identical ~44 tok/s throughput)
