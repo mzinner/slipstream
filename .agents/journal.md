@@ -1,6 +1,9 @@
 # Journal — qwen4exp port
 
-## 2026-09-26 22:25 PDT — antigravity
+## 2026-09-27 09:30 PDT — antigravity
+
+Updated the Work Hub (`~/Documents/shared-with-google-drive/INDEX.html`) and agent configurations per Nitin's direction. Updated `Splash Q8 — Swift-Qwen3.8-27B-Splash-HQ` card with DFlash 2 + Prompt Lookup Decoding and `Slipstream — Swift-Qwen3.8-Flash-Next-V3` card with MTP + PLD and 145-item benchmark results. Configured all `omp` and `pi` commands to use minimum medium thinking (`--thinking=medium`), eliminating `--thinking=low`. Updated `~/.omp/agent/models.yml` (`defaultLevel: medium`). Verified Swift-27B engine is live on port 8000 with Prompt Lookup active (570 ms TTFT, 42.3 tok/s decode).
+Blocked on: nothing.
 
 Implemented Prompt Lookup Decoding for Swift-Qwen3.8-27B-Splash-HQ in `splash2` (`branch q8`). Wired `ops::PromptLookup` into `Runtime.mm` and `Makefile`, indexing prompts on admission and appending emitted tokens. In `decodeTick`, exact n-gram prompt matches (>= 2 tokens) populate `ProposedTokens` in 49 ns and bypass DFlash GPU drafting entirely, falling back to DFlash when no match is found. Compiled cleanly, installed into `/Users/nitin/Library/Application Support/Splash-Q8/current/engine/splash`, and committed/pushed (`10555a4`) to `fork/q8`. Did not start 27B server because user is currently running Swift-Flash-Next-V3 with `omp` on port 8090 (free RAM 5.1 GiB).
 Blocked on: waiting for user to finish `omp` session before benchmarking 27B.

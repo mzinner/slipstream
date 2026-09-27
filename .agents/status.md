@@ -76,14 +76,16 @@ Completed 2026-09-26 across 145 paired items (seed 1234, temperature 0.0), run s
 | Integrated hybrid MTP + Prompt Lookup drafting into engine forward pass & request lifecycle | `models/qwen4exp/Qwen4ExpTarget.cpp`, `runtime/model/Runtime.mm` |
 | Validated 20-item benchmark under `SPLASH_EXPERT_CACHE_GIB=30` (10,268 accepted speculative tokens, 100% accuracy on GSM8K/HumanEval/Systems) | `dev/benchmarks/benchmark_drafting.py` |
 | Integrated Prompt Lookup Decoding into Swift-27B runtime (`splash2`), bypassing GPU DFlash on exact matches | `splash2/runtime/model/Runtime.mm`, installed to `Splash-Q8/current/engine/splash` |
+| Updated Work Hub (`INDEX.html`) & `~/.omp/agent/models.yml` to minimum medium thinking (`--thinking=medium`) | `INDEX.html`, `~/.omp/agent/models.yml` |
 
 ---
 
 ## Active Status & Next Steps
 
-1. **Speculative Drafting Status**:
+1. **Speculative Drafting & Model Status**:
    - Hybrid linear MTP + Prompt Lookup speculation is fully operational on Swift-V3.
    - Prompt Lookup Decoding engine is integrated into Swift-27B (`splash2/q8`), enabling 49 ns CPU drafting and bypassing DFlash on exact n-gram matches.
-   - User is currently running Swift-Flash-Next-V3 on port 8090 with `omp`.
+   - Swift-27B server is currently running live on port 8000 with Prompt Lookup active (570 ms TTFT, 42.3 tok/s decode).
+   - Work Hub (`INDEX.html`) and agent configs are synced with minimum medium thinking.
 2. **Next Steps**:
-   - When user completes their `omp` session, benchmark Swift-27B with Prompt Lookup enabled on repetitive context tasks.
+   - Benchmark Swift-27B with Prompt Lookup enabled on repetitive context tasks on port 8000.
