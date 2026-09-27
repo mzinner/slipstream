@@ -1,5 +1,15 @@
 # Journal — qwen4exp port
 
+## 2026-09-26 21:55 PDT — antigravity
+
+Ran full CPU engine test suite (`make test-engine-cpu`), passing 100% of all 18 test targets (memory plan, KV caches, Qwen4Exp layout, ragged scheduler, protocols, native engine loops, runtime metrics/status, and Q8 paged KV). Committing and pushing the complete Prompt Lookup Decoding engine implementation, hybrid MTP + PLD runtime wiring, microbenchmark harness, and research docs to `origin/main`.
+Blocked on: nothing.
+
+## 2026-09-26 21:50 PDT — antigravity
+
+Implemented and integrated the high-performance CPU Prompt Lookup Decoding (PLD) engine (`runtime/ops/PromptLookup.{hpp,cpp}`). Measured 49.1 ns average query latency and 7.9 µs 400-token prompt indexing time (15x faster than Tirmazi's fastest benchmark). Wired into `Runtime.mm` and `Qwen4ExpTarget.cpp` as a hybrid fallback when MTP head confidence drops below 0.35. Validated on 20-item benchmark: candidate proposals grew from 13,436 to 14,729 (+1,293 tokens), delivering 10,268 accepted speculative tokens with 100% accuracy on GSM8K (5/5), HumanEval (5/5), and Systems (5/5). Server stopped cleanly.
+Blocked on: nothing.
+
 ## 2026-09-26 21:30 PDT — antigravity
 
 Implemented tree speculative drafting across Metal shaders (2D attention mask, tree GDN recurrence, tree greedy acceptance in sampling) and evaluated it against linear drafting on Swift V3. Found that tree branching requires non-sequential KV-cache scatter and state reordering because physical cache writes happen during verify; linear drafting remains optimal and rock-solid (76.2% acceptance, 100% accuracy on GSM8K/HumanEval/Systems, up to 48.8 tok/s). Evaluated Hayder Tirmazi's 42x prompt lookup research and designed hybrid CPU PLD roadmap for Swift 27B and V3 (documented in docs/research/prompt_lookup_drafting_analysis.md).

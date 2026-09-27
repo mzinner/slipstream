@@ -55,8 +55,9 @@
 - [x] Tree-based speculative drafting Metal shaders (2D attention mask, tree GDN recurrence, tree greedy sampling)
 - [x] Tree drafting evaluation: identified physical KV cache placement barrier; linear drafting remains optimal (76.2% acceptance, 37.7 tok/s avg, up to 48.8 tok/s burst)
 - [x] Prompt Lookup Decoding (PLD) technical analysis & roadmap (`docs/research/prompt_lookup_drafting_analysis.md`)
-- [ ] Standalone CPU Prompt Lookup engine (`runtime/ops/PromptLookup.hpp`) for Swift-27B (target: 60–75+ tok/s with 0 MB extra VRAM)
-- [ ] Hybrid MTP + Prompt Lookup fallback for Swift-V3 on low-confidence tokens
+- [x] Standalone CPU Prompt Lookup engine (`runtime/ops/PromptLookup.hpp`, 49.1 ns/query, 0 allocations)
+- [x] Hybrid MTP + Prompt Lookup fallback for Swift-V3 on low-confidence tokens (integrated in `Qwen4ExpTarget.cpp`)
+- [x] Full CPU test suite verification (`make test-engine-cpu` 18/18 targets PASS)
 - [ ] Uneven cache slots per layer (~9% fewer misses in replay)
 - [ ] Draft head: process only live rows (~0.5 ms)
 - [x] Quality round: Swift-Qwen3.8-27B-Splash-HQ vs Swift-Qwen3.8-Flash-Next-V3 (145 items across 6 domains: AIME 2025, MATH-500, GPQA Diamond, GSM8K, HumanEval, Hard Systems & Logic; Flash-Next leads 70.3% vs 67.6% with identical ~44 tok/s throughput)

@@ -8,6 +8,7 @@
 #include "ops/Linear.hpp"
 #include "ops/MoE.hpp"
 #include "ops/PagedAttention.hpp"
+#include "ops/PromptLookup.hpp"
 
 #include <array>
 #include <cstdint>
@@ -304,6 +305,7 @@ struct QwenTargetVerifyBuffers final {
   bool mtpShadow = true;
   uint32_t kvPageCount = 0;
   std::array<QwenMtpLane, ExecutionLimits::maximumBatchWidth> mtp{};
+  const ops::PromptLookup *promptLookup = nullptr;
   metal::MetalBuffer proposedTokens;
   // Out: proposals the MTP head actually made for lane 0 (it stops when
   // unsure), so the runtime can cap the rows the verifier keeps.

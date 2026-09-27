@@ -8,6 +8,7 @@
 #include "ops/GDN.hpp"
 #include "ops/MoE.hpp"
 #include "ops/PagedAttention.hpp"
+#include "ops/PromptLookup.hpp"
 
 #include <algorithm>
 #include <bitset>
@@ -2792,9 +2793,36 @@ void Qwen4ExpTarget::addVerify(
     setLiveRows();
   } else if (buffers.mtpEnabled && weights.mtpLayer && lanes == 1 && buffers.mtp[0].rows) {
     const auto mtpStart = std::chrono::steady_clock::now();
-    const auto drafts = runMtpDraft();
+    auto drafts = runMtpDraft();
     mtpMs = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - mtpStart).count();
+    static const bool pldEnabled = [] {
+      const char *v = std::getenv("SPLASH_PROMPT_LOOKUP");
+      return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (pldEnabled && buffers.promptLookup && drafted < maxDrafts && buffers.mtp[0].rows) {
+      const uint32_t anchor = buffers.mtp[0].tokens[buffers.mtp[0].rows - 1];
+      std::vector<uint32_t> queryTokens;
+      queryTokens.reserve(1 + drafted);
+      queryTokens.push_back(anchor);
+      for (uint32_t k = 0; k < drafted; ++k) {
+        queryTokens.push_back(drafts[k]);
+      }
+      std::array<uint32_t, ExecutionLimits::draftProposalTokens> pldDrafts{};
+      const uint32_t needed = maxDrafts - drafted;
+      const uint32_t pldFound = buffers.promptLookup->propose(queryTokens, pldDrafts, needed);
+      for (uint32_t j = 0; j < pldFound; ++j) {
+        const uint32_t idx = drafted + j;
+        drafts[idx] = pldDrafts[j];
+        draftCandidates[idx][0] = pldDrafts[j];
+        draftProbabilities[idx][0] = 1.0f;
+        for (uint32_t c = 1; c < 16; ++c) {
+          draftCandidates[idx][c] = UINT32_MAX;
+          draftProbabilities[idx][c] = 0.0f;
+        }
+      }
+      drafted += pldFound;
+    }
     if (!buffers.mtpShadow) {
       buffers.liveRowsPerLane = 1 + drafted;
       setLiveRows();

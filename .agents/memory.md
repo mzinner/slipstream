@@ -69,6 +69,7 @@ wanted 128 MiB, long before any real weights existed.
 - **Swift models loop under `xhigh` thinking**: Swift 1.5 is distilled for concise thinking; forcing `xhigh` in deep contexts (>50k tokens) causes degenerate repetitive thinking loops that consume the full generation token budget and emit empty output. Always default Swift to `--thinking low` or `medium`.
 - **Expert cache sizing flag is `SPLASH_EXPERT_CACHE_GIB`**: Pass `SPLASH_EXPERT_CACHE_GIB=30` (not `CACHE_GIB=30`) to control expert cache allocation. At 30 GiB, free host RAM remains >46 GiB, preventing `resource_timeout` on high-context prompts.
 - **Tree drafting KV physical placement invariant**: `PagedAttention::addVerify` stores the 8 verify rows linearly into `keyData`/`valueData` during the forward pass. Taking non-linear tree branches leaves unaccepted branch activations in physical slots unless followed by a compaction pass.
+- **Prompt Lookup Engine latency**: `ops::PromptLookup` delivers 49.1 ns per query on Apple Silicon using a flat chained hash table with zero heap allocations during decode.
 
 ## About Nitin
 

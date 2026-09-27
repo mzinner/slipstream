@@ -212,6 +212,7 @@ struct Runtime::Impl {
     DecodeStage decodeStage = DecodeStage::Regular;
     // The MTP head's input for the next decode cycle; see QwenMtpLane.
     QwenMtpLane mtp;
+    ops::PromptLookup promptLookup;
   };
 
   struct DecodeLaneResult final {
@@ -870,6 +871,7 @@ struct Runtime::Impl {
         buffers.mtp[lane].topK = requestEntry.sampling.topK;
       }
     }
+    buffers.promptLookup = &laneEntry(entries, 0).promptLookup;
     buffers.ple = {d(DecodeTensor::InputTokens), d(DecodeTensor::PleShifted),
                    d(DecodeTensor::PleEmbedding), d(DecodeTensor::PleKeys),
                    d(DecodeTensor::PleValues), d(DecodeTensor::PleGated),
@@ -1100,6 +1102,8 @@ struct Runtime::Impl {
       states.updateLengths(entry.slot, {nextLength});
       entry.generatedTokens += laneResult.retained;
       entry.pendingToken = laneResult.nextAnchor;
+      for (uint32_t tok : output)
+        entry.promptLookup.appendToken(tok);
       // Next cycle the MTP head reads this step's retained rows, each with
       // the token that followed it; the last with the new anchor.
       entry.mtp.rows = laneResult.retained;
@@ -1410,6 +1414,7 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
     entry.slot = *admission.cell;
     entry.resident = true;
     entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
+    entry.promptLookup.indexPrompt(request.prompt);
   }
   return admission;
 }
@@ -1424,6 +1429,7 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
   Impl::Request entry;
   entry.id = request.id;
   entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
+  entry.promptLookup.indexPrompt(request.prompt);
   entry.maxNewTokens = request.maxNewTokens;
   entry.cohort = request.cohort;
   entry.sampling = request.sampling;
