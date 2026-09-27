@@ -377,3 +377,14 @@ To create a Swift version of Nitin's V3 model (`Swift-Qwen3.8-Flash-Next-V3`) de
    - When MTP head confidence drops below 0.35, Prompt Lookup supplies the remaining candidate tokens to fill the 5-draft batch.
    - Proposed tokens are verified in linear causal order on the GPU in the existing target verifier with zero extra forward passes and zero KV cache scatter complexity.
    - Increases candidate proposals (+1,293 tokens across 20 benchmark items) while maintaining 100% accuracy on math and coding.
+
+## 2026-09-27 — Constrained Decoding Dispatch & Empty Metal Command Guard
+
+1. **Constrained Decoding Multi-Stage Scheduling**:
+   - In constrained decoding (`ConstraintMode::TokenMask`, active when tools or grammars are used), Splash splits each step into Stage 1 (Draft) and Stage 2 (Target Forward).
+   - In unconstrained decoding, target verification is always encoded, so the command graph always contains dispatches.
+   - In constrained decoding (`draftForMask = true`, `verify = false`), bypassing draft compute on exact prompt lookup matches left `commandGraph` empty (0 dispatches).
+   - Prompt lookup draft bypass is restricted to unconstrained steps (`!constrained`), ensuring tool-calling passes always run full draft dispatches and maintain RoPE position tables.
+2. **Defensive Metal Command Submission**:
+   - Metal backend previously threw `MetalBackendError("Metal command must contain a dispatch")` if `commandGraph` had 0 dispatches.
+   - `MetalBackend::submitCommandAsync` now defensively returns an immediately completed `CommandTicket` with zero timing overhead instead of throwing.

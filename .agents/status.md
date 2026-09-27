@@ -85,7 +85,9 @@ Completed 2026-09-26 across 145 paired items (seed 1234, temperature 0.0), run s
 1. **Speculative Drafting & Model Status**:
    - Hybrid linear MTP + Prompt Lookup speculation is fully operational on Swift-V3.
    - Prompt Lookup Decoding engine is integrated into Swift-27B (`splash2/q8`), enabling 49 ns CPU drafting and bypassing DFlash on exact n-gram matches.
-   - Swift-27B server is currently running live on port 8000 with Prompt Lookup active (570 ms TTFT, 42.3 tok/s decode).
+   - All model servers are currently stopped. Ports 8000, 8080, and 8090 are completely free.
+   - Ready for you to launch in your separate shell.
    - Work Hub (`INDEX.html`) and agent configs are synced with minimum medium thinking.
 2. **Next Steps**:
-   - Benchmark Swift-27B with Prompt Lookup enabled on repetitive context tasks on port 8000.
+   - Start Swift-27B in your shell (`~/models/bin/swift27b-server.sh`) or Swift-V3 (`./splash serve --model ~/models/swift-qwen38-flash-next-v3 --port 8090`).
+   - Run interactive tests or benchmarks.
