@@ -749,9 +749,15 @@ struct Runtime::Impl {
     auto *positions =
         contents<uint32_t>(decodeArena->get(lane, DecodeTensor::Positions),
                            "decode RoPE positions");
+    static const bool treeDrafting = [] {
+      const char *v = std::getenv("SPLASH_TREE_DRAFT");
+      return v != nullptr && std::atoi(v) != 0;
+    }();
+    constexpr uint32_t kTreeDepths[8] = {0, 1, 2, 3, 4, 2, 1, 2};
     for (uint32_t row = 0; row < kDecodeRows; ++row) {
+      const uint32_t depth = treeDrafting ? kTreeDepths[row] : row;
       const std::array<uint32_t, 3> rotary =
-          ropePosition(entry, item.logicalPosition + row);
+          ropePosition(entry, item.logicalPosition + depth);
       std::copy(rotary.begin(), rotary.end(), positions + row * 3);
     }
     *contents<uint32_t>(decodeArena->get(lane, DecodeTensor::Arrived),
@@ -876,6 +882,11 @@ struct Runtime::Impl {
           q8[lane].committed_tokens, q8[lane].chunk_tokens,
           q8[lane].chunk_stride, q8[lane].page_table_entries,
           q8[lane].physical_page_count);
+      static const bool treeDrafting = [] {
+        const char *v = std::getenv("SPLASH_TREE_DRAFT");
+        return v != nullptr && std::atoi(v) != 0;
+      }();
+      verify[lane].tree_parents = treeDrafting ? 0x60132100u : 0u;
       if (!kv::q8VerifyAttentionValidationError(verify[lane]).empty())
         throw std::invalid_argument("invalid batched Q8 verify geometry");
       Request &entry = laneEntry(entries, lane);
@@ -967,7 +978,11 @@ struct Runtime::Impl {
          decodeArena->packed(DecodeTensor::NextAnchor, width),
          decodeArena->packed(DecodeTensor::AcceptedCount, width)},
         maximumRetained, std::span(policies).first(width),
-        geometry.target.stopTokens[0], geometry.target.stopTokens[1]);
+        geometry.target.stopTokens[0], geometry.target.stopTokens[1],
+        [] {
+          const char *v = std::getenv("SPLASH_TREE_DRAFT");
+          return (v != nullptr && std::atoi(v) != 0) ? 0x60132100u : 0u;
+        }());
   }
 
   void encodeBatchEmbedding(CommandGraph &graph, DecodeTensor tokens,

@@ -1,5 +1,10 @@
 # Journal — qwen4exp port
 
+## 2026-09-26 21:30 PDT — antigravity
+
+Implemented tree speculative drafting across Metal shaders (2D attention mask, tree GDN recurrence, tree greedy acceptance in sampling) and evaluated it against linear drafting on Swift V3. Found that tree branching requires non-sequential KV-cache scatter and state reordering because physical cache writes happen during verify; linear drafting remains optimal and rock-solid (76.2% acceptance, 100% accuracy on GSM8K/HumanEval/Systems, up to 48.8 tok/s). Evaluated Hayder Tirmazi's 42x prompt lookup research and designed hybrid CPU PLD roadmap for Swift 27B and V3 (documented in docs/research/prompt_lookup_drafting_analysis.md).
+Blocked on: nothing.
+
 ## 2026-09-26 20:00 PDT — antigravity
 
 Presented comprehensive findings and next steps to Nitin comparing `Swift-Qwen3.8-Flash-Next-V3` and `Swift-Qwen3.8-27B-Splash-HQ`. Nitin selected Option B (Tree Drafting with 2D Attention Masking to target 50–60+ tok/s). Added `*.dylib` to `.gitignore`. Committing all benchmarks, GGUF toolings, launcher CLI options, and drafting optimizations to `origin/main` (GitHub `npanj/slipstream`) before commencing tree drafting implementation.

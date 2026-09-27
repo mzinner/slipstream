@@ -33,7 +33,7 @@ inline void gdn_decode_prologue(
     device bfloat *mixed_qkv, device const float *a_scale,
     device const bfloat *dt_bias, device float *decay, device bfloat *beta,
     uint packed_width, threadgroup bfloat *queries, threadgroup bfloat *keys,
-    uint value_head, uint lane, uint simd_group) {
+    uint value_head, uint lane, uint simd_group, uint tree_parents = 0) {
   constexpr uint Tokens = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint HeadsPerKey = ValueHeads / KeyHeads;
   constexpr uint KeyWidth = KeyHeads * HeadDim;
@@ -56,10 +56,10 @@ inline void gdn_decode_prologue(
   for (uint g = 0; g < Groups; ++g) {
     q[g] = float(gdn_conv_silu(packed, conv_state_in, conv_weights,
                                packed_width, ConvDim, token,
-                               q_channel + 32 * g));
+                               q_channel + 32 * g, tree_parents));
     k[g] = float(gdn_conv_silu(packed, conv_state_in, conv_weights,
                                packed_width, ConvDim, token,
-                               k_channel + 32 * g));
+                               k_channel + 32 * g, tree_parents));
   }
   float q_sum = 0.0f, k_sum = 0.0f;
   for (uint g = 0; g < Groups; ++g) {
@@ -80,7 +80,7 @@ inline void gdn_decode_prologue(
     }
     mixed_qkv[token * ConvDim + v_channel + 32 * g] =
         gdn_conv_silu(packed, conv_state_in, conv_weights, packed_width,
-                      ConvDim, token, v_channel + 32 * g);
+                      ConvDim, token, v_channel + 32 * g, tree_parents);
   }
   if (lane == 0) {
     const uint gate_index = token * ValueHeads + value_head;
@@ -117,34 +117,35 @@ inline void gdn_decode_scan(device const bfloat *mixed_qkv,
                             device float *state_out, device bfloat *output,
                             threadgroup const bfloat *queries,
                             threadgroup const bfloat *keys, uint value_head,
-                            uint lane, uint simd_group) {
+                            uint lane, uint simd_group, uint tree_parents = 0) {
   constexpr uint Tokens = SPLASH_TARGET_VERIFY_ROWS;
   constexpr uint KeyWidth = KeyHeads * HeadDim;
   constexpr uint Batches = HeadDim / kDecodeSimdgroups;
   static_assert(Batches % RowsInFlight == 0, "rows in flight tile the head");
   const uint value_channel = 2 * KeyWidth + value_head * HeadDim;
   for (uint batch = 0; batch < Batches; batch += RowsInFlight) {
-    float state[RowsInFlight][4];
+    float state[Tokens][RowsInFlight][4];
     uint value_dim[RowsInFlight];
     ulong state_base[RowsInFlight];
     for (uint r = 0; r < RowsInFlight; ++r) {
       value_dim[r] = (batch + r) * kDecodeSimdgroups + simd_group;
       state_base[r] =
           (ulong(value_head) * HeadDim + value_dim[r]) * HeadDim + lane * 4;
-      for (uint i = 0; i < 4; ++i)
-        state[r][i] = state_in[state_base[r] + i];
     }
     for (uint token = 0; token < Tokens; ++token) {
       const float d = decay[token * ValueHeads + value_head];
       const float b = float(beta[token * ValueHeads + value_head]);
       threadgroup const bfloat *key = keys + token * HeadDim + lane * 4;
       threadgroup const bfloat *query = queries + token * HeadDim + lane * 4;
+      int p = tree_parent(tree_parents, int(token));
       float memory[RowsInFlight];
       for (uint r = 0; r < RowsInFlight; ++r) {
         memory[r] = 0.0f;
         for (uint i = 0; i < 4; ++i) {
-          state[r][i] *= d;
-          memory[r] += state[r][i] * float(key[i]);
+          float st = (p < 0) ? state_in[state_base[r] + i] : state[uint(p)][r][i];
+          st *= d;
+          state[token][r][i] = st;
+          memory[r] += st * float(key[i]);
         }
         memory[r] = simd_sum(memory[r]);
       }
@@ -156,8 +157,8 @@ inline void gdn_decode_scan(device const bfloat *mixed_qkv,
             b;
         result[r] = 0.0f;
         for (uint i = 0; i < 4; ++i) {
-          state[r][i] += float(key[i]) * delta;
-          result[r] += state[r][i] * float(query[i]);
+          state[token][r][i] += float(key[i]) * delta;
+          result[r] += state[token][r][i] * float(query[i]);
         }
         result[r] = simd_sum(result[r]);
       }
@@ -170,7 +171,7 @@ inline void gdn_decode_scan(device const bfloat *mixed_qkv,
     }
     for (uint r = 0; r < RowsInFlight; ++r)
       for (uint i = 0; i < 4; ++i)
-        state_out[state_base[r] + i] = state[r][i];
+        state_out[state_base[r] + i] = state[Tokens - 1][r][i];
   }
 }
 
@@ -355,11 +356,11 @@ inline void gdn_decode_batch_phase(
   gdn_decode_prologue<KeyHeads, ValueHeads, HeadDim, ConvDim>(
       packed, conv_weights, conv_state_in, conv_state_out, mixed, a_scale,
       dt_bias, decay, beta, params.packed_width, queries, keys, group.x, lane,
-      simd_group);
+      simd_group, params.tree_parents);
   threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
   gdn_decode_scan<KeyHeads, ValueHeads, HeadDim, ConvDim, RowsInFlight>(
       mixed, decay, beta, state_in, state_out, lane_recurrent, queries, keys,
-      group.x, lane, simd_group);
+      group.x, lane, simd_group, params.tree_parents);
   threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
   gdn_gate_phase<ValueHeads, HeadDim, ConvDim, kDecodeSimdgroups>(
       lane_recurrent, packed, gdn_norm_weight, lane_hidden, Rows * ValueHeads,

@@ -71,7 +71,7 @@ struct SplashQ8VerifyAttentionParams {
   // plan-wide slot stride that every lane's partials use.
   uint32_t split_count;
   uint32_t slot_splits;
-  uint32_t reserved2;
+  uint32_t tree_parents;
 };
 
 static_assert(sizeof(SplashQ8VerifyAttentionParams) == 32,

@@ -31,13 +31,15 @@ struct GDNDecodeBatchParams {
   uint32_t packed_width;
   uint32_t lanes;
   uint32_t layer;
+  uint32_t tree_parents;
+  uint32_t reserved0;
   uint64_t conv_layer_bytes;
   uint64_t recurrent_layer_bytes;
   uint64_t convolution_state_bytes;
 };
 
-static_assert(sizeof(GDNDecodeBatchParams) == 40,
-              "GDN decode parameters are 40 bytes on both sides");
+static_assert(sizeof(GDNDecodeBatchParams) == 48,
+              "GDN decode parameters are 48 bytes on both sides");
 
 // Explicit padding aligns the uint64_t state strides and keeps transmitted
 // bytes initialized.
@@ -49,7 +51,7 @@ struct GDNBatchCommitParams {
   uint32_t mixed_stride;
   uint32_t decay_stride;
   uint32_t beta_stride;
-  uint32_t reserved0;
+  uint32_t tree_parents;
   uint64_t conv_layer_bytes;
   uint64_t recurrent_layer_bytes;
   uint64_t convolution_state_bytes;

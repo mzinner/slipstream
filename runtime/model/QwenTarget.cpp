@@ -226,12 +226,17 @@ void QwenTarget::addStateCommit(metal::CommandGraph &graph,
   if (geometry_.hasPerLayerEmbedding())
     Qwen4ExpTarget::addPerLayerEmbeddingCommit(geometry_, backend_, graph,
                                                buffers, lanes);
+  ops::GdnShape gdnShape = geometry_.gdnShape();
+  const char *treeEnv = std::getenv("SPLASH_TREE_DRAFT");
+  if (treeEnv != nullptr && std::atoi(treeEnv) != 0) {
+    gdnShape.treeParents = 0x60132100u;
+  }
   ops::GDN::addCommit(
       graph,
       {std::move(buffers.packed), std::move(buffers.mixed),
        std::move(buffers.decay), std::move(buffers.beta), buffers.currentStates,
        buffers.nextStates, std::move(buffers.retainedCounts)},
-      geometry_.gdnShape(), geometry_.stateLayout.layers, lanes,
+      gdnShape, geometry_.stateLayout.layers, lanes,
       {geometry_.stateLayout.convolutionLayerBytes(),
        geometry_.stateLayout.recurrentLayerBytes(),
        geometry_.stateLayout.convolutionBytes()});

@@ -12,7 +12,7 @@
 namespace splash::ops {
 namespace {
 
-static_assert(offsetof(GDNDecodeBatchParams, conv_layer_bytes) == 16);
+static_assert(offsetof(GDNDecodeBatchParams, conv_layer_bytes) == 24);
 static_assert(offsetof(GDNBatchCommitParams, conv_layer_bytes) == 32);
 
 enum class KernelLayout : uint8_t { Value48, Value32 };
@@ -22,6 +22,7 @@ enum class KernelLayout : uint8_t { Value48, Value32 };
     throw std::invalid_argument("invalid GDN shape");
   GdnShape geometry = shape;
   geometry.sigmoidGate = false;
+  geometry.treeParents = 0;
   if (geometry == GdnShape{16, 48, 128, 10240, 16640})
     return KernelLayout::Value48;
   if (geometry == GdnShape{16, 32, 128, 8192, 12544})
@@ -89,6 +90,8 @@ void GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                                     shape.packedWidth,
                                     lanes,
                                     layer,
+                                    shape.treeParents,
+                                    0u,
                                     state.convolutionLayerBytes,
                                     state.recurrentLayerBytes,
                                     state.convolutionStateBytes};
@@ -116,7 +119,7 @@ void GDN::addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
                                     rows * shape.convolutionDimension,
                                     rows * shape.valueHeads,
                                     rows * shape.valueHeads,
-                                    0,
+                                    shape.treeParents,
                                     state.convolutionLayerBytes,
                                     state.recurrentLayerBytes,
                                     state.convolutionStateBytes};

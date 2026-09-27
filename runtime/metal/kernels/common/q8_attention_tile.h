@@ -57,8 +57,7 @@ inline bool splash_q8_verify_attention_contract_valid(
          params.split_count > 0 &&
          params.split_count <= SplashVerifyMaximumSplits &&
          params.slot_splits >= params.split_count &&
-         params.slot_splits <= SplashVerifyMaximumSplits &&
-         params.reserved2 == 0;
+         params.slot_splits <= SplashVerifyMaximumSplits;
 }
 
 // Split and reduce derive the same balanced partition of each query tile's
@@ -82,6 +81,20 @@ inline uint splash_attention_pages_per_split(uint pages, uint splits) {
 // (splash_q8_scale_index is a multiple of 32 floats and the bound scale
 // buffers start at their placement-aligned base).
 // Rows whose running maximum grew atomically set the shared boolean rescale
+// Derive an 8-bit ancestor mask from tree_parents (4 bits per node).
+// Default linear causal: 0x65432100u.
+inline uint8_t tree_ancestors(uint32_t tree_parents, uint row) {
+  uint tp = (tree_parents == 0) ? 0x65432100u : tree_parents;
+  uint8_t mask = (1u << row);
+  uint curr = row;
+#pragma unroll
+  for (uint step = 0; step < 7 && curr > 0; ++step) {
+    curr = (tp >> (curr * 4)) & 0xFu;
+    mask |= (1u << curr);
+  }
+  return mask;
+}
+
 // flag. Existing threadgroup barriers separate reset, concurrent set, and
 // read; relaxed atomics make the same-value writes safe without changing
 // arithmetic.
@@ -97,7 +110,8 @@ inline void splash_q8_page_softmax(
     // Which of this page's tokens the indexer kept, one bit per token, low
     // bit first. The dense path passes all ones and the comparison folds
     // away; only qwen4exp's sparse attention passes anything else.
-    uint page_mask = ~0u) {
+    uint page_mask = ~0u,
+    uint tree_parents = 0u) {
   constexpr uint N = SplashQ8PageTokens;
   constexpr uint FusedRows = RowsPerTile * QueryHeadsPerKVHead;
   constexpr uint TokensPerLane = 8;
@@ -107,9 +121,8 @@ inline void splash_q8_page_softmax(
     const uint fused_row = lane_idx / LanesPerRow;
     const uint column = lane_idx % LanesPerRow * TokensPerLane;
     const uint query_row = fused_row / QueryHeadsPerKVHead;
-    const uint causal_end =
-        committed_tokens + min(query_row, active_rows - 1) + 1;
-    const uint limit = min(visible_tokens, causal_end);
+    const uint8_t ancestor_mask =
+        tree_ancestors(tree_parents, min(query_row, active_rows - 1));
     const uint token = token_start + column;
     threadgroup const float4 *scores4 =
         reinterpret_cast<threadgroup const float4 *>(scores + fused_row * N +
@@ -127,11 +140,25 @@ inline void splash_q8_page_softmax(
       score[0] = low.x, score[1] = low.y, score[2] = low.z, score[3] = low.w;
       score[4] = high.x, score[5] = high.y, score[6] = high.z, score[7] = high.w;
     }
+    bool visible[TokensPerLane];
+#pragma unroll
+    for (uint j = 0; j < TokensPerLane; ++j) {
+      uint t = token + j;
+      if (t < committed_tokens) {
+        visible[j] = true;
+      } else if (t < visible_tokens) {
+        uint current_row = t - committed_tokens;
+        visible[j] = (current_row < active_rows) &&
+                     ((ancestor_mask & (1u << current_row)) != 0u);
+      } else {
+        visible[j] = false;
+      }
+    }
     float local_max = -INFINITY;
 #pragma unroll
     for (uint j = 0; j < TokensPerLane; ++j) {
       const bool kept = ((page_mask >> (column + j)) & 1u) != 0u;
-      score[j] = (token + j < limit && kept) ? score[j] : -INFINITY;
+      score[j] = (visible[j] && kept) ? score[j] : -INFINITY;
       local_max = max(local_max, score[j]);
     }
     local_max = max(local_max, simd_shuffle_xor(local_max, 1));
@@ -142,7 +169,7 @@ inline void splash_q8_page_softmax(
     float local_sum = 0.0f;
 #pragma unroll
     for (uint j = 0; j < TokensPerLane; ++j) {
-      probability[j] = token + j < limit ? fast::exp(score[j] - next_max) : 0.0f;
+      probability[j] = visible[j] ? fast::exp(score[j] - next_max) : 0.0f;
       local_sum += probability[j];
     }
     local_sum += simd_shuffle_xor(local_sum, 1);
@@ -160,14 +187,14 @@ inline void splash_q8_page_softmax(
     // Masked tokens stay exactly zero whatever their stored value scale holds.
     const float4 low_scales = value_scales[vector],
                  high_scales = value_scales[vector + 1];
-    const float4 low(token + 0 < limit ? probability[0] * low_scales.x : 0.0f,
-                     token + 1 < limit ? probability[1] * low_scales.y : 0.0f,
-                     token + 2 < limit ? probability[2] * low_scales.z : 0.0f,
-                     token + 3 < limit ? probability[3] * low_scales.w : 0.0f);
-    const float4 high(token + 4 < limit ? probability[4] * high_scales.x : 0.0f,
-                      token + 5 < limit ? probability[5] * high_scales.y : 0.0f,
-                      token + 6 < limit ? probability[6] * high_scales.z : 0.0f,
-                      token + 7 < limit ? probability[7] * high_scales.w : 0.0f);
+    const float4 low(visible[0] ? probability[0] * low_scales.x : 0.0f,
+                     visible[1] ? probability[1] * low_scales.y : 0.0f,
+                     visible[2] ? probability[2] * low_scales.z : 0.0f,
+                     visible[3] ? probability[3] * low_scales.w : 0.0f);
+    const float4 high(visible[4] ? probability[4] * high_scales.x : 0.0f,
+                      visible[5] ? probability[5] * high_scales.y : 0.0f,
+                      visible[6] ? probability[6] * high_scales.z : 0.0f,
+                      visible[7] ? probability[7] * high_scales.w : 0.0f);
     threadgroup bfloat4 *probabilities4 = reinterpret_cast<threadgroup bfloat4 *>(
         probabilities + fused_row * N + column);
     probabilities4[0] = bfloat4(low);
@@ -201,7 +228,8 @@ inline void splash_q8_attention_direct_tile(
     uint thread_index,
     device const uint *selected_pages = nullptr,
     device const uint *selected_masks = nullptr,
-    uint selected_count = 0u) {
+    uint selected_count = 0u,
+    uint tree_parents = 0u) {
   constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr ushort N = SplashQ8PageTokens;
   constexpr ushort D = SplashQ8HeadDimension;
@@ -298,7 +326,7 @@ inline void splash_q8_attention_direct_tile(
         reinterpret_cast<device const float4 *>(key_scales),
         reinterpret_cast<device const float4 *>(value_scales), token_start,
         visible_tokens, committed_tokens, active_rows, thread_index,
-        page_mask);
+        page_mask, tree_parents);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (atomic_load_explicit(rescale, memory_order_relaxed)) {
 #pragma unroll

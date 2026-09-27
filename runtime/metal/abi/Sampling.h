@@ -50,10 +50,11 @@ struct AcceptParams {
   uint32_t remaining;
   uint32_t stop_token_0;
   uint32_t stop_token_1;
+  uint32_t tree_parents;
 };
 
-static_assert(sizeof(AcceptParams) == 12,
-              "Acceptance lane parameters are 12 bytes on both sides");
+static_assert(sizeof(AcceptParams) == 16,
+              "Acceptance lane parameters are 16 bytes on both sides");
 
 struct AcceptBatchParams {
   uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];
@@ -61,7 +62,9 @@ struct AcceptBatchParams {
   uint32_t stop_token_1;
   uint32_t lanes;
   uint32_t sampling_mask;
+  uint32_t tree_parents;
+  uint32_t reserved0;
 };
 
-static_assert(sizeof(AcceptBatchParams) == 32,
-              "Batched acceptance parameters are 32 bytes on both sides");
+static_assert(sizeof(AcceptBatchParams) == 40,
+              "Batched acceptance parameters are 40 bytes on both sides");

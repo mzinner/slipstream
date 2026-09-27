@@ -515,11 +515,58 @@ inline void accept_greedy_lane(device const uint *draft_tokens,
                                device uint &next_anchor,
                                device uint &accepted_count,
                                AcceptParams params) {
-  uint accepted = 0;
-  while (accepted < SPLASH_DRAFT_PROPOSAL_TOKENS &&
-         draft_tokens[accepted] == target_tokens[accepted]) {
-    ++accepted;
+  if (params.tree_parents == 0) {
+    uint accepted = 0;
+    while (accepted < SPLASH_DRAFT_PROPOSAL_TOKENS &&
+           draft_tokens[accepted] == target_tokens[accepted]) {
+      ++accepted;
+    }
+    finish_acceptance(target_tokens, accepted, params, retained, next_anchor,
+                      accepted_count);
+    return;
   }
+
+  // Tree acceptance traversal:
+  // Node 0 is Anchor (root).
+  // Candidate nodes 1..7 have parent nibble in tree_parents.
+  // Draft token for node `cand` is draft_tokens[cand - 1].
+  // Target prediction at node `curr` is target_tokens[curr].
+  uint accepted_path[SPLASH_TARGET_VERIFY_ROWS];
+  uint path_len = 1;
+  accepted_path[0] = 0;
+  uint curr = 0;
+
+  while (path_len < SPLASH_TARGET_VERIFY_ROWS) {
+    uint target_pred = target_tokens[curr];
+    int best_child = -1;
+    for (uint cand = 1; cand < SPLASH_TARGET_VERIFY_ROWS; ++cand) {
+      uint parent = (params.tree_parents >> (cand * 4)) & 0xFu;
+      if (parent == curr) {
+        if (target_pred == draft_tokens[cand - 1]) {
+          best_child = int(cand);
+          break;
+        }
+      }
+    }
+    if (best_child < 0) {
+      break;
+    }
+    accepted_path[path_len] = uint(best_child);
+    ++path_len;
+    curr = uint(best_child);
+  }
+
+  uint accepted = path_len - 1;
+  // Write the accepted path tokens in sequential order into target_tokens:
+  // target_tokens[i] is the token of accepted_path[i + 1]
+  // target_tokens[accepted] is the next anchor (target prediction at curr)
+  uint final_anchor = target_tokens[curr];
+  for (uint i = 0; i < accepted; ++i) {
+    uint node = accepted_path[i + 1];
+    target_tokens[i] = draft_tokens[node - 1];
+  }
+  target_tokens[accepted] = final_anchor;
+
   finish_acceptance(target_tokens, accepted, params, retained, next_anchor,
                     accepted_count);
 }
@@ -540,8 +587,8 @@ kernel void decode_accept_dflash(
   if (batch >= params.lanes)
     return;
   uint remaining = params.remaining[batch];
-  AcceptParams lane_params{remaining, params.stop_token_0,
-                           params.stop_token_1};
+  AcceptParams lane_params{remaining, params.stop_token_0, params.stop_token_1,
+                           params.tree_parents};
   device const uint *lane_draft =
       draft_tokens + batch * SPLASH_DRAFT_PROPOSAL_TOKENS;
   device uint *lane_target =

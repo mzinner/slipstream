@@ -2,6 +2,15 @@
 
 #include "metal/abi/KernelABI.h"
 
+// Ancestor traversal for tree-structured speculative drafting.
+// Node 0 is the root / Anchor; its ancestors (< 0) come from conv_state_in.
+// For node > 0, parent nibble is read from tree_parents unless tree_parents == 0 (linear fallback).
+inline int tree_parent(uint tree_parents, int node) {
+  if (node <= 0) return node - 1;
+  if (tree_parents == 0) return node - 1;
+  return int((tree_parents >> (uint(node) * 4)) & 0xFu);
+}
+
 // Four-tap causal convolution of one channel at one token of the command,
 // reading the three preceding tokens from the carried state, rounded to bf16
 // and gated by SiLU.
@@ -9,13 +18,18 @@ inline bfloat gdn_conv_silu(device const bfloat *packed,
                             device const bfloat *conv_state_in,
                             device const bfloat *conv_weights,
                             uint packed_width, uint conv_dim, uint token,
-                            uint channel) {
+                            uint channel, uint tree_parents = 0) {
   float value = 0.0f;
+  int tap_node[4];
+  tap_node[3] = int(token);
+  tap_node[2] = tree_parent(tree_parents, tap_node[3]);
+  tap_node[1] = tree_parent(tree_parents, tap_node[2]);
+  tap_node[0] = tree_parent(tree_parents, tap_node[1]);
   for (uint tap = 0; tap < 4; ++tap) {
-    uint position = token + tap;
-    bfloat input = position < 3
-                       ? conv_state_in[position * conv_dim + channel]
-                       : packed[(position - 3) * packed_width + channel];
+    int node = tap_node[tap];
+    bfloat input = node < 0
+                       ? conv_state_in[uint(3 + node) * conv_dim + channel]
+                       : packed[uint(node) * packed_width + channel];
     value += float(input) * float(conv_weights[channel * 4 + tap]);
   }
   value = float(bfloat(value));

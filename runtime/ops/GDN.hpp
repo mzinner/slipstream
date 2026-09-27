@@ -17,6 +17,7 @@ struct GdnShape final {
   // Output gate activation: silu when false, sigmoid when true. Not part of
   // the compiled geometry; see GDNPreparePrefillParams.
   bool sigmoidGate = false;
+  uint32_t treeParents = 0;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return keyHeads && valueHeads && valueHeads % keyHeads == 0 &&

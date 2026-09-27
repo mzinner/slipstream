@@ -337,6 +337,32 @@ To create a Swift version of Nitin's V3 model (`Swift-Qwen3.8-Flash-Next-V3`) de
 3. **Draft Accounting Parity in `Runtime.mm`**:
    - `Runtime.mm` line 1105 previously hardcoded `kDraftProposalTokens` (7), masking true draft acceptance. Updated to report `impl_.mtpProposed` when active.
 4. **Linear Speculation Bound**:
-   - Raising the chain confidence threshold (`SPLASH_MTP_CHAIN_MIN` 0.35 -> 0.42) reduced acceptance to 27.2% and throughput to 40.9 tok/s because the verifier's fixed cost is high; retaining guesses up to chain threshold 0.35 remains optimal for linear chains. Reaching 50+ tok/s strictly requires 2D tree attention masking in Metal.
+   - Raising the chain confidence threshold (`SPLASH_MTP_CHAIN_MIN` 0.35 -> 0.42) reduced acceptance to 27.2% and throughput to 40.9 tok/s because the verifier's fixed cost is high; retaining guesses up to chain threshold 0.35 remains optimal for linear chains.
 
+## 2026-09-26 — Tree Speculative Drafting Invariants & KV Scatter Barrier
 
+1. **Tree Drafting Shader Implementation**:
+   - Implemented 2D attention masking in Metal (`attention_q8.metal`, `q8_attention_tile.h`), GDN tree recurrence (`gdn_primitives.h`, `gdn.metal`), and tree greedy acceptance in sampling (`sampling.metal`).
+   - Guarded under `SPLASH_TREE_DRAFT`: defaults to 0 (exact linear causal path).
+2. **The KV Cache Physical Placement Invariant**:
+   - In `PagedAttention::addVerify`, `storePipeline_` writes all 8 verify rows sequentially into `keyData` and `valueData` at positions `committed_tokens + 0` through `committed_tokens + 7` during the forward pass.
+   - For linear speculation, any accepted branch is strictly a prefix `{0, 1, ..., k-1}`, so sequential placement is naturally valid.
+   - For tree speculation, taking a side branch (e.g. node 5 or node 6) accepts a non-contiguous set of rows. Leaving them in sequential physical slots pollutes the KV cache with activations from the rejected branches.
+   - Similarly, GDN commit (`gdn_decode_commit`) replays the first `retained` rows in linear order.
+   - Supporting general tree speculation safely requires an in-place KV cache compaction kernel and selective GDN state replay.
+3. **MTP CPU Dispatch Overhead**:
+   - Proposing 7 tree draft tokens using 4 sequential MTP forward steps inside `runMtpDraft` added ~8–10 ms of CPU/GPU scheduling overhead, offsetting the verification gain.
+
+## 2026-09-26 — Expert Cache Sizing Flag is `SPLASH_EXPERT_CACHE_GIB`
+
+- To prevent memory growth pauses (`resource_timeout`) during high-context prompts (such as GPQA Diamond), set `SPLASH_EXPERT_CACHE_GIB=30` (not `CACHE_GIB=30`).
+- At 30 GiB (`~239` experts per layer), free host RAM remains >46 GiB, completely eliminating resource stalls while preserving decode throughput.
+
+## 2026-09-26 — Prompt Lookup Decoding (PLD) Evaluation
+
+- Evaluated Hayder Tirmazi's 42x prompt lookup research (`docs/research/prompt_lookup_drafting_analysis.md`).
+- Fast CPU-side n-gram lookup (<4 µs) requires zero GPU compute and zero extra weights.
+- Recommended roadmap:
+  1. Add standalone zero-copy n-gram lookup engine (`PromptLookup.hpp`).
+  2. Implement speculative verification on `Swift-Qwen3.8-27B-Splash-HQ` (projected to boost decode from 44 tok/s to 60–75+ tok/s on context-rich tasks with 0 MB extra VRAM).
+  3. Integrate hybrid fallback on `Swift-Flash-Next-V3` when MTP head confidence < 0.35.

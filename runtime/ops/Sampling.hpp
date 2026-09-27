@@ -86,7 +86,7 @@ public:
       metal::CommandGraph &graph, AcceptanceBuffers buffers,
       std::span<const uint32_t> maximumRetained,
       std::span<const SamplingPolicy> policies, uint32_t stopToken0,
-      uint32_t stopToken1) const;
+      uint32_t stopToken1, uint32_t treeParents = 0) const;
   void addVerifyInput(metal::CommandGraph &graph,
                       metal::MetalBuffer draftInputTokens,
                       metal::MetalBuffer proposedTokens,

@@ -67,7 +67,8 @@ wanted 128 MiB, long before any real weights existed.
 - **GGUF GDN head interleaving**: GGUF groups 48 GDN heads as `(3, 16)`. Reshape and transpose `(3, 16) -> (16, 3)` before feeding Splash kernels.
 - **APFS hardlinks for n-gram tables**: Using `os.link` reuses physical SSD blocks (0 extra bytes) during conversion.
 - **Swift models loop under `xhigh` thinking**: Swift 1.5 is distilled for concise thinking; forcing `xhigh` in deep contexts (>50k tokens) causes degenerate repetitive thinking loops that consume the full generation token budget and emit empty output. Always default Swift to `--thinking low` or `medium`.
-- **Pi glob pattern matching**: In `~/.pi/agent/settings.json`, matching model IDs with subpaths (e.g. `slipstream/local/swift-qwen38-flash-next-v3`) requires `"slipstream/**"`. `"slipstream/*"` only matches single segments and logs a pattern warning.
+- **Expert cache sizing flag is `SPLASH_EXPERT_CACHE_GIB`**: Pass `SPLASH_EXPERT_CACHE_GIB=30` (not `CACHE_GIB=30`) to control expert cache allocation. At 30 GiB, free host RAM remains >46 GiB, preventing `resource_timeout` on high-context prompts.
+- **Tree drafting KV physical placement invariant**: `PagedAttention::addVerify` stores the 8 verify rows linearly into `keyData`/`valueData` during the forward pass. Taking non-linear tree branches leaves unaccepted branch activations in physical slots unless followed by a compaction pass.
 
 ## About Nitin
 

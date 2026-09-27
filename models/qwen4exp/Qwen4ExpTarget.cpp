@@ -36,9 +36,11 @@ constexpr uint32_t kMoeSkippedRoute = 0xFFFFFFFFu;
 // qwen4exp gates its linear-attention output with a sigmoid (the checkpoint's
 // config sets output_gate_type), where Qwen3.8 uses silu. Everything else about
 // the GDN shape is shared, so only this flag differs.
-[[nodiscard]] ops::GdnShape gdnShape(const QwenTargetGeometry &geometry) {
+[[nodiscard]] ops::GdnShape gdnShape(const QwenTargetGeometry &geometry,
+                                     uint32_t treeParents = 0) {
   ops::GdnShape shape = geometry.gdnShape();
   shape.sigmoidGate = true;
+  shape.treeParents = treeParents;
   return shape;
 }
 
@@ -1603,9 +1605,10 @@ void Qwen4ExpTarget::addPrefill(
 uint32_t mtpDraftLimit() noexcept {
   static const uint32_t limit = [] {
     const char *value = std::getenv("SPLASH_MTP_DRAFTS");
-    // 5 measured best across greedy and sampled (mean 40.8 tok/s over the
-    // three bench prompts, lowest 36.6; 3 gave 38.9 and 33.6).
-    const int parsed = value ? std::atoi(value) : 5;
+    const char *tree = std::getenv("SPLASH_TREE_DRAFT");
+    const bool treeDrafting = tree != nullptr && std::atoi(tree) != 0;
+    const int defaultDrafts = treeDrafting ? 7 : 5;
+    const int parsed = value ? std::atoi(value) : defaultDrafts;
     return static_cast<uint32_t>(std::clamp(parsed, 1, 7));
   }();
   return limit;
@@ -1748,7 +1751,10 @@ void Qwen4ExpTarget::addVerify(
            buffers.gdnDecay[gdnIdx], buffers.gdnBeta[gdnIdx],
            buffers.recurrent, mixer.mixerNorm, buffers.gdnHidden,
            buffers.arrived, buffers.generation},
-          gdnShape(geometry), lanes, gdnIdx,
+          gdnShape(geometry, [] {
+            const char *v = std::getenv("SPLASH_TREE_DRAFT");
+            return (v != nullptr && std::atoi(v) != 0) ? 0x60132100u : 0u;
+          }()), lanes, gdnIdx,
           {geometry.stateLayout.convolutionLayerBytes(),
            geometry.stateLayout.recurrentLayerBytes(),
            geometry.stateLayout.convolutionBytes()});
@@ -2527,7 +2533,7 @@ void Qwen4ExpTarget::addVerify(
       // id), and the exact softmax mass from each slice's max and sum.
       // Greedy keeps one candidate; four when tracing, for the record only.
       const uint32_t width16 = mtp.temperature > 0.0f
-          ? std::min<uint32_t>(mtp.topK ? mtp.topK : 16, 16) : (traceFile ? 4u : 1u);
+          ? std::min<uint32_t>(mtp.topK ? mtp.topK : 16, 16) : 4u;
       const auto *pickIds = static_cast<const uint32_t *>(weights.mtpPickIds.contents());
       const auto *pickValues = static_cast<const float *>(weights.mtpPickValues.contents());
       const auto *pickMass = static_cast<const float *>(weights.mtpPickMass.contents());
@@ -2566,9 +2572,11 @@ void Qwen4ExpTarget::addVerify(
       }
       lastCandidates.fill(UINT32_MAX);
       lastProbabilities.fill(0.0f);
+      for (uint32_t i = 0; i < filled; ++i) {
+        lastCandidates[i] = ids[i];
+        lastProbabilities[i] = (i == 0) ? 1.0f : 0.0f;
+      }
       if (mtp.temperature <= 0.0f) {
-        lastCandidates[0] = ids[0];
-        lastProbabilities[0] = 1.0f;
         return ids[0];
       }
       std::array<float, 16> q{};
@@ -2620,6 +2628,98 @@ void Qwen4ExpTarget::addVerify(
       const char *value = std::getenv("SPLASH_MTP_CHAIN_MIN");
       return value ? static_cast<float>(std::atof(value)) : 0.35f;
     }();
+    static const bool treeDrafting = [] {
+      const char *value = std::getenv("SPLASH_TREE_DRAFT");
+      return value != nullptr && std::atoi(value) != 0;
+    }();
+
+    if (treeDrafting) {
+      // Structure A Tree: 7 draft tokens
+      // Row 1: drafts[0] = Guess 1A (Top-1 from Anchor, parent 0)
+      // Row 2: drafts[1] = Guess 2A (Top-1 from Guess 1A, parent 1)
+      // Row 3: drafts[2] = Guess 3A (Top-1 from Guess 2A, parent 2)
+      // Row 4: drafts[3] = Guess 4A (Top-1 from Guess 3A, parent 3)
+      // Row 5: drafts[4] = Guess 2B (Top-2 from Guess 1A, parent 1)
+      // Row 6: drafts[5] = Guess 1B (Top-2 from Anchor, parent 0)
+      // Row 7: drafts[6] = Guess 2C (Top-1 from Guess 1B, parent 6)
+      const uint64_t anchorPosition = mtp.firstPosition + mtp.rows;
+      const auto *y = static_cast<const uint16_t *>(Y.contents());
+
+      drafts[0] = step(mtp.firstPosition, mtp.rows, mtp.tokens.data());
+      draftTrace.chosen[0] = drafts[0];
+      draftCandidates[0] = lastCandidates;
+      draftProbabilities[0] = lastProbabilities;
+
+      uint32_t guess1B = (lastCandidates[1] != UINT32_MAX) ? lastCandidates[1] : drafts[0];
+      drafts[5] = guess1B;
+      draftCandidates[5] = lastCandidates;
+      draftProbabilities[5] = lastProbabilities;
+
+      std::vector<uint16_t> yAnchor(width);
+      std::memcpy(yAnchor.data(), y + uint64_t{mtp.rows - 1} * width, width * 2);
+
+      // Guess 1A step -> produces Guess 2A (ids[0]) and Guess 2B (ids[1])
+      std::memcpy(hIn, yAnchor.data(), width * 2);
+      drafts[1] = step(anchorPosition, 1, &drafts[0]);
+      draftTrace.chosen[1] = drafts[1];
+      draftCandidates[1] = lastCandidates;
+      draftProbabilities[1] = lastProbabilities;
+
+      uint32_t guess2B = (lastCandidates[1] != UINT32_MAX) ? lastCandidates[1] : drafts[1];
+      drafts[4] = guess2B;
+      draftCandidates[4] = lastCandidates;
+      draftProbabilities[4] = lastProbabilities;
+
+      std::vector<uint16_t> y1A(width);
+      std::memcpy(y1A.data(), y, width * 2);
+
+      // Guess 2A step -> produces Guess 3A (ids[0])
+      std::vector<uint16_t> y2A(width);
+      const bool fits2 = (anchorPosition + 1 + kRows + kv::kPageTokens - 1) /
+                             kv::kPageTokens <= mtp.pageTable.size();
+      if (fits2) {
+        std::memcpy(hIn, y1A.data(), width * 2);
+        drafts[2] = step(anchorPosition + 1, 1, &drafts[1]);
+        std::memcpy(y2A.data(), y, width * 2);
+      } else {
+        std::memcpy(hIn, yAnchor.data(), width * 2);
+        std::memcpy(hIn + uint64_t{1} * width, y1A.data(), width * 2);
+        std::array<uint32_t, 2> branch2{drafts[0], drafts[1]};
+        drafts[2] = step(anchorPosition, 2, branch2.data());
+        std::memcpy(y2A.data(), y + uint64_t{1} * width, width * 2);
+      }
+      draftTrace.chosen[2] = drafts[2];
+      draftCandidates[2] = lastCandidates;
+      draftProbabilities[2] = lastProbabilities;
+
+      // Guess 3A step -> produces Guess 4A (ids[0])
+      const bool fits3 = (anchorPosition + 2 + kRows + kv::kPageTokens - 1) /
+                             kv::kPageTokens <= mtp.pageTable.size();
+      if (fits3) {
+        std::memcpy(hIn, y2A.data(), width * 2);
+        drafts[3] = step(anchorPosition + 2, 1, &drafts[2]);
+      } else {
+        std::memcpy(hIn, yAnchor.data(), width * 2);
+        std::memcpy(hIn + uint64_t{1} * width, y1A.data(), width * 2);
+        std::memcpy(hIn + uint64_t{2} * width, y2A.data(), width * 2);
+        std::array<uint32_t, 3> branch3{drafts[0], drafts[1], drafts[2]};
+        drafts[3] = step(anchorPosition, 3, branch3.data());
+      }
+      draftTrace.chosen[3] = drafts[3];
+      draftCandidates[3] = lastCandidates;
+      draftProbabilities[3] = lastProbabilities;
+
+      // Guess 1B step -> produces Guess 2C (ids[0])
+      std::memcpy(hIn, yAnchor.data(), width * 2);
+      drafts[6] = step(anchorPosition, 1, &drafts[5]);
+      draftTrace.chosen[6] = drafts[6];
+      draftCandidates[6] = lastCandidates;
+      draftProbabilities[6] = lastProbabilities;
+
+      drafted = 7;
+      return drafts;
+    }
+
     float chainConfidence = 1.0f;
     drafted = 0;
     drafts[0] = step(mtp.firstPosition, mtp.rows, mtp.tokens.data());

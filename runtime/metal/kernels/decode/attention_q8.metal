@@ -16,6 +16,7 @@ struct SplashQ8VerifyTile {
   uint splits;
   uint committed_tokens;
   uint active_rows;
+  uint tree_parents;
   bool active;
 };
 
@@ -47,6 +48,7 @@ inline SplashQ8VerifyTile splash_q8_verify_attention_tile_at(
   tile.splits = lane_params.split_count;
   tile.committed_tokens = lane_params.committed_tokens;
   tile.active_rows = lane_params.active_rows;
+  tile.tree_parents = lane_params.tree_parents;
   tile.active = true;
   return tile;
 }
@@ -99,7 +101,7 @@ inline SplashQ8VerifyTile splash_q8_verify_attention_tile_at(
         tile.page_table, tile.kv_head, tile.committed_tokens, tile.active_rows, \
         tile.splits, tile.split, partials, statistics, tile.slot, scores,       \
         probabilities, row_max, row_sum, previous_scale, &rescale,              \
-        thread_index);                                                          \
+        thread_index, nullptr, nullptr, 0u, tile.tree_parents);                 \
   }
 
 // Sparse verify: the same tile, walking the pages the indexer selected. The
@@ -136,7 +138,8 @@ inline SplashQ8VerifyTile splash_q8_verify_attention_tile_at(
         tile.page_table, tile.kv_head, tile.committed_tokens, tile.active_rows, \
         tile.splits, tile.split, partials, statistics, tile.slot, scores,       \
         probabilities, row_max, row_sum, previous_scale, &rescale,              \
-        thread_index, selected_pages, selected_masks, selected_count);          \
+        thread_index, selected_pages, selected_masks, selected_count,           \
+        tile.tree_parents);                                                     \
   }
 
 Q8_VERIFY_SPLIT(verify_attention_q8_split, 4, 6, true)

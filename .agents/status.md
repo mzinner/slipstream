@@ -71,11 +71,17 @@ Completed 2026-09-26 across 145 paired items (seed 1234, temperature 0.0), run s
 | Capped maxTokens to 16,384 and registered Swift V3 across Pi & Omp | `~/.pi/agent/models.json`, `~/.omp/agent/models.yml`, `~/.pi/agent/settings.json` |
 | Executed comprehensive 145-item benchmark between Swift-27B-HQ and Swift-V3 | `dev/benchmarks/swift_benchmark_results/BENCHMARK_SCORECARD.md` |
 | Benchmarked & optimized speculative drafting on Swift V3 (20 items; 68.6% tokens speculative, precomputed rotary frequencies) | `dev/benchmarks/benchmark_drafting.py`, `models/qwen4exp/Qwen4ExpTarget.cpp` |
+| Implemented tree drafting Metal shaders (2D attention mask, tree GDN recurrence, tree greedy sampling) | `runtime/metal/kernels/decode/{attention_q8, gdn, sampling}.metal` |
+| Benchmarked speculative drafting under `SPLASH_EXPERT_CACHE_GIB=30` (76.2% acceptance, 100% accuracy on GSM8K/HumanEval/Systems, up to 48.8 tok/s) | `dev/benchmarks/benchmark_drafting.py` |
+| Completed technical evaluation and implementation plan for Prompt Lookup Decoding (PLD) | `docs/research/prompt_lookup_drafting_analysis.md` |
 
 ---
 
-## Pending / Active Track (Option B: Tree Drafting)
-1. Implement 2D tree attention masking in Metal shaders (`runtime/metal/kernels/decode/attention_q8.metal`) for tree-based speculative drafting.
-2. Update MTP draft proposer to emit branching candidate trees.
-3. Update verification and tree acceptance path in `Runtime.mm`.
-4. Validate throughput gain (target: 50–60+ tok/s).
+## Active Status & Next Steps
+
+1. **Speculative Drafting Status**:
+   - Linear speculative drafting is active by default (`SPLASH_TREE_DRAFT=0`), delivering **76.18% acceptance ratio** (10,235 / 13,436 tokens) with 100% accuracy on math, coding, and systems reasoning, and decode throughput up to **48.8 tok/s**.
+   - Tree speculative drafting (`SPLASH_TREE_DRAFT=1`) shaders are implemented; general tree speculation requires a post-verification KV cache compaction kernel to avoid state corruption when non-linear branches win.
+2. **Next Track: Prompt Lookup Decoding (PLD)**:
+   - Implement standalone CPU-side prompt lookup engine (`runtime/ops/PromptLookup.hpp`) to accelerate `Swift-Qwen3.8-27B-Splash-HQ` (which has no draft head) toward 60–75+ tok/s with zero extra VRAM.
+   - Add hybrid fallback on `Swift-Flash-Next-V3` for tokens where MTP head confidence drops below 0.35.

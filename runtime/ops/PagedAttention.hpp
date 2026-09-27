@@ -55,9 +55,10 @@ q8VerifyAttentionSplits(uint32_t baseSplits, uint32_t committedTokens,
 [[nodiscard]] constexpr Q8VerifyAttentionParams
 q8VerifyAttentionParams(uint32_t committedTokens, uint32_t activeRows,
                         uint32_t chunkStride, uint32_t pageTableEntries,
-                        uint32_t physicalPageCount) noexcept {
+                        uint32_t physicalPageCount,
+                        uint32_t treeParents = 0) noexcept {
   return {committedTokens, activeRows, chunkStride, pageTableEntries,
-          physicalPageCount, kQ8VerifySplits, kQ8VerifySplits, 0};
+          physicalPageCount, kQ8VerifySplits, kQ8VerifySplits, treeParents};
 }
 
 [[nodiscard]] constexpr std::string_view q8VerifyAttentionValidationError(
@@ -81,8 +82,6 @@ q8VerifyAttentionParams(uint32_t committedTokens, uint32_t activeRows,
   if (params.slot_splits < params.split_count ||
       params.slot_splits > kQ8VerifyMaximumSplits)
     return "slot_splits_invalid";
-  if (params.reserved2)
-    return "reserved_fields_nonzero";
   return {};
 }
 
