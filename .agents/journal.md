@@ -1,6 +1,9 @@
 # Journal — qwen4exp port
 
-## 2026-09-27 09:30 PDT — antigravity
+## 2026-09-27 09:40 PDT — antigravity
+
+Investigated and resolved "Metal command must contain a dispatch" error on Swift-27B during `omp` sessions. Root cause: in constrained decoding (`ConstraintMode::TokenMask` used by `omp` for tools/grammar), steps are split into separate Draft and Target phases (`draftForMask = true`, `verify = false`). Setting `draftComputed = false` on exact prompt matches left `commandGraph` with 0 dispatches, which threw in `MetalBackend::submitCommandAsync`. Fixed by: 1) restricting PLD draft bypass to `!constrained` steps so `ConstrainedDecodeTicket`'s multi-stage grammar simulation and RoPE generation remain intact; 2) patching `MetalBackend::submitCommandAsync` to safely complete empty commands instead of throwing. Rebuilt `splash`, installed to Splash-Q8, and verified end-to-end with curl tool calling (50.97 tok/s) and live headless `omp` (`OMP OK`). Pushed (`81affb1`) to `fork/q8`.
+Blocked on: nothing.
 
 Updated the Work Hub (`~/Documents/shared-with-google-drive/INDEX.html`) and agent configurations per Nitin's direction. Updated `Splash Q8 — Swift-Qwen3.8-27B-Splash-HQ` card with DFlash 2 + Prompt Lookup Decoding and `Slipstream — Swift-Qwen3.8-Flash-Next-V3` card with MTP + PLD and 145-item benchmark results. Configured all `omp` and `pi` commands to use minimum medium thinking (`--thinking=medium`), eliminating `--thinking=low`. Updated `~/.omp/agent/models.yml` (`defaultLevel: medium`). Verified Swift-27B engine is live on port 8000 with Prompt Lookup active (570 ms TTFT, 42.3 tok/s decode).
 Blocked on: nothing.
