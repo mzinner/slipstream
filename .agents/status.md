@@ -1,6 +1,6 @@
 # Status — Slipstream-GGUF (handoff)
 
-**Updated:** 2026-09-26 20:00 PDT by antigravity.
+**Updated:** 2026-09-27 10:15 PDT by antigravity.
 **Branch:** `main` tracking `origin/main` (`github.com/npanj/slipstream.git`). Never push to `github.com/incoai/splash`.
 
 ## In one line
