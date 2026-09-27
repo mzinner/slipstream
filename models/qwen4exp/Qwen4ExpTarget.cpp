@@ -2798,7 +2798,7 @@ void Qwen4ExpTarget::addVerify(
                 std::chrono::steady_clock::now() - mtpStart).count();
     static const bool pldEnabled = [] {
       const char *v = std::getenv("SPLASH_PROMPT_LOOKUP");
-      return v == nullptr || std::atoi(v) != 0;
+      return v != nullptr && std::atoi(v) != 0;
     }();
     if (pldEnabled && buffers.promptLookup && drafted < maxDrafts && buffers.mtp[0].rows) {
       const uint32_t anchor = buffers.mtp[0].tokens[buffers.mtp[0].rows - 1];
