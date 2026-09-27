@@ -77,6 +77,7 @@ Completed 2026-09-26 across 145 paired items (seed 1234, temperature 0.0), run s
 | Validated 20-item benchmark under `SPLASH_EXPERT_CACHE_GIB=30` (10,268 accepted speculative tokens, 100% accuracy on GSM8K/HumanEval/Systems) | `dev/benchmarks/benchmark_drafting.py` |
 | Integrated Prompt Lookup Decoding into Swift-27B runtime (`splash2`), bypassing GPU DFlash on exact matches | `splash2/runtime/model/Runtime.mm`, installed to `Splash-Q8/current/engine/splash` |
 | Updated Work Hub (`INDEX.html`) & `~/.omp/agent/models.yml` to minimum medium thinking (`--thinking=medium`) | `INDEX.html`, `~/.omp/agent/models.yml` |
+| Re-tuned Flash-Next expert cache default to 32 GiB (reclaiming ~2.4 GiB RAM) & guard floor to 3.5 GiB | `~/models/bin/{splash-flashnext-server.sh, slipstream-server.sh}` |
 
 ---
 
@@ -85,9 +86,8 @@ Completed 2026-09-26 across 145 paired items (seed 1234, temperature 0.0), run s
 1. **Speculative Drafting & Model Status**:
    - Hybrid linear MTP + Prompt Lookup speculation is fully operational on Swift-V3.
    - Prompt Lookup Decoding engine is integrated into Swift-27B (`splash2/q8`), enabling 49 ns CPU drafting and bypassing DFlash on exact n-gram matches.
-   - All model servers are currently stopped. Ports 8000, 8080, and 8090 are completely free.
-   - Ready for you to launch in your separate shell.
+   - Flash-Next launcher tuned to default 32 GiB expert cache (`SPLASH_EXPERT_CACHE_GIB=32`), preventing memory guard kills on 50k+ token sessions.
    - Work Hub (`INDEX.html`) and agent configs are synced with minimum medium thinking.
 2. **Next Steps**:
-   - Start Swift-27B in your shell (`~/models/bin/swift27b-server.sh`) or Swift-V3 (`./splash serve --model ~/models/swift-qwen38-flash-next-v3 --port 8090`).
+   - Start Flash-Next server in separate shell (`~/models/bin/swift-flashnext-server.sh` or `splash-flashnext-server.sh`).
    - Run interactive tests or benchmarks.

@@ -1,5 +1,10 @@
 # Journal — qwen4exp port
 
+## 2026-09-27 11:45 PDT — antigravity
+
+Investigated recurring server death on Flash-Next during long-context agent sessions. Diagnosed root cause: `SPLASH_EXPERT_CACHE_GIB` was defaulted to 34 GiB, which with 7 GiB base weights and 12-14 GiB macOS/Chrome memory left only ~9 GiB free headroom. When sessions expanded past 50k tokens, the KV cache pushed free memory below 4.0 GiB, triggering `guarded.py` SIGKILL or internal engine pauses (`Memory: growth paused; waiting=1`). Re-tuned `SPLASH_EXPERT_CACHE_GIB` default to 32 GiB in `~/models/bin/splash-flashnext-server.sh` and set memory guard floor to 3.5 GiB in `slipstream-server.sh`, safely freeing ~2.4 GiB RAM.
+Blocked on: nothing.
+
 ## 2026-09-27 09:40 PDT — antigravity
 
 Investigated and resolved "Metal command must contain a dispatch" error on Swift-27B during `omp` sessions. Root cause: in constrained decoding (`ConstraintMode::TokenMask` used by `omp` for tools/grammar), steps are split into separate Draft and Target phases (`draftForMask = true`, `verify = false`). Setting `draftComputed = false` on exact prompt matches left `commandGraph` with 0 dispatches, which threw in `MetalBackend::submitCommandAsync`. Fixed by: 1) restricting PLD draft bypass to `!constrained` steps so `ConstrainedDecodeTicket`'s multi-stage grammar simulation and RoPE generation remain intact; 2) patching `MetalBackend::submitCommandAsync` to safely complete empty commands instead of throwing. Rebuilt `splash`, installed to Splash-Q8, and verified end-to-end with curl tool calling (50.97 tok/s) and live headless `omp` (`OMP OK`). Pushed (`81affb1`) to `fork/q8`.
