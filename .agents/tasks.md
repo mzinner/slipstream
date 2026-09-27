@@ -55,8 +55,7 @@
 - [ ] 50 tok/s: needs ~4.1 tokens a step (tree drafting / better draft head)
 - [ ] Uneven cache slots per layer (~9% fewer misses in replay)
 - [ ] Draft head: process only live rows (~0.5 ms)
-- [/] Resume the paused quality round: Splash vs llama.cpp V3 vs 27B HQ
-      (In progress: running agreement, ifeval, math500 on llama.cpp, then 27B HQ all suites via run_remaining_round2.sh)
+- [x] Quality round: Swift-Qwen3.8-27B-Splash-HQ vs Swift-Qwen3.8-Flash-Next-V3 (145 items across 6 domains: AIME 2025, MATH-500, GPQA Diamond, GSM8K, HumanEval, Hard Systems & Logic; Flash-Next leads 70.3% vs 67.6% with identical ~44 tok/s throughput)
 - [ ] Code-prompt drift: 79% same pick vs llama.cpp 89%
 - [ ] Short-prompt reading speed (87 vs ~110 tok/s)
 - [x] 27B 4-bit package prepared: Swift-Qwen3.8-27B converted to Splash format (local/Swift-Qwen3.8-27B, 16.9 GB)
@@ -83,8 +82,28 @@
 - [x] Upstream fixes #31/#92/#120 merged; live omp/pi tool calls OK
 - [ ] llama.cpp V3: humaneval (may be partial), ifeval, math500
 - [ ] Both engines: sessions, then Nitin judges blind (bench.judge)
-- [ ] 27B HQ round (Nitin to decide)
+- [x] 27B HQ round: completed head-to-head against Swift V3 (45.0% on AIME 2025, 92.0% HumanEval, 44.4 vs 43.9 tok/s)
 - [ ] Decide default expert cache (34 vs 30 GiB): measure speed cost first
 - [ ] Optional: full-precision reference via a hosted API (Nitin's key)
 - [ ] Optional: drop `install/` and Homebrew/release packaging
 - [ ] Optional: explicit model interface in place of `QwenTarget`
+
+## GGUF Direct Ingestion (slipstream-gguf)
+
+- [x] Sharded GGUF reader with SIMD dequantization via libggml-base (`dev/tools/sharded_gguf_reader.py`)
+- [x] Parallel GGUF-to-Slipstream converter (`models/qwen4exp/tools/convert_qwen4exp_gguf.py`)
+- [x] Layer composition and weights alignment:
+  - [x] Hyper-connection & MTP RMS norm offsets: subtract 1.0 (Metal kernel adds +1.0f)
+  - [x] GDN value heads de-permutation: (3, 16) -> (16, 3) across 7 tensors
+  - [x] Router & shexp quantization layout: `quantized_q8` group-major transpose
+- [x] CLI launcher `--model` auto-detecting GGUF directories + `--port` option (`install/launcher.py`)
+- [x] End-to-end 10-prompt benchmark: 40.1 tok/s decode, 10/10 coherent
+- [x] HTTP server test `/v1/chat/completions` on `:8090` verified
+- [x] Paired A/B benchmark (Slipstream vs llama.cpp on V3 GGUF): 40.76 vs 23.10 tok/s (1.76x speedup, 100% quality parity)
+- [x] Reclaim ~97 GB by deleting redundant `~/models/qwen38-flash-next-splash` (confirmed & completed)
+- [x] Spliced Swift V3 GGUF (`~/models/swift-qwen38-flash-next-v3`, 95.52 GiB) via HTTP range donor requests (`dev/tools/build_swift_v3_gguf.py`)
+- [x] Fast ingestion of Swift V3 into Slipstream package (`~/models/swift-qwen38-flash-next-v3/prepared`, 372.6s, hardlinked `ngram.bin`)
+- [x] Paired A/B benchmark on Swift V3 GGUF (Slipstream vs llama.cpp): 41.72 vs 22.84 tok/s (1.83x speedup, 1.51x faster TTFT, 100% quality parity)
+- [x] Set maxTokens cap to 16,384 across Pi and Omp configurations and registered `local/swift-qwen38-flash-next-v3`
+
+

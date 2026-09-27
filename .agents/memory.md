@@ -16,6 +16,8 @@ fact that set the whole shape of this project.
 | 27B converter (format proof) | `dev/tools/convert_qwen38.py` |
 | Verification scripts | `models/qwen4exp/tools/checks/` |
 | Nitin's working V3 model | `~/models/qwen38-flash-next-v3` (GGUF, llama.cpp) |
+| Swift V3 GGUF model | `~/models/swift-qwen38-flash-next-v3` (GGUF + prepared Slipstream) |
+| Flash-Next parameters | 125.7B neural network weights (120.8B in 512 MoE experts + 5.0B dense backbone); 7.3B active/token; +51.2B n-gram lookup table (176.9B total on disk) |
 
 ## The file format is unforgiving, which is good
 
@@ -61,6 +63,11 @@ wanted 128 MiB, long before any real weights existed.
   repeat the kernel under test (`SPLASH_HC_REPEAT=8`) so its cost dwarfs the noise.
 - **PLE gate offset**: normalized rows go at `row + (taps-1)*dilation`, because
   the convolution reads history first.
+- **GGUF RMS norm offsets**: GGUF weights store `(1.0 + weight)` for hyper-connection and MTP RMS norms, but Splash Metal kernels compute `(1.0f + weight)` internally from zero-centered weights. Subtract 1.0f or gains double.
+- **GGUF GDN head interleaving**: GGUF groups 48 GDN heads as `(3, 16)`. Reshape and transpose `(3, 16) -> (16, 3)` before feeding Splash kernels.
+- **APFS hardlinks for n-gram tables**: Using `os.link` reuses physical SSD blocks (0 extra bytes) during conversion.
+- **Swift models loop under `xhigh` thinking**: Swift 1.5 is distilled for concise thinking; forcing `xhigh` in deep contexts (>50k tokens) causes degenerate repetitive thinking loops that consume the full generation token budget and emit empty output. Always default Swift to `--thinking low` or `medium`.
+- **Pi glob pattern matching**: In `~/.pi/agent/settings.json`, matching model IDs with subpaths (e.g. `slipstream/local/swift-qwen38-flash-next-v3`) requires `"slipstream/**"`. `"slipstream/*"` only matches single segments and logs a pattern warning.
 
 ## About Nitin
 

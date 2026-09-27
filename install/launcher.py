@@ -11,6 +11,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 try:
     from . import catalog, clients, paths
@@ -117,9 +118,10 @@ def serve(args):
                 f"Splash is already serving{_serve_lock_owner(lock)}; "
                 "stop it with Ctrl+C first"
             ) from None
+        port = getattr(args, "port", None) or 8090
         lock.seek(0)
         lock.truncate()
-        json.dump({"pid": os.getpid(), "model": args.model, "port": PORT}, lock)
+        json.dump({"pid": os.getpid(), "model": args.model, "port": port}, lock)
         lock.flush()
         # Fail before downloads/builds if another service owns the default port.
         # The HTTP server also binds before loading weights, closing the race.
@@ -128,13 +130,34 @@ def serve(args):
             # not block a restart; a live listener still owns the address.
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                probe.bind(("127.0.0.1", PORT))
+                probe.bind(("127.0.0.1", port))
             except OSError:
                 raise LauncherError(
-                    f"127.0.0.1:{PORT} is in use; stop that service first"
+                    f"127.0.0.1:{port} is in use; stop that service first"
                 ) from None
-        _ensure_installed(args.model)
-        root = model_artifacts.installed_root(paths.MODELS, args.model)
+        model_str = args.model
+        model_path = Path(model_str).expanduser()
+        if model_path.is_dir():
+            gguf_files = list(model_path.glob("*.gguf"))
+            if gguf_files:
+                prepared_dir = model_path / "prepared"
+                manifest_path = prepared_dir / "manifest.json"
+                layer0_path = prepared_dir / "target/layer-0.bin"
+                if not (manifest_path.exists() and layer0_path.exists()):
+                    print(f"[Slipstream] Preparing GGUF model from {model_path}...", flush=True)
+                    from models.qwen4exp.tools.convert_qwen4exp_gguf import prepare_gguf_model
+                    prepare_gguf_model(model_path, prepared_dir)
+                root = prepared_dir
+                model_id = f"local/{model_path.name}"
+            elif (model_path / "manifest.json").exists():
+                root = model_path
+                model_id = f"local/{model_path.name}"
+            else:
+                raise LauncherError(f"Directory {model_path} does not contain GGUF files or a manifest.json")
+        else:
+            _ensure_installed(args.model)
+            root = model_artifacts.installed_root(paths.MODELS, args.model)
+            model_id = args.model
         command = [
             str(paths.PYTHON),
             "-u",
@@ -144,7 +167,7 @@ def serve(args):
             "--tokenizer",
             str(root / "tokenizer"),
             "--model",
-            args.model,
+            model_id,
             "--binary",
             str(paths.BINARY),
             "--max-memory",
@@ -152,6 +175,7 @@ def serve(args):
             "--max-context",
             "auto" if args.max_context is None else str(args.max_context),
         ]
+        command.extend(["--port", str(port)])
         if args.max_image_pixels is not None:
             command.extend(["--max-image-pixels", str(args.max_image_pixels)])
         if args.no_webui:
@@ -263,6 +287,13 @@ def _version():
     )
 
 
+def _parse_model_spec(value):
+    path = Path(value).expanduser()
+    if path.exists() or value.startswith(("/", "./", "../", "~")):
+        return str(path.resolve())
+    return model_artifacts.parse_repo_id(value)
+
+
 def parse_args(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     client_args = []
@@ -279,10 +310,10 @@ def parse_args(argv=None):
     server = commands.add_parser("serve", help="run the local server; Ctrl+C stops it")
     server.add_argument(
         "--model",
-        type=model_artifacts.parse_repo_id,
+        type=_parse_model_spec,
         required=True,
-        metavar="OWNER/REPO",
-        help="Hugging Face repository containing a Splash package",
+        metavar="OWNER/REPO_OR_PATH",
+        help="Hugging Face repository or local directory containing a model package or GGUF shards",
     )
     server.add_argument(
         "--max-memory",
@@ -308,6 +339,12 @@ def parse_args(argv=None):
         "--api-key",
         default=os.environ.get("SPLASH_API_KEY"),
         help="API key (default: SPLASH_API_KEY environment variable)",
+    )
+    server.add_argument(
+        "--port",
+        type=int,
+        default=8090,
+        help="HTTP serving port (default: 8090)",
     )
     server.add_argument("--no-webui", action="store_true", help="disable the chat page")
     for name in clients.INSTALL_URLS:

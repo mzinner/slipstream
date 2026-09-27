@@ -2379,6 +2379,13 @@ void Qwen4ExpTarget::addVerify(
     const ops::LinearMatrix attentionInput{geometry.packedAttentionWidth, hidden};
     const ops::LinearMatrix mixerOutput{hidden, geometry.attentionWidth};
 
+    // Precompute rotary frequencies once outside step:
+    std::vector<float> rotaryFrequencies(geometry.rotaryPairs);
+    for (uint32_t d = 0; d < geometry.rotaryPairs; ++d) {
+      rotaryFrequencies[d] = std::pow(geometry.rotaryTheta,
+                                      -float(d) / float(geometry.rotaryPairs));
+    }
+
     // One draft step over `live` rows at positions position..position+live-1,
     // whose inputs are rows 0..live-1 of mtpHin and `tokens`. Returns the
     // head's top token after the last row.
@@ -2394,9 +2401,7 @@ void Qwen4ExpTarget::addVerify(
       for (uint32_t r = 0; r < kRows; ++r) {
         tokenOut[r] = tokens[std::min(r, live - 1)];
         for (uint32_t d = 0; d < geometry.rotaryPairs; ++d) {
-          const float frequency = std::pow(geometry.rotaryTheta,
-                                           -float(d) / float(geometry.rotaryPairs));
-          const float angle = float(position + r) * frequency;
+          const float angle = float(position + r) * rotaryFrequencies[d];
           cosines[r * geometry.rotaryPairs + d] = std::cos(angle);
           sines[r * geometry.rotaryPairs + d] = std::sin(angle);
         }

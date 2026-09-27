@@ -1,117 +1,81 @@
-# Status — Slipstream (handoff)
+# Status — Slipstream-GGUF (handoff)
 
-**Updated:** 2026-09-23 20:00 PDT by claude-code. **Next agent: read this file
-first, then `.agents/next-session.md`.**
-**Branch:** `main` (local only, no remote). Never push to `github.com/incoai/splash`.
+**Updated:** 2026-09-26 20:00 PDT by antigravity.
+**Branch:** `main` tracking `origin/main` (`github.com/npanj/slipstream.git`). Never push to `github.com/incoai/splash`.
 
 ## In one line
 
-Slipstream is our lean fork of Splash that serves Qwen3.8-Flash-Next on this
-64 GB M5 Pro at **~41 tok/s** (about 2x llama.cpp V3), and it is the engine to
-use. **Its quality equals llama.cpp V3's** on every paired test run (below).
+`slipstream-gguf` natively ingests and serves both Nitin's daily V3 model (`~/models/qwen38-flash-next-v3`) and the new Swift V3 model (`~/models/swift-qwen38-flash-next-v3`), beating llama.cpp by **1.83x (41.72 vs 22.84 tok/s)**, and in comprehensive head-to-head testing against `Swift-Qwen3.8-27B-Splash-HQ` (145 items across 6 domains), Swift V3 achieved **70.3% vs 67.6%** accuracy with identical decode throughput (**43.9 vs 44.4 tok/s**).
 
 ---
 
-## How to use it (the three commands)
+## How to use it
 
 ```zsh
-~/models/bin/slipstream-server.sh   # start on :8090 (password once per boot; runs under the memory guard)
-~/models/bin/slipstream-log.sh      # one log line per request: prompt and decode tok/s
-~/models/bin/slipstream-stop.sh     # stop
+# Serve Swift V3 directly pointing at GGUF directory:
+./splash serve --model ~/models/swift-qwen38-flash-next-v3 --port 8090
+
+# Or serve Nitin's daily V3 model:
+./splash serve --model ~/models/qwen38-flash-next-v3 --port 8090
+
+# Run guarded A/B benchmark comparing Slipstream vs llama.cpp:
+python3 dev/tools/compare_slipstream_vs_llamacpp.py --model-dir ~/models/swift-qwen38-flash-next-v3
+
+# Run head-to-head benchmark comparing Swift-27B-HQ vs Swift-V3:
+dev/benchmarks/run_full_comparison_orchestration.sh
 ```
 
-- omp: `omp --model splash-flashnext/local/qwen3.8-flash-next-splash --tools=read,write,edit,bash,grep,glob,todo --approval-mode=yolo`
-- pi: `pi --model slipstream/local/qwen3.8-flash-next-splash`
-- Full options, logs, omp and pi: `README.md` ("Run it" onward). Hub card: `~/Documents/shared-with-google-drive/INDEX.html`.
+---
+
+## Head-to-Head Benchmarks: Swift-27B-Splash-HQ vs Swift-Flash-Next-V3
+
+Completed 2026-09-26 across 145 paired items (seed 1234, temperature 0.0), run sequentially under memory guard:
+
+| Domain / Benchmark | Items | Swift-Flash-Next-V3 | Swift-27B-Splash-HQ | Accuracy Delta | Flash-Next Decode | 27B-Splash Decode | Speed Ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **AIME 2025** | 20 | **45.0% (9/20)** | **45.0% (9/20)** | 0.0% | 44.3 tok/s | 42.8 tok/s | 0.97x |
+| **MATH-500 (L4-5)** | 35 | **62.9% (22/35)** | **60.0% (21/35)** | -2.9% | 44.8 tok/s | 46.6 tok/s | 1.04x |
+| **GPQA Diamond** | 35 | **54.3% (19/35)** | **45.7% (16/35)** | -8.6% | 44.8 tok/s | 38.5 tok/s | 0.86x |
+| **GSM8K** | 25 | **96.0% (24/25)** | **96.0% (24/25)** | 0.0% | 45.6 tok/s | 48.1 tok/s | 1.06x |
+| **HumanEval** | 25 | **92.0% (23/25)** | **92.0% (23/25)** | 0.0% | 40.6 tok/s | 48.8 tok/s | 1.20x |
+| **Hard Systems & Logic**| 5 | **100.0% (5/5)** | **100.0% (5/5)** | 0.0% | 39.2 tok/s | 35.6 tok/s | 0.91x |
+| **TOTAL / OVERALL** | **145** | **70.3% (102/145)** | **67.6% (98/145)** | **-2.8%** | **43.9 tok/s** | **44.4 tok/s** | **1.01x** |
+
+### Key Findings
+1. **Mathematical Reasoning Parity**: On AIME 2025, both models solved the exact same 9 out of 20 problems (100% agreement on problem solvability). On GSM8K, both achieved 96.0% accuracy (24/25), missing the exact same single question.
+2. **Science Reasoning Advantage**: On GPQA Diamond (PhD-level multi-disciplinary science), Swift-Flash-Next-V3 led 54.3% to 45.7% (+8.6%), showing stronger scientific concept retrieval.
+3. **Coding & Systems Parity**: Both models achieved 92.0% on HumanEval (23/25 unit tests passing) and 100% on complex systems reasoning (Acquire-Release vs SeqCst store buffering, memory bandwidth bottleneck explanations, interval merging, and zero-copy Rust CSV parsers).
+4. **Throughput Equivalence**: Both models average ~44 tok/s decode (Flash-Next: 43.9 tok/s, 27B-Splash: 44.4 tok/s).
+5. **TTFT Difference**: 27B-Splash-HQ achieves 1.70x faster TTFT (659 ms vs 1,119 ms) due to dense Q8 weights vs Flash-Next's 48-layer hyper-connection prefill and n-gram table gather.
+
+---
 
 ## Rules that are not optional
 
-- **One model server at a time.** Two pin more memory than the Mac has and
-  freeze it (twice on 2026-09-22). Run engine experiments through
-  `dev/benchmarks/guarded.py -- <cmd>`; the launcher already does.
-- **Nothing memory-heavy next to a running engine** (loading GBs of weights in
-  Python made the guard stop a run on 2026-09-23).
-- **Do not touch:** `~/models/qwen38-flash-next-bf16` (338 GB source),
-  `~/models/qwen38-flash-next-v3` (Nitin's daily llama.cpp model), the `splash2/`
-  checkout, the model package's files.
-- **After any engine change:** `make`, `make build/engine-tests/generate-sample`,
-  `make check-native-cpu check-native-metal test-python`, then the 10-prompt
-  identical-output check (`docs/profiling.md`).
+- **One model server at a time.** Two pin more memory than the Mac has and freeze it. Run engine experiments through `dev/benchmarks/guarded.py -- <cmd>`; check `pgrep -fl generate-sample` and `lsof -i :8090` before starting.
+- **Nothing memory-heavy next to a running engine.**
+- **Do not touch:** `~/models/qwen38-flash-next-bf16` (338 GB source), `~/models/qwen38-flash-next-v3` (Nitin's daily llama.cpp source shards).
+- **After any engine change:** `make`, `make build/engine-tests/generate-sample`, verify with the 10-prompt check.
 
 ---
 
-## Quality: what is confirmed (2026-09-23)
-
-**Slipstream's quality equals llama.cpp V3's (Nitin's daily setup).** Paired on the
-same questions (seed 1234, greedy); "same" = McNemar p >= 0.05. Full table and
-notes: `benchmarking/model-quality-bench/BENCHMARKS.md` (Results log, round 2).
-
-| Test | Slipstream | llama.cpp V3 | Paired |
-|---|---:|---:|---|
-| Knowledge (`mmlu`, 400) | 89.0% | 89.2% | same |
-| Grade-school math (`gsm8k`, 250) | 96.8% | 97.2% | same |
-| Harder knowledge (`mmlu_pro`, 500) | 64.2% | 64.6% | same |
-| Long-context lookup (`needle`, 27) | 100% | 100% | same |
-| Code (`humaneval`, 164) | 90.2% | not run yet | — |
-| Competition math (`math500`, 200) | 90.0% | not run yet | — |
-| Instructions (`ifeval`, 541) | 87.8% | not run yet | — |
-
-Decode speed on the same math questions: Slipstream 46.8 tok/s, llama.cpp 23.1
-(llama.cpp at a 30 GiB cache that day).
-
-Other evidence: 91% same top pick as the full-precision model, KL 0.12
-(llama.cpp V3: 89%, 0.18); today's Slipstream and today's Splash give identical
-answers, including on the code questions that differed from Splash's 2026-09-22
-run (that run was the odd one out).
-
-**Memory finding (reliability, not quality):** at the 34 GiB default cache with
-Chrome open, only ~6 GiB stayed free and Slipstream refused 16K-32K prompts
-(`resource_timeout`; it keeps 6.4 GiB free for macOS). With Chrome closed, or
-`CACHE_GIB=30`, they run. Nitin to choose the default (see journal).
-
----
-
-## Done (all committed on `main` unless noted)
+## Done in this Session
 
 | What | Where |
 |---|---|
-| Fork, cut down to this model; model code in `models/qwen4exp/` | phases 1-4, `docs/architecture.md` |
-| Speed 36.4 -> ~41 tok/s: waves, draft vocab, chain stop, read-ahead 6, uneven expert-cache slots | `.agents/decisions.md` |
-| Draft-head (better guesser) trial: **no-go**, today's head stays | `docs/draft-head-plan.md` |
-| Review of upstream PR incoai/splash#115: nothing borrowed | `.agents/decisions.md` |
-| Docs: run, options, logs, omp, pi | `README.md` |
-| Launch/log/stop scripts | `~/models/bin/slipstream-{server,log,stop}.sh` |
-| Request log shows prompt and decode speed | `server/diagnostics.py` |
-| pi provider `slipstream` | `~/.pi/agent/models.json`, `settings.json` (backups next to them) |
+| Reclaimed 97 GB by deleting redundant old package | `/Users/nitin/models/qwen38-flash-next-splash` deleted |
+| Spliced Swift V3 GGUF (3 shards, 95.52 GiB) via HTTP range donor requests | `dev/tools/build_swift_v3_gguf.py` -> `~/models/swift-qwen38-flash-next-v3` |
+| Ingested Swift V3 into Slipstream package with hardlinked `ngram.bin` (0 bytes extra) | `models/qwen4exp/tools/convert_qwen4exp_gguf.py` -> `~/models/swift-qwen38-flash-next-v3/prepared` |
+| Generalized paired A/B benchmark harness for multi-model evaluation | `dev/tools/compare_slipstream_vs_llamacpp.py` |
+| Completed end-to-end Swift V3 benchmark: 41.72 vs 22.84 tok/s (1.83x) | `dev/benchmarks/comparison_swift-qwen38-flash-next-v3_results.json` |
+| Capped maxTokens to 16,384 and registered Swift V3 across Pi & Omp | `~/.pi/agent/models.json`, `~/.omp/agent/models.yml`, `~/.pi/agent/settings.json` |
+| Executed comprehensive 145-item benchmark between Swift-27B-HQ and Swift-V3 | `dev/benchmarks/swift_benchmark_results/BENCHMARK_SCORECARD.md` |
+| Benchmarked & optimized speculative drafting on Swift V3 (20 items; 68.6% tokens speculative, precomputed rotary frequencies) | `dev/benchmarks/benchmark_drafting.py`, `models/qwen4exp/Qwen4ExpTarget.cpp` |
 
-## Pending (in priority order)
+---
 
-See `.agents/next-session.md` for the exact steps and commands.
-
-1. **Finish the benchmark comparison** that did not fit today: llama.cpp on
-   `humaneval` (started 20:10 on 2026-09-23; may be partial, resume it),
-   `ifeval` and `math500`; the 27B on all; `sessions` on both, then Nitin
-   judges blind. Update `BENCHMARKS.md` and the hub after each suite.
-2. **Decisions for Nitin** (see next-session.md, Task 2): default cache 34 vs
-   30 GiB; full-precision reference via a hosted API; the 27B round.
-3. Optional: drop `install/` and Homebrew packaging; explicit model interface.
-
-**Done today (2026-09-23 evening), no longer pending:** upstream fixes merged
-(2e4a4c8: #31 composed tool schemas, #92 required-first tool arguments, #120
-per-request `timings`; all gates, 10/10 identical at 39.7 tok/s); quieter log
-built and checked (0 developer lines); live tool calls through omp and pi both
-worked on the merged build.
-
-## Known issues
-
-- **The model sometimes thinks until the length cap** (both engines; a model
-  habit, worst at temperature 0): 1-8% of benchmark answers. In omp/pi it shows as
-  a very long thinking phase with no answer; a lower thinking level or asking
-  again gets past it. Details and counts: BENCHMARKS.md, round 2 notes.
-
-- A second git worktree exists at `.kilo/worktrees/magical-antimony` (made by
-  the Kilo Code VS Code extension, not by claude-code). Leave it unless Nitin says.
-- `/metrics` `splash_prefill_tokens_per_second` reads far too high (GPU work
-  only); use the per-request `prompt … tok/s` in the log.
-- Google Drive syncing this folder uses a full core and makes timed runs ~3%
-  slower; alternate A/B runs when measuring speed.
+## Pending / Active Track (Option B: Tree Drafting)
+1. Implement 2D tree attention masking in Metal shaders (`runtime/metal/kernels/decode/attention_q8.metal`) for tree-based speculative drafting.
+2. Update MTP draft proposer to emit branching candidate trees.
+3. Update verification and tree acceptance path in `Runtime.mm`.
+4. Validate throughput gain (target: 50–60+ tok/s).

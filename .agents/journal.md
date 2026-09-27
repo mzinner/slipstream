@@ -1,5 +1,40 @@
 # Journal — qwen4exp port
 
+## 2026-09-26 20:00 PDT — antigravity
+
+Presented comprehensive findings and next steps to Nitin comparing `Swift-Qwen3.8-Flash-Next-V3` and `Swift-Qwen3.8-27B-Splash-HQ`. Nitin selected Option B (Tree Drafting with 2D Attention Masking to target 50–60+ tok/s). Added `*.dylib` to `.gitignore`. Committing all benchmarks, GGUF toolings, launcher CLI options, and drafting optimizations to `origin/main` (GitHub `npanj/slipstream`) before commencing tree drafting implementation.
+Blocked on: nothing.
+
+## 2026-09-26 16:30 PDT — antigravity
+
+Evaluated and optimized speculative drafting on `Swift-Qwen3.8-Flash-Next-V3` (Slipstream, port 8090). Benchmarked across 20 standardized items (GSM8K, HumanEval, GPQA, Systems Probes). Discovered speculative drafting delivers a **2.7x speedup** (driving decode from ~15 tok/s to ~42–44 tok/s), with **68.6% of all generated tokens originating from accepted draft guesses** (averaging 3.19 tokens/step) and 100% accuracy parity on math and coding (5/5 GSM8K, 5/5 HumanEval, 5/5 Systems). Precomputed rotary frequencies in `Qwen4ExpTarget.cpp` to eliminate 1,280 redundant CPU `std::pow` calls per token step, and fixed `Runtime.mm` step proposal accounting. Confirmed linear speculation ceiling (~3.2 tok/step); path to 50+ tok/s requires 2D tree attention masking in Metal.
+Blocked on: nothing.
+
+## 2026-09-26 11:27 PDT — antigravity
+
+Executed full automated head-to-head quality & speed benchmark (145 items across 6 domains: AIME 2025, MATH-500, GPQA Diamond, GSM8K, HumanEval, Hard Systems & Logic) between `Swift-Qwen3.8-Flash-Next-V3` (:8090) and `Swift-Qwen3.8-27B-Splash-HQ` (:8000) under sequential memory guard in 1h47m. Result: Flash-Next V3 achieved **70.3% (102/145)** vs 27B's **67.6% (98/145)** overall quality (+2.8% edge driven by GPQA Diamond 54.3% vs 45.7%), with exact tie on AIME 2025 (45.0%, solving the exact same 9/20 problems), GSM8K (96.0%), HumanEval (92.0%), and Hard Systems (100.0%). Decode throughput was virtually identical (43.9 vs 44.4 tok/s; 1.01x), while 27B exhibited 1.70x faster TTFT (659 ms vs 1119 ms). Daily V3 server safely restored on :8090.
+Blocked on: nothing.
+
+## 2026-09-26 09:22 PDT — antigravity
+
+Capped maxTokens to 16,384 across all local models in `~/.pi/agent/models.json` and `~/.omp/agent/models.yml`. Explicitly registered `local/swift-qwen38-flash-next-v3` in both agent catalogs. Updated `~/.pi/agent/settings.json` (`compaction.reserveTokens: 16384`, `enabledModels: ["flashnext/*", "slipstream/**"]`). Tested and verified end-to-end with `pi -p` on port 8090 (40.3 tok/s, 0 warnings).
+Blocked on: nothing.
+
+## 2026-09-25 21:20 PDT — antigravity
+
+Synthesized `Swift-Qwen3.8-Flash-Next-V3` GGUF (95.52 GiB across 3 shards in `~/models/swift-qwen38-flash-next-v3`) by extracting and splicing Swift's 686 high-precision donor resident tensors (Q8_0 output head, attention, hyper-connections, ssm_out, token_embd, shexp) over the base Q4_0 shards via HTTP range requests. Ingested Swift V3 directly into Slipstream format with APFS hardlinked `ngram.bin` (0 extra bytes) in 372.6s. Executed head-to-head A/B benchmark against llama.cpp: Slipstream reached **41.72 tok/s** average decode throughput vs llama.cpp's **22.84 tok/s** (**1.83x speedup**, +82.7% throughput, and 1.51x faster TTFT at 1,305 ms vs 1,973 ms) with 100% mathematical and reasoning quality parity.
+Blocked on: nothing.
+
+## 2026-09-25 16:15 PDT — antigravity
+
+Executed sequential, memory-guarded A/B benchmark comparing Slipstream-GGUF against llama.cpp on the V3 GGUF model (`~/models/qwen38-flash-next-v3`) across math reasoning, series derivation, constraint logic, and systems coding (`dev/tools/compare_slipstream_vs_llamacpp.py`). Slipstream achieved **40.76 tok/s** average decode throughput vs llama.cpp's **23.10 tok/s** (**1.76x speedup**, +76.5% throughput), while maintaining exact mathematical and logical quality equivalence (exact matches on $18 duck eggs, $\boxed{p-q}$ series derivation, and Alice-Charlie-Bob seating). TTFT averaged 1,283 ms on Slipstream vs 1,862 ms on llama.cpp. Memory cleanly reclaimed between runs.
+Blocked on: nothing.
+
+## 2026-09-25 15:35 PDT — antigravity
+
+Implemented native sharded GGUF loading and direct ingestion in `slipstream-gguf`. Built `dev/tools/sharded_gguf_reader.py` with native `libggml-base` SIMD dequantization and `models/qwen4exp/tools/convert_qwen4exp_gguf.py` converting all 48 layers + MTP sidecar in 285s. Discovered and resolved GGUF layout nuances: subtracted 1.0 from RMS norms (as Metal kernels add 1.0f internally), de-permuted GDN value heads (3, 16) -> (16, 3) across 7 tensors, and formatted router/shexp with `quantized_q8`. Validated generation with 40.1 tok/s decode across 10 prompts and verified `./splash serve --model ~/models/qwen38-flash-next-v3 --port 8090` HTTP completions.
+Blocked on: user confirmation to reclaim ~97 GB from old redundant package.
+
 ## 2026-09-24 12:35 PDT — antigravity
 
 Packaged Swift-Qwen3.8-27B for Splash custom Metal kernels. Downloaded MLX 4-bit checkpoint (15.8 GB), handled mixed 4/5-bit layers with dynamic MLX dequantization to affine 4-bit, and packed all 64 layers into Splash's tiled Metal format with exact 16 KiB alignment. Staging files pruned (26 GiB disk free). Registered as `local/Swift-Qwen3.8-27B` and added to `models.yaml`. Background llama.cpp benchmark remains undisturbed.

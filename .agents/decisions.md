@@ -266,3 +266,77 @@ Flash-Next speed claims, no whole-model runs on the rebased build.
   message-prefix reuse (agent turns), #44 false Metal command timeouts, #40
   UTF-8 JSON, #31 composed tool schemas, #120 per-request timings. Most kernel
   commits target Apple9 or dense Q4 (the 27B/35B), not our 8-bit/expert paths.
+
+## 2026-09-25 — GGUF Direct Ingestion & Layout Parity
+
+To serve Nitin's daily 3-shard model (`~/models/qwen38-flash-next-v3`, Q4_0/Q8_0) without requiring an intermediate 338 GB BF16 conversion:
+1. **Sharded GGUF Reader (`dev/tools/sharded_gguf_reader.py`)**:
+   - Discovers across multi-file shards (`-00001-of-00003.gguf`, etc.) and sidecars (`mtp-shared-Q4_K_M.gguf`).
+   - Uses `llama.cpp-prism/build/bin/libggml-base.0.21.0.dylib` for native SIMD dequantization of Q4_0, Q8_0, Q4_K, and Q6_K rows.
+2. **RMS Norm Offsets**:
+   - GGUF encodes `(1.0 + weight)` into hyper-connection norms, MTP enorm/hnorm, and indexer norms.
+   - Splash Metal kernels (`hyper_connection_normalize`, etc.) calculate `(1.0f + weight)` internally from zero-centered weights.
+   - We subtract `1.0f` from GGUF norm tensors during conversion to avoid doubling the effective normalization gains.
+3. **GDN Value-Head De-permutation**:
+   - In GGUF, 48 GDN heads are ordered `(3, 16)` across channels (3 groups of 16 heads).
+   - Splash kernels expect canonical 48 heads ordered sequentially.
+   - Reshaping `(3, 16, ...)` and transposing to `(16, 3, ...)` across `qkv` (v-part), `gate`, `beta`, `alpha`, `conv1d`, `ssm_a`, `ssm_dt`, and `ssm_out` achieves exact numerical agreement with reference logits.
+4. **Router & Shared Expert Quantization**:
+   - Router matmul tiles index weights by `[quant group][row]`.
+   - Applying `quantized_q8` with transposed code layouts matches Splash router kernels with 100% byte equality.
+5. **Zero Disk Duplication for N-gram**:
+   - APFS hardlinking `ngram.bin` (26.8 GB) reuses the physical disk blocks, enabling zero-byte duplication during GGUF conversion.
+
+## 2026-09-25 — Swift V3 GGUF Splicing & Dual-Engine Deployment
+
+To create a Swift version of Nitin's V3 model (`Swift-Qwen3.8-Flash-Next-V3`) deployable to both llama.cpp and Slipstream without downloading redundant 175 GB Q8_0 repositories:
+1. **HTTP Range Splicing Engine (`dev/tools/build_swift_v3_gguf.py`)**:
+   - Indexed all 686 high-precision resident donor tensors (~4.77 GiB) across shards 1, 3, 4, 5 of `ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF/Q8_0` using HTTP range requests via standard HuggingFace endpoints.
+   - Streamed the base Q4_0 shards (`ukisai/Swift-1.5-Qwen3.8-Flash-Next-GGUF/Q4_0`, ~93.7 GiB) sequentially.
+   - Spliced Swift's Q8_0 output head (0.65 GiB) and resident tensor groups (`attn`, `hc`, `token_embd`, `ssm_out`, `shexp`), while retaining Q4_0 for the 512 routed experts and PLE table.
+   - Produced 3 standard GGUF shards totalling 95.52 GiB (1,224 tensors) in `~/models/swift-qwen38-flash-next-v3`, bit-compatible with llama.cpp MTP streaming.
+2. **Dual-Engine Benchmark Parity**:
+   - Both Slipstream (`local/swift-qwen38-flash-next-v3`) and llama.cpp run the identical GGUF weights.
+   - Slipstream delivers **41.72 tok/s** vs llama.cpp's **22.84 tok/s** (1.83x speedup) with 1.51x faster TTFT (1,305 ms vs 1,973 ms) and 100% quality parity across all reasoning and coding domains.
+
+## 2026-09-26 — Max-Tokens Capped at 16,384 & Swift Thinking Calibration
+
+1. **Generation Cap Reduced to 16,384**:
+   - High-context sessions (~58k input tokens) combined with `xhigh` thinking level triggered repetitive thought loops that ran up to the 32,768 token ceiling (~10.5 minutes at 54 tok/s), exhausting the budget and returning an empty turn (`stopReason: length`) inside hidden `<thought>`.
+   - Capping `maxTokens: 16384` across `~/.pi/agent/models.json` (and `~/.omp/agent/models.yml`) halts runaway thought loops in under 5 minutes without starving legitimate code generation or reasoning turns.
+   - Aligned `compaction.reserveTokens: 16384` in `~/.pi/agent/settings.json`, buying an additional 16,384 tokens of prompt conversation history before auto-compaction triggers.
+2. **Swift Thinking Profile**:
+   - Swift 1.5 models are distilled specifically for concise internal chains of thought; forcing `xhigh` in deep contexts induces degenerate loop behaviour. Swift models should be invoked with `--thinking low` or `medium`.
+3. **Pi Catalog Multi-segment Globs**:
+   - In `~/.pi/agent/settings.json`, `enabledModels` requires `"slipstream/**"` (not `"slipstream/*"`) to match slash-nested model identifiers like `slipstream/local/swift-qwen38-flash-next-v3`.
+
+## 2026-09-26 — Head-to-Head Benchmark: Swift-27B-Splash-HQ vs Swift-Flash-Next-V3
+
+1. **Automated Memory-Guarded Swapping Pipeline (`run_full_comparison_orchestration.sh`)**:
+   - Implemented a fully automated sequential pipeline enforcing the strict single-large-model constraint on 64 GB unified memory.
+   - Runs Model 1 (`Swift-Qwen3.8-Flash-Next-V3` on `:8090`), shuts it down, confirms 0 listeners and RAM release, launches Model 2 (`Swift-Qwen3.8-27B-Splash-HQ` on `:8000`), runs identical items, shuts down Model 2, restores Model 1, and compiles the comparative report.
+2. **Benchmark Scope (145 Items across 6 Domains)**:
+   - Evaluated 20 AIME 2025 problems, 35 Level 4-5 MATH-500 problems, 35 GPQA Diamond science questions, 25 GSM8K word problems, 25 HumanEval coding challenges with test execution, and 5 hard systems/concurrency/architecture probes.
+3. **Empirical Quality Findings**:
+   - **Overall Accuracy**: Swift-Flash-Next-V3 leads slightly at **70.3% (102/145)** vs Swift-27B-Splash-HQ at **67.6% (98/145)**.
+   - **AIME 2025 Parity**: Exactly 45.0% (9/20) on both models, solving the identical 9 problems with 100% agreement.
+   - **Science Advantage**: Flash-Next-V3 outperformed 27B-Splash-HQ on GPQA Diamond (54.3% vs 45.7%, +8.6%), demonstrating stronger recall and domain reasoning in biology, chemistry, and physics.
+   - **Coding & Systems Equivalence**: Both models achieved 92.0% on HumanEval (23/25 unit tests passing) and 100% on hard systems tasks (Acquire-Release memory ordering, memory bandwidth decode bottleneck, and zero-copy Rust CSV parsing).
+4. **Speed & Latency Profile**:
+   - Steady-state decode throughput is indistinguishable: **43.9 tok/s** (Flash-Next) vs **44.4 tok/s** (27B-Splash) (1.01x).
+   - TTFT is 1.70x faster on 27B-Splash-HQ (**659 ms** vs **1,119 ms**) due to dense Q8 weights avoiding MoE prefill hyper-connection mixing and n-gram table gathers.
+
+## 2026-09-26 — Speculative Drafting Optimization & Linear Chain Ceiling
+
+1. **Empirical Impact of MTP Speculation**:
+   - Across 14,876 generated tokens on the 20-item balanced benchmark, **10,206 tokens (68.6%) were generated speculatively**, giving an average of **3.19 tokens per forward pass** of the 48 layers.
+   - Speculative drafting delivers a **2.7x speedup** over non-speculative decode (~42–44 tok/s vs ~15–16 tok/s).
+2. **Trigonometric Precomputation in Draft Head (`Qwen4ExpTarget.cpp`)**:
+   - `runMtpDraft` previously recomputed `std::pow` across all 32 rotary dimensions on every draft row, issuing 1,280 redundant double-precision math calls per token step on the CPU.
+   - Precomputing the 32 frequency coefficients in `rotaryFrequencies` eliminates transcendental math during drafting.
+3. **Draft Accounting Parity in `Runtime.mm`**:
+   - `Runtime.mm` line 1105 previously hardcoded `kDraftProposalTokens` (7), masking true draft acceptance. Updated to report `impl_.mtpProposed` when active.
+4. **Linear Speculation Bound**:
+   - Raising the chain confidence threshold (`SPLASH_MTP_CHAIN_MIN` 0.35 -> 0.42) reduced acceptance to 27.2% and throughput to 40.9 tok/s because the verifier's fixed cost is high; retaining guesses up to chain threshold 0.35 remains optimal for linear chains. Reaching 50+ tok/s strictly requires 2D tree attention masking in Metal.
+
+

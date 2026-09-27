@@ -233,6 +233,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/MemoryAudit.cpp \
 	runtime/engine/Status.cpp \
 	runtime/model/WeightStore.cpp \
+	runtime/model/ShardedGgufFile.cpp \
 	models/qwen4exp/Qwen4Exp.cpp \
 	runtime/model/QwenTarget.cpp \
 	models/qwen4exp/Qwen4ExpTarget.cpp \

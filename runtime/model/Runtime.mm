@@ -1096,13 +1096,14 @@ struct Runtime::Impl {
       entry.maskWords.clear();
       entry.verifyMaskInFlight = false;
       entry.decodeStage = DecodeStage::Regular;
+      const uint32_t stepDrafted = mtpProposing(entry) ? mtpProposed : kDraftProposalTokens;
       ModelStepResult &result = results[lane];
       result = {entry.id,
                 0,
                 std::move(output),
                 false,
                 DecodeStage::Regular,
-                kDraftProposalTokens,
+                stepDrafted,
                 std::min(laneResult.accepted, laneResult.retained - 1)};
       if (entry.generatedTokens < entry.maxNewTokens)
         emitTerminalAnchor(entry, result);
