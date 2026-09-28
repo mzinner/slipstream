@@ -169,7 +169,14 @@ QwenStateStorage &requireQwenStateStorage(StateStorage &storage) {
 template <class Activate>
 StateAdmission admitIdleSlot(const QwenStateStorage &states,
                              Activate activate) {
-  for (uint32_t slot = 0; slot < kLaneCount; ++slot) {
+  static const uint32_t maxSlots = [] {
+    const char *mc = std::getenv("SPLASH_MAX_CONCURRENCY");
+    if (mc && *mc) return std::max(1u, std::min<uint32_t>(kLaneCount, std::atoi(mc)));
+    const char *bw = std::getenv("SPLASH_MAX_BATCH_WIDTH");
+    if (bw && *bw) return std::max(1u, std::min<uint32_t>(kLaneCount, std::atoi(bw)));
+    return kLaneCount;
+  }();
+  for (uint32_t slot = 0; slot < maxSlots; ++slot) {
     if (states.metadata(slot).assigned)
       continue;
     const metal::AllocationResult admission = activate(slot);
@@ -213,6 +220,8 @@ struct Runtime::Impl {
     // The MTP head's input for the next decode cycle; see QwenMtpLane.
     QwenMtpLane mtp;
     ops::PromptLookup promptLookup;
+    std::vector<uint32_t> nextDraftMask;
+    bool inThinkingPhase = true;
   };
 
   struct DecodeLaneResult final {
@@ -872,6 +881,8 @@ struct Runtime::Impl {
       }
     }
     buffers.promptLookup = &laneEntry(entries, 0).promptLookup;
+    buffers.draftMask = laneEntry(entries, 0).nextDraftMask;
+    buffers.inThinkingPhase = laneEntry(entries, 0).inThinkingPhase;
     buffers.ple = {d(DecodeTensor::InputTokens), d(DecodeTensor::PleShifted),
                    d(DecodeTensor::PleEmbedding), d(DecodeTensor::PleKeys),
                    d(DecodeTensor::PleValues), d(DecodeTensor::PleGated),
@@ -1102,8 +1113,12 @@ struct Runtime::Impl {
       states.updateLengths(entry.slot, {nextLength});
       entry.generatedTokens += laneResult.retained;
       entry.pendingToken = laneResult.nextAnchor;
-      for (uint32_t tok : output)
+      for (uint32_t tok : output) {
         entry.promptLookup.appendToken(tok);
+        if (tok == 248069 || tok == 151668) {
+          entry.inThinkingPhase = false;
+        }
+      }
       // Next cycle the MTP head reads this step's retained rows, each with
       // the token that followed it; the last with the new anchor.
       entry.mtp.rows = laneResult.retained;
@@ -1112,6 +1127,8 @@ struct Runtime::Impl {
       for (uint32_t row = 0; row + 1 < laneResult.retained; ++row)
         entry.mtp.tokens[row] = output[row + 1];
       entry.mtp.tokens[laneResult.retained - 1] = laneResult.nextAnchor;
+
+      entry.nextDraftMask.clear();
       entry.maskWords.clear();
       entry.verifyMaskInFlight = false;
       entry.decodeStage = DecodeStage::Regular;
@@ -1213,25 +1230,10 @@ struct Runtime::Impl {
           }
         }
 
-        CommandGraph target;
-        const uint32_t width = static_cast<uint32_t>(lanes_.size());
-        impl_.encodeBatchVerifyInput(target, width);
-        impl_.encodeBatchEmbedding(target, DecodeTensor::InputTokens,
-                                   DecodeTensor::Hidden0, width);
-        impl_.encodeTargetVerifyBatchForward(
-            target, {entries.data(), lanes_.size()}, items_, stats_,
-            mtpProposes ? MtpPhase::AlreadyDrafted : MtpPhase::DraftAndVerify);
         mtpProposes_ = mtpProposes;
-        submit(target);
-        stage_ = Stage::TargetForward;
-      }
-
-      if (stage_ == Stage::TargetForward && command_.ready()) {
-        const CommandTiming forward = command_.wait();
-        addTiming(forward);
-        targetForwardGpuSeconds_ += forward.gpuSeconds;
         maskWaitStarted_ = std::chrono::steady_clock::now();
         stage_ = Stage::WaitingMask;
+        return requests;
       }
 
       if (stage_ == Stage::WaitingMask) {
@@ -1241,33 +1243,85 @@ struct Runtime::Impl {
                                       !lanes_[lane].request->maskWords.empty());
         }
         if (masksReady) {
-          maskWaitSeconds_ +=
-              std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                            *maskWaitStarted_)
-                  .count();
-          maskWaitStarted_.reset();
+          if (maskWaitStarted_) {
+            maskWaitSeconds_ +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                              *maskWaitStarted_)
+                    .count();
+            maskWaitStarted_.reset();
+          }
           std::array<Request *, kLaneCount> entries{};
-          std::array<uint32_t, kLaneCount> maximumRetained{};
+          const uint32_t maskWords = impl_.geometry.maskWords();
           for (uint32_t lane = 0; lane < lanes_.size(); ++lane) {
             DecodeLaneResult &laneResult = lanes_[lane];
             Request &entry = *laneResult.request;
             entries[lane] = &entry;
-            maximumRetained[lane] = laneResult.maximumRetained;
-            impl_.loadPolicyBuffers(
-                entry, lane,
-                abandoned_[lane] ? std::span<const uint32_t>{}
-                                 : std::span<const uint32_t>{entry.maskWords});
+            const uint32_t *proposed = contents<uint32_t>(
+                impl_.decodeArena->get(lane, DecodeTensor::ProposedTokens),
+                "constrained draft proposals");
+            uint32_t validDrafts = 0;
+            if (!abandoned_[lane] && !entry.maskWords.empty()) {
+              const uint32_t maxDraftsToCheck =
+                  mtpProposes_ ? impl_.mtpProposed : kDraftProposalTokens;
+              for (uint32_t k = 0; k < maxDraftsToCheck; ++k) {
+                const uint32_t tok = proposed[k];
+                const uint32_t maskRow = 1 + k;
+                if ((maskRow + 1) * maskWords > entry.maskWords.size())
+                  break;
+                const uint32_t wordIdx = maskRow * maskWords + (tok / 32);
+                const uint32_t bitIdx = tok % 32;
+                if ((entry.maskWords[wordIdx] & (1U << bitIdx)) == 0) {
+                  // Grammar rejects this draft token
+                  break;
+                }
+                validDrafts++;
+              }
+            }
+            if (mtpProposes_)
+              impl_.mtpProposed = validDrafts;
+            laneResult.maximumRetained =
+                std::min(laneResult.maximumRetained, 1 + validDrafts);
           }
 
-          CommandGraph commit;
-          impl_.encodeTargetVerifyBatchPolicy(commit,
-                                              {entries.data(), lanes_.size()});
-          impl_.encodeBatchAcceptance(commit, {entries.data(), lanes_.size()},
-                                      {maximumRetained.data(), lanes_.size()});
-          impl_.encodeBatchGdnCommit(commit, {entries.data(), lanes_.size()});
-          submit(commit);
-          stage_ = Stage::Commit;
+          CommandGraph target;
+          const uint32_t width = static_cast<uint32_t>(lanes_.size());
+          impl_.encodeBatchVerifyInput(target, width);
+          impl_.encodeBatchEmbedding(target, DecodeTensor::InputTokens,
+                                     DecodeTensor::Hidden0, width);
+          impl_.encodeTargetVerifyBatchForward(
+              target, {entries.data(), lanes_.size()}, items_, stats_,
+              mtpProposes_ ? MtpPhase::AlreadyDrafted : MtpPhase::DraftAndVerify);
+          submit(target);
+          stage_ = Stage::TargetForward;
         }
+      }
+
+      if (stage_ == Stage::TargetForward && command_.ready()) {
+        const CommandTiming forward = command_.wait();
+        addTiming(forward);
+        targetForwardGpuSeconds_ += forward.gpuSeconds;
+
+        std::array<Request *, kLaneCount> entries{};
+        std::array<uint32_t, kLaneCount> maximumRetained{};
+        for (uint32_t lane = 0; lane < lanes_.size(); ++lane) {
+          DecodeLaneResult &laneResult = lanes_[lane];
+          Request &entry = *laneResult.request;
+          entries[lane] = &entry;
+          maximumRetained[lane] = laneResult.maximumRetained;
+          impl_.loadPolicyBuffers(
+              entry, lane,
+              abandoned_[lane] ? std::span<const uint32_t>{}
+                               : std::span<const uint32_t>{entry.maskWords});
+        }
+
+        CommandGraph commit;
+        impl_.encodeTargetVerifyBatchPolicy(commit,
+                                            {entries.data(), lanes_.size()});
+        impl_.encodeBatchAcceptance(commit, {entries.data(), lanes_.size()},
+                                    {maximumRetained.data(), lanes_.size()});
+        impl_.encodeBatchGdnCommit(commit, {entries.data(), lanes_.size()});
+        submit(commit);
+        stage_ = Stage::Commit;
       }
       return requests;
     }

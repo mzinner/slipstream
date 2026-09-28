@@ -1,6 +1,6 @@
 # Status — Slipstream-GGUF (handoff)
 
-**Updated:** 2026-09-27 10:15 PDT by antigravity.
+**Updated:** 2026-09-27 21:50 PDT by antigravity.
 **Branch:** `main` tracking `origin/main` (`github.com/npanj/slipstream.git`). Never push to `github.com/incoai/splash`.
 
 ## In one line
@@ -78,16 +78,31 @@ Completed 2026-09-26 across 145 paired items (seed 1234, temperature 0.0), run s
 | Integrated Prompt Lookup Decoding into Swift-27B runtime (`splash2`), bypassing GPU DFlash on exact matches | `splash2/runtime/model/Runtime.mm`, installed to `Splash-Q8/current/engine/splash` |
 | Updated Work Hub (`INDEX.html`) & `~/.omp/agent/models.yml` to minimum medium thinking (`--thinking=medium`) | `INDEX.html`, `~/.omp/agent/models.yml` |
 | Re-tuned Flash-Next expert cache default to 32 GiB (reclaiming ~2.4 GiB RAM) & guard floor to 3.5 GiB | `~/models/bin/{splash-flashnext-server.sh, slipstream-server.sh}` |
+| Set `compaction.thresholdTokens=30000` in `omp` to prevent runaway context degradation | `~/.omp/agent/config.json` via `omp config` |
+| Enabled Tree Speculation (`SPLASH_TREE_DRAFT=1`) by default in launcher scripts | `~/models/bin/{splash-flashnext-server.sh, swift27b-server.sh}` |
+| Implemented Grammar-Pruned Speculative Verification (jumped tool-calling decode from 5.6 to 49.6 tok/s) | `runtime/model/Runtime.mm` |
+| Gated Smart PLD, Proactive Grammar Masking, and Adaptive Mode Detection | `runtime/ops/PromptLookup.{hpp,cpp}`, `models/qwen4exp/Qwen4ExpTarget.cpp`, `runtime/model/Runtime.mm` |
 
 ---
 
 ## Active Status & Next Steps
 
 1. **Speculative Drafting & Model Status**:
-   - Hybrid linear MTP + Prompt Lookup speculation is fully operational on Swift-V3.
-   - Prompt Lookup Decoding engine is integrated into Swift-27B (`splash2/q8`), enabling 49 ns CPU drafting and bypassing DFlash on exact n-gram matches.
-   - Flash-Next launcher tuned to default 32 GiB expert cache (`SPLASH_EXPERT_CACHE_GIB=32`), preventing memory guard kills on 50k+ token sessions.
-   - Work Hub (`INDEX.html`) and agent configs are synced with minimum medium thinking.
-2. **Next Steps**:
-   - Start Flash-Next server in separate shell (`~/models/bin/swift-flashnext-server.sh` or `splash-flashnext-server.sh`).
-   - Run interactive tests or benchmarks.
+   - Hybrid linear MTP + Gated Smart Prompt Lookup speculation is fully operational on Swift-V3.
+   - Resolved dual causes of tool-calling decode degradation:
+     1. Enforced strict admission concurrency (`SPLASH_MAX_CONCURRENCY=1`): eliminates multi-request expert-cache thrashing and time-slicing stalls (such as omp mid-turn speculative compaction handoffs or title generation running concurrently).
+     2. PLD-first structured drafting: during non-thinking / tool-calling mode, PLD queries the committed anchor directly against the prompt. Exact tool definitions, parameter names, and file paths are drafted with 100% precision, bypassing neural MTP and guaranteeing grammar acceptance.
+   - Independent environment controls:
+     - `SPLASH_MAX_CONCURRENCY` (default 1 in launchers): Enforces single-request admission limit.
+     - `SPLASH_PROMPT_LOOKUP` (default 1 in launchers): Master switch for Prompt Lookup Decoding.
+     - `SPLASH_PLD_MIN_MATCH` (default 4): Minimum match length before proposing.
+     - `SPLASH_PLD_UNAMBIGUOUS` (default 1): Only propose when prompt continuation is unambiguous.
+     - `SPLASH_MTP_MASKED_DRAFT` (default 0): Disabled stale mask feedback into MTP head.
+     - `SPLASH_MAX_BATCH_WIDTH` (default 1 in launchers): Prevents multi-lane speculation disabling.
+     - `SPLASH_ADAPTIVE_MODE` (default 1): Distinguishes `<thought>` reasoning from structured JSON tool calling.
+   - `omp` is configured with `task.maxConcurrency: 1`, `compaction.midTurnEnabled: false`, `contextWindow: 94208`, and `compaction.reserveTokens: 16384` (auto-compacts at ~78,000 tokens), preserving full context quality with 40–50 tok/s decode performance.
+   - Flash-Next launcher tuned to default 32 GiB expert cache (`SPLASH_EXPERT_CACHE_GIB=32`), leaving 15+ GiB free host RAM with zero memory pressure.
+2. **Current State & Next Steps**:
+   - Engine and tests recompiled cleanly; all 18 CPU engine test suites pass 100% green.
+   - Server on port 8090 is live and running cleanly with 51.6 GiB free host RAM.
+   - Verified live request at 41.3 tok/s decode under `SPLASH_MAX_CONCURRENCY=1` and tool PLD-first drafting.

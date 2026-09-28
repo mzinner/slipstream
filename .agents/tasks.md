@@ -60,6 +60,10 @@
 - [x] Full CPU test suite verification (`make test-engine-cpu` 18/18 targets PASS)
 - [x] Prompt Lookup Decoding engine integrated into Swift-27B (`splash2/runtime/model/Runtime.mm`, bypasses DFlash on n-gram match >= 2 tokens; installed to Splash-Q8 and pushed to `fork/q8`)
 - [x] Updated Work Hub (`~/Documents/shared-with-google-drive/INDEX.html`) and `~/.omp/agent/models.yml` to minimum medium thinking (`--thinking=medium`) for Swift-27B and Swift-V3
+- [x] Grammar-Pruned Speculative Verification in constrained decoding (`Runtime.mm`, 8.5x tool-calling speedup: 5.6 -> 49.6 tok/s)
+- [x] Gated Smart Prompt Lookup Decoding with match length gating & unambiguity validation (`SPLASH_PLD_MIN_MATCH`, `SPLASH_PLD_UNAMBIGUOUS`)
+- [x] Proactive Grammar-Masked Drafting (`SPLASH_MTP_MASKED_DRAFT`, filters MTP candidates with grammar mask)
+- [x] Adaptive Mode Detection (`SPLASH_ADAPTIVE_MODE`, separates `<thought>` from structured JSON tool calling)
 - [ ] Uneven cache slots per layer (~9% fewer misses in replay)
 - [ ] Draft head: process only live rows (~0.5 ms)
 - [x] Quality round: Swift-Qwen3.8-27B-Splash-HQ vs Swift-Qwen3.8-Flash-Next-V3 (145 items across 6 domains: AIME 2025, MATH-500, GPQA Diamond, GSM8K, HumanEval, Hard Systems & Logic; Flash-Next leads 70.3% vs 67.6% with identical ~44 tok/s throughput)
@@ -112,5 +116,8 @@
 - [x] Fast ingestion of Swift V3 into Slipstream package (`~/models/swift-qwen38-flash-next-v3/prepared`, 372.6s, hardlinked `ngram.bin`)
 - [x] Paired A/B benchmark on Swift V3 GGUF (Slipstream vs llama.cpp): 41.72 vs 22.84 tok/s (1.83x speedup, 1.51x faster TTFT, 100% quality parity)
 - [x] Set maxTokens cap to 16,384 across Pi and Omp configurations and registered `local/swift-qwen38-flash-next-v3`
+- [x] Speculation stall resolution: eliminated stale mask feedback loop in Runtime.mm (SPLASH_MTP_MASKED_DRAFT=0), added SPLASH_MAX_BATCH_WIDTH=1 to Scheduler.cpp, and tuned omp maxConcurrency: 1 with 94k contextWindow
+- [x] Fixed tool-calling decode collapse: enforced strict admission concurrency (`SPLASH_MAX_CONCURRENCY=1` in `Runtime.mm`), refactored `Qwen4ExpTarget.cpp` to run PLD-first during structured tool calling, enabled `SPLASH_PROMPT_LOOKUP=1` in launcher, and disabled `midTurnEnabled` in `omp`.
+
 
 

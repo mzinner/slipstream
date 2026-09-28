@@ -2540,11 +2540,25 @@ void Qwen4ExpTarget::addVerify(
       const auto *pickMass = static_cast<const float *>(weights.mtpPickMass.contents());
       std::array<uint32_t, 16> ids{};
       std::array<float, 16> values{};
+      static const bool mtpMaskedDraft = [] {
+        const char *v = std::getenv("SPLASH_MTP_MASKED_DRAFT");
+        return v ? (std::atoi(v) != 0) : false;
+      }();
+      const bool hasDraftMask = mtpMaskedDraft && !buffers.draftMask.empty() && (live == 1);
       uint32_t filled = 0;
       for (uint32_t c = 0; c < kSlices * kCandidates; ++c) {
         const uint32_t id = pickIds[c];
         const float value = pickValues[c];
         if (id == UINT32_MAX) continue;
+        if (hasDraftMask) {
+          const uint32_t realId = subset ? weights.draftVocabIds[id] : id;
+          const uint32_t wordIdx = realId / 32;
+          const uint32_t bitIdx = realId % 32;
+          if (wordIdx < buffers.draftMask.size() &&
+              (buffers.draftMask[wordIdx] & (1U << bitIdx)) == 0) {
+            continue;
+          }
+        }
         auto before = [&](uint32_t at) {
           return values[at] > value || (values[at] == value && ids[at] < id);
         };
@@ -2554,6 +2568,22 @@ void Qwen4ExpTarget::addVerify(
           ids[at] = ids[at - 1]; values[at] = values[at - 1]; --at;
         }
         ids[at] = id; values[at] = value;
+      }
+      if (filled == 0 && hasDraftMask) {
+        for (uint32_t c = 0; c < kSlices * kCandidates; ++c) {
+          const uint32_t id = pickIds[c];
+          const float value = pickValues[c];
+          if (id == UINT32_MAX) continue;
+          auto before = [&](uint32_t at) {
+            return values[at] > value || (values[at] == value && ids[at] < id);
+          };
+          if (filled == width16 && before(width16 - 1)) continue;
+          uint32_t at = filled < width16 ? filled++ : width16 - 1;
+          while (at > 0 && !before(at - 1)) {
+            ids[at] = ids[at - 1]; values[at] = values[at - 1]; --at;
+          }
+          ids[at] = id; values[at] = value;
+        }
       }
       if (subset)
         for (uint32_t i = 0; i < filled; ++i) ids[i] = weights.draftVocabIds[ids[i]];
@@ -2792,36 +2822,54 @@ void Qwen4ExpTarget::addVerify(
     buffers.liveRowsPerLane = 1 + *buffers.mtpProposedOut;
     setLiveRows();
   } else if (buffers.mtpEnabled && weights.mtpLayer && lanes == 1 && buffers.mtp[0].rows) {
-    const auto mtpStart = std::chrono::steady_clock::now();
-    auto drafts = runMtpDraft();
-    mtpMs = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - mtpStart).count();
     static const bool pldEnabled = [] {
       const char *v = std::getenv("SPLASH_PROMPT_LOOKUP");
       return v != nullptr && std::atoi(v) != 0;
     }();
-    if (pldEnabled && buffers.promptLookup && drafted < maxDrafts && buffers.mtp[0].rows) {
-      const uint32_t anchor = buffers.mtp[0].tokens[buffers.mtp[0].rows - 1];
-      std::vector<uint32_t> queryTokens;
-      queryTokens.reserve(1 + drafted);
-      queryTokens.push_back(anchor);
-      for (uint32_t k = 0; k < drafted; ++k) {
-        queryTokens.push_back(drafts[k]);
-      }
+    static const uint32_t pldMinMatch = [] {
+      const char *v = std::getenv("SPLASH_PLD_MIN_MATCH");
+      return v ? static_cast<uint32_t>(std::atoi(v)) : 4u;
+    }();
+    static const bool pldUnambiguous = [] {
+      const char *v = std::getenv("SPLASH_PLD_UNAMBIGUOUS");
+      return v ? (std::atoi(v) != 0) : true;
+    }();
+    static const uint32_t pldMaxDrafts = [] {
+      const char *v = std::getenv("SPLASH_PLD_MAX_DRAFTS");
+      return v ? static_cast<uint32_t>(std::atoi(v)) : 4u;
+    }();
+    static const bool adaptiveMode = [] {
+      const char *v = std::getenv("SPLASH_ADAPTIVE_MODE");
+      return v ? (std::atoi(v) != 0) : true;
+    }();
+    const bool skipPld = adaptiveMode && buffers.inThinkingPhase;
+    std::array<uint32_t, 7> drafts{};
+    const uint32_t anchor = buffers.mtp[0].tokens[buffers.mtp[0].rows - 1];
+
+    if (pldEnabled && !skipPld && buffers.promptLookup) {
+      std::array<uint32_t, 1> queryTokens{anchor};
       std::array<uint32_t, ExecutionLimits::draftProposalTokens> pldDrafts{};
-      const uint32_t needed = maxDrafts - drafted;
-      const uint32_t pldFound = buffers.promptLookup->propose(queryTokens, pldDrafts, needed);
-      for (uint32_t j = 0; j < pldFound; ++j) {
-        const uint32_t idx = drafted + j;
-        drafts[idx] = pldDrafts[j];
-        draftCandidates[idx][0] = pldDrafts[j];
-        draftProbabilities[idx][0] = 1.0f;
-        for (uint32_t c = 1; c < 16; ++c) {
-          draftCandidates[idx][c] = UINT32_MAX;
-          draftProbabilities[idx][c] = 0.0f;
+      const uint32_t needed = std::min(maxDrafts, pldMaxDrafts);
+      const uint32_t pldFound = buffers.promptLookup->propose(queryTokens, pldDrafts, needed, pldMinMatch, pldUnambiguous);
+      if (pldFound > 0) {
+        for (uint32_t j = 0; j < pldFound; ++j) {
+          drafts[j] = pldDrafts[j];
+          draftCandidates[j][0] = pldDrafts[j];
+          draftProbabilities[j][0] = 1.0f;
+          for (uint32_t c = 1; c < 16; ++c) {
+            draftCandidates[j][c] = UINT32_MAX;
+            draftProbabilities[j][c] = 0.0f;
+          }
         }
+        drafted = pldFound;
       }
-      drafted += pldFound;
+    }
+
+    if (drafted == 0) {
+      const auto mtpStart = std::chrono::steady_clock::now();
+      drafts = runMtpDraft();
+      mtpMs = std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - mtpStart).count();
     }
     if (!buffers.mtpShadow) {
       buffers.liveRowsPerLane = 1 + drafted;
@@ -2849,7 +2897,6 @@ void Qwen4ExpTarget::addVerify(
     static std::array<uint64_t, 3> hits{}, total{};
     const QwenMtpLane &mtp = buffers.mtp[0];
     const uint64_t anchorPosition = mtp.firstPosition + mtp.rows;
-    const uint32_t anchor = mtp.tokens[mtp.rows - 1];
     if (auto found = guesses.find(anchorPosition); found != guesses.end()) {
       for (uint32_t k = 0; k < 3; ++k)
         if (found->second[k] != UINT32_MAX) {

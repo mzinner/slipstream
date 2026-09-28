@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace splash::engine {
@@ -286,10 +287,20 @@ std::optional<BatchPlan> Scheduler::nextDecode() const {
   plan.decodeStage = decodeStage;
   // Applying the initial mask can terminate a request or start drafting.
   // Classify that branch one request at a time; regular decode can batch.
+  static const uint32_t configuredMaxWidth = [] {
+    const char *v = std::getenv("SPLASH_MAX_BATCH_WIDTH");
+    if (v) {
+      uint32_t val = static_cast<uint32_t>(std::atoi(v));
+      if (val >= 1 && val <= model::ExecutionLimits::maximumBatchWidth) {
+        return val;
+      }
+    }
+    return model::ExecutionLimits::maximumBatchWidth;
+  }();
   const uint32_t maximumWidth =
       decodeStage == DecodeStage::ApplyInitialMask
           ? 1
-          : model::ExecutionLimits::maximumBatchWidth;
+          : configuredMaxWidth;
   for (const Request *request : ready) {
     if (request->spec.priority != selectedPriority ||
         request->spec.cohort != cohort ||

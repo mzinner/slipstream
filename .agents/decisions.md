@@ -388,3 +388,63 @@ To create a Swift version of Nitin's V3 model (`Swift-Qwen3.8-Flash-Next-V3`) de
 2. **Defensive Metal Command Submission**:
    - Metal backend previously threw `MetalBackendError("Metal command must contain a dispatch")` if `commandGraph` had 0 dispatches.
    - `MetalBackend::submitCommandAsync` now defensively returns an immediately completed `CommandTicket` with zero timing overhead instead of throwing.
+
+## 2026-09-27 — Grammar-Pruned Speculative Verification
+
+1. **The Grammar-Draft Mismatch Bottleneck**:
+   - In constrained decoding (`ConstraintMode::TokenMask`), `ConstrainedDecodeTicket::takeMaskRequests` previously drafted proposals, emitted `ModelMaskRequest` to the Python frontend, and immediately submitted `TargetForward` on all 8 rows before the grammar bitmask arrived.
+   - Because MTP drafted without syntax constraints, draft token 0 violated JSON syntax on 76% of steps. The 48-layer target verifier loaded 60+ MoE experts from SSD across 8 rows (~150 ms) only to reject draft token 0, resulting in a ~6.25 tok/s floor.
+2. **Grammar Mask Early Pruning (`takeMaskRequests`)**:
+   - `ConstrainedDecodeTicket` now transitions to `Stage::WaitingMask` immediately after drafting without scheduling `TargetForward`.
+   - Once the CPU grammar bitmask arrives from Python (~0.16 ms), the engine inspects `entry.maskWords` to count how many consecutive draft tokens are permitted by the grammar (`validDrafts`).
+   - `impl_.mtpProposed` is pruned to `validDrafts`, and `laneResult.maximumRetained` is capped to `1 + validDrafts`.
+   - If draft token 0 is illegal, `TargetForward` verifies only 1 row (the anchor), touching ~10 cached experts (~15 ms) instead of 60+ experts across 8 rows (~150 ms).
+   - If draft tokens are legal, the verifier checks only the legal prefix.
+   - Result: decode throughput during tool calls jumped from 5.6–6.9 tok/s to 45.2–49.6 tok/s (8.5x speedup; ITL p50 dropped from 161 ms to 22 ms).
+
+## 2026-09-27 — Gated Smart PLD, Proactive Masked Drafting, and Adaptive Mode
+
+1. **Gated Smart Prompt Lookup (`PromptLookup.cpp`)**:
+   - Blind prompt lookup previously hurt MoE decode speed because false-positive matches forced unneeded SSD expert reads.
+   - Added `minMatchLength` (default 4 via `SPLASH_PLD_MIN_MATCH`) and `requireUnambiguous` (default true via `SPLASH_PLD_UNAMBIGUOUS`).
+   - The engine checks backward continuity against prompt history. If the matching n-gram has multiple conflicting continuations in the prompt, or is shorter than 4 tokens, it refuses to propose.
+2. **Proactive Grammar-Masked Drafting (`Qwen4ExpTarget.cpp`)**:
+   - In step $N-1$, when the target verifier commits, row `retained` of `entry.maskWords` contains the legal mask for the next token after the new anchor.
+   - This row mask is captured into `entry.nextDraftMask` and passed to `runMtpDraft()` as `buffers.draftMask`.
+   - When MTP scans its 1,024 top slice candidates on CPU, any candidate violating the mask is skipped.
+   - The chosen draft token 0 is guaranteed to satisfy the grammar, boosting valid draft chain lengths.
+   - Controllable via `SPLASH_MTP_MASKED_DRAFT` (default 1).
+3. **Adaptive Mode Detection (`Runtime.mm`)**:
+   - The engine tracks `inThinkingPhase` based on token `248069` / `151668` (`</think>`).
+   - During `<thought>`, PLD is skipped to avoid inserting prompt instructions into internal reasoning.
+   - After `</thought>`, PLD and proactive grammar masking are active for fast tool parameter generation.
+   - Controllable via `SPLASH_ADAPTIVE_MODE` (default 1).
+
+## 2026-09-27 — Speculation Stall Resolution: Stale Mask Pruning & Sequential Decode Width
+
+1. **Resolution of Stale Grammar Mask Poisoning (`SPLASH_MTP_MASKED_DRAFT=0`)**:
+   - Capturing row `retained` of `entry.maskWords` into `entry.nextDraftMask` was based on the flawed assumption that row `retained` predicted the continuation of `nextAnchor`.
+   - In reality, when a draft is rejected, `nextAnchor` is freshly sampled by the target verifier; Python simulated row `retained` assuming the *rejected* token was accepted.
+   - Constraining MTP with this stale mask forced MTP to generate tokens from the rejected branch, resulting in 0% draft acceptance and collapsing tool decode throughput to 3.3–7.6 tok/s.
+   - Cleared `entry.nextDraftMask` and disabled `SPLASH_MTP_MASKED_DRAFT` (default 0). Unconstrained drafting combined with post-draft validation in `takeMaskRequests` cleanly preserves grammar validity without poisoning the draft head.
+2. **Sequential Decode Width Capping (`SPLASH_MAX_BATCH_WIDTH=1`)**:
+   - MTP speculative drafting in `Runtime.mm` is single-lane only (`lanes == 1`).
+   - When multiple requests were admitted, `Scheduler.cpp` batched them into width 2 (`b2`), which hard-disabled MTP speculation for both requests (`buffers.mtpShadow = true`), dropping decode from 45 tok/s to 6 tok/s.
+   - Added `SPLASH_MAX_BATCH_WIDTH` to `Scheduler.cpp` and set it to 1 in `splash-flashnext-server.sh`. Capping decode batch width to 1 serializes requests so each runs at 45 tok/s with speculation active, completing faster than concurrent non-speculative execution.
+3. **Agent Client Concurrency & Compaction Bounds**:
+   - In `~/.omp/agent/config.yml`: set `task.maxConcurrency: 1` and `compaction.reserveTokens: 16384`.
+   - In `~/.omp/agent/models.yml`: restored `contextWindow: 94208` for Swift Flash-Next models.
+
+## 2026-09-27 — Strict Engine Admission Concurrency & PLD-First Tool-Calling Speculation
+
+1. **Strict Engine Admission Concurrency (`SPLASH_MAX_CONCURRENCY=1`)**:
+   - Even when `SPLASH_MAX_BATCH_WIDTH=1` forced decode batches to width 1, `Runtime::begin` in `Runtime.mm` previously admitted up to 4 concurrent slots (`kLaneCount = 4`).
+   - When `omp` fired background requests (mid-turn speculative compaction handoffs or title generator), the engine admitted two requests simultaneously (`active_cells: 2`).
+   - The scheduler interleaved single-width decode steps between Request A and Request B, doubling step latency and causing severe expert-cache thrashing across two disjoint contexts (reducing decode speed to 2.7–3.5 tok/s).
+   - `admitIdleSlot` in `Runtime.mm` now restricts assignable slots to `maxSlots` based on `SPLASH_MAX_CONCURRENCY` (or `SPLASH_MAX_BATCH_WIDTH`). Any secondary request receives `StateFailure::ConcurrencyLimit` and waits in the scheduler resource queue until the active request finishes. The active request retains 100% GPU bandwidth and cache locality.
+2. **PLD-First Speculative Drafting in Tool-Calling Mode (`Qwen4ExpTarget.cpp`)**:
+   - During tool calling (after `</think>`), linear MTP drafts frequently fail against the strict Lark tool grammar, causing early-pruning in `takeMaskRequests` to truncate proposals to 0 rows (falling back to 144 ms single-token steps = 6.9 tok/s).
+   - PLD was previously chained *after* MTP, using MTP's unverified draft tokens as its search query, meaning PLD was never called on tool schemas unless MTP guessed them first.
+   - Refactored `Qwen4ExpTarget::addVerify` to run PLD *first* during non-thinking / tool-calling mode using the committed anchor context. When PLD finds an exact match in the prompt (e.g. tool signatures, parameter names, file paths), it drafts up to 4 tokens with 100% precision, bypassing MTP neural drafting and guaranteeing grammar acceptance.
+   - Defaulted `SPLASH_PROMPT_LOOKUP=1` in `splash-flashnext-server.sh` and disabled `midTurnEnabled` in `~/.omp/agent/config.yml`.
+

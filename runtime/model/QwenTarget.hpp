@@ -306,6 +306,8 @@ struct QwenTargetVerifyBuffers final {
   uint32_t kvPageCount = 0;
   std::array<QwenMtpLane, ExecutionLimits::maximumBatchWidth> mtp{};
   const ops::PromptLookup *promptLookup = nullptr;
+  std::span<const uint32_t> draftMask;
+  bool inThinkingPhase = false;
   metal::MetalBuffer proposedTokens;
   // Out: proposals the MTP head actually made for lane 0 (it stops when
   // unsure), so the runtime can cap the rows the verifier keeps.

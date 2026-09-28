@@ -36,7 +36,9 @@ public:
   /// Returns 0 if no matching n-gram is found or if the match has no follow-on tokens.
   [[nodiscard]] uint32_t propose(std::span<const uint32_t> recentTokens,
                                 std::span<uint32_t> outDrafts,
-                                uint32_t maxDrafts) const;
+                                uint32_t maxDrafts,
+                                uint32_t minMatchLength = 3,
+                                bool requireUnambiguous = false) const;
 
   /// Clears the index and token history.
   void clear() noexcept;

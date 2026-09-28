@@ -50,7 +50,9 @@ void PromptLookup::appendToken(uint32_t token) {
 
 uint32_t PromptLookup::propose(std::span<const uint32_t> recentTokens,
                                std::span<uint32_t> outDrafts,
-                               uint32_t maxDrafts) const {
+                               uint32_t maxDrafts,
+                               uint32_t minMatchLength,
+                               bool requireUnambiguous) const {
   if (tokens_.size() < 3 || head_.empty() || maxDrafts == 0 || outDrafts.empty()) {
     return 0;
   }
@@ -85,6 +87,8 @@ uint32_t PromptLookup::propose(std::span<const uint32_t> recentTokens,
   uint32_t bestMatch = UINT32_MAX;
   uint32_t bestMatchLen = 0;
   uint32_t scanned = 0;
+  uint32_t firstFollowOn = UINT32_MAX;
+  bool isAmbiguous = false;
 
   // Search in reverse chronological order
   while (curr != UINT32_MAX && scanned < kMaxScanDepth) {
@@ -100,11 +104,29 @@ uint32_t PromptLookup::propose(std::span<const uint32_t> recentTokens,
           ++matchLen;
         }
 
-        if (matchLen > bestMatchLen) {
-          bestMatchLen = matchLen;
-          bestMatch = curr;
-          if (matchLen >= 6) {
-            break;
+        const size_t tailPos = tokens_.size() - 1;
+        while (curr >= matchLen && tailPos >= matchLen &&
+               tokens_[curr - matchLen] == tokens_[tailPos - matchLen]) {
+          ++matchLen;
+        }
+
+        if (matchLen >= minMatchLength) {
+          const uint32_t followOn = tokens_[curr + 1];
+          if (requireUnambiguous) {
+            if (firstFollowOn == UINT32_MAX) {
+              firstFollowOn = followOn;
+            } else if (firstFollowOn != followOn && matchLen == bestMatchLen) {
+              isAmbiguous = true;
+            }
+          }
+          if (matchLen > bestMatchLen) {
+            bestMatchLen = matchLen;
+            bestMatch = curr;
+            firstFollowOn = followOn;
+            isAmbiguous = false;
+            if (matchLen >= 8) {
+              break;
+            }
           }
         }
       }
@@ -112,7 +134,7 @@ uint32_t PromptLookup::propose(std::span<const uint32_t> recentTokens,
     curr = next_[curr];
   }
 
-  if (bestMatch == UINT32_MAX)
+  if (bestMatch == UINT32_MAX || (requireUnambiguous && isAmbiguous))
     return 0;
 
   const uint32_t available = static_cast<uint32_t>(tokens_.size() - 1 - bestMatch);

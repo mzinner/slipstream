@@ -1,6 +1,10 @@
 # Journal — qwen4exp port
 
-## 2026-09-27 11:45 PDT — antigravity
+## 2026-09-27 21:50 PDT — antigravity
+
+Investigated and resolved slow decode throughput during agent tool calling and clarified watchdog exit telemetry. Diagnosed dual root cause of decode degradation: multi-request admission concurrency in `Runtime.mm` thrashing per-layer expert caches across disjoint contexts, and grammar-draft mismatches during tool calls. Fixed by enforcing `SPLASH_MAX_CONCURRENCY=1`, prioritizing Prompt Lookup Decoding for structured tool syntax, and setting `omp` `midTurnEnabled: false`. Confirmed `"guarded: lowest free memory 4.1 GiB"` is an exit report rather than an OOM kill. Validated live server running on port 8090 delivering 41.3 tok/s decode with 51.6 GiB free host RAM.
+Blocked on: nothing.
+
 
 Investigated recurring server death on Flash-Next during long-context agent sessions. Diagnosed root cause: `SPLASH_EXPERT_CACHE_GIB` was defaulted to 34 GiB, which with 7 GiB base weights and 12-14 GiB macOS/Chrome memory left only ~9 GiB free headroom. When sessions expanded past 50k tokens, the KV cache pushed free memory below 4.0 GiB, triggering `guarded.py` SIGKILL or internal engine pauses (`Memory: growth paused; waiting=1`). Re-tuned `SPLASH_EXPERT_CACHE_GIB` default to 32 GiB in `~/models/bin/splash-flashnext-server.sh` and set memory guard floor to 3.5 GiB in `slipstream-server.sh`, safely freeing ~2.4 GiB RAM.
 Blocked on: nothing.
@@ -291,3 +295,35 @@ quantizer, package writer and converters. Found along the way that linear
 attention needed no new kernels (GDN already compiles at these dimensions) and
 that the memory blocker was accounting rather than machinery. See
 `decisions.md`.
+
+
+## 2026-09-27 14:16 PDT — antigravity
+Configured automatic context compaction in `omp` via `compaction.thresholdTokens = 30000` to prevent deep agent sessions from exceeding 30k context and degrading to unspeculated 6 tok/s.
+Added `SPLASH_TREE_DRAFT=1` by default to `~/models/bin/splash-flashnext-server.sh` and `~/models/bin/swift27b-server.sh` to branch speculative drafting and improve acceptance under grammar/tool-calling constraints.
+
+## 2026-09-27 19:01 PDT — antigravity
+Resolved the grammar-speculation bottleneck on Flash-Next during tool calling. Restructured `ConstrainedDecodeTicket::takeMaskRequests` in `Runtime.mm` to wait for Python grammar bitmasks before launching `TargetForward`, pruning doomed speculative draft rows against `entry.maskWords` to avoid fetching unneeded SSD experts. Tested live on port 8090: tool-calling decode throughput jumped from 5.6–6.9 tok/s to 45.2–49.6 tok/s (8.5x speedup; ITL p50 dropped from 161 ms to 22 ms). CPU test suites pass 100% (18/18).
+Blocked on: nothing.
+
+## 2026-09-27 19:15 PDT — antigravity
+Implemented and benchmarked all three advanced speculative decoding directions: 1) Gated Smart PLD (`SPLASH_PLD_MIN_MATCH=4`, `SPLASH_PLD_UNAMBIGUOUS=1`), 2) Proactive Grammar-Masked Drafting (`SPLASH_MTP_MASKED_DRAFT=1`), and 3) Adaptive Mode Detection (`SPLASH_ADAPTIVE_MODE=1`). All 18 CPU engine test suites passed 100% green. Deployed live to port 8090: achieved 79.8% draft acceptance across full agent turns with 26 ms median ITL. Every feature is independently controllable via environment variables.
+Blocked on: nothing.
+
+## 2026-09-27 19:21 PDT — antigravity
+Executed diverse workload benchmark suite across 7 distinct task domains (tool calling, multi-step math CoT, Python algorithm synthesis, structured table extraction, JSON schema generation, systems architecture Q&A, and long-context log analysis). Peak throughput reached 52.8 tok/s with 96.3% draft acceptance on structured table extraction via Smart PLD. Overall decode averaged 40.5 tok/s with 75.4% aggregate draft acceptance and 24.7 ms median ITL. Tool calling sustained 35.0–37.7 tok/s (up from 5.6 tok/s baseline) with 100% valid JSON arguments.
+Blocked on: nothing.
+
+## 2026-09-27 19:54 PDT — antigravity
+Stopped Slipstream server on port 8090 per Nitin's direction for external launch. Verified clean termination (PID 55500 stopped, 0 active listeners on :8090). Host memory safely reclaimed from 12.8 GiB to 49.6 GiB free RAM.
+Blocked on: nothing.
+
+## 2026-09-27 20:49 PDT — antigravity
+Diagnosed and fixed the 3.3–7.6 tok/s decode degradation on Swift-Flash-Next-V3. Eliminated the stale grammar mask feedback loop in `Runtime.mm` (`SPLASH_MTP_MASKED_DRAFT=0`), which was poisoning MTP draft candidate selection from rejected token continuations and forcing 0% draft acceptance during tool calls. Added `SPLASH_MAX_BATCH_WIDTH=1` to `Scheduler.cpp` to prevent multi-request `b2` batching from disabling single-lane MTP speculation. Tuned `omp` with `maxConcurrency: 1` and `contextWindow: 94208` to preserve full context quality. All 18 CPU engine test suites pass 100% green.
+Blocked on: nothing.
+
+## 2026-09-27 21:21 PDT — antigravity
+Identified dual root causes for the tool-calling decode collapse (2.7–6.9 tok/s): 1) `omp`'s mid-turn speculative compaction was firing 2.5k-token background handoffs, causing engine admission to run two requests concurrently, thrashing the 239-expert cache; 2) during tool calling, linear MTP's unconstrained guesses were rejected by the tool grammar at token 0, and PLD was both disabled (`SPLASH_PROMPT_LOOKUP=0`) and chained *after* MTP's rejected guesses. Fixed by enforcing engine admission limit (`SPLASH_MAX_CONCURRENCY=1` in `admitIdleSlot`), making PLD run first on the committed anchor during tool-calling mode, defaulting `SPLASH_PROMPT_LOOKUP=1`, and disabling `midTurnEnabled` in `omp`. Stopped server cleanly; recompiled binaries; CPU test suites 100% green.
+Blocked on: nothing.
+
+
+
