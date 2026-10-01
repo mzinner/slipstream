@@ -363,5 +363,11 @@ Blocked on: nothing.
 Prepared Reddit launch post for Slipstream follow-up to r/LocalLLaMA and r/Qwen_AI posts. Renamed older `../slipstream` directory to `slipstream-orig` and symlinked `../slipstream -> slipstream-v2` so public and local workflows alias cleanly to Slipstream. Extracted 3,086 empirical telemetry points demonstrating flat decode speeds (33–44 tok/s) up to 130k context on M5 Pro 64GB; generated high-res visual chart at `docs/context_scaling_and_benchmark.png`. Assembled head-to-head comparison tables against llama.cpp fork (1.76x speedup) and evaluated Swift KV-sparsity gains (+8.6% on GPQA Diamond, 70.3% overall on 145 items).
 Blocked on: nothing.
 
+## 2026-09-30 21:51 PDT — antigravity
+Identified that `nitinpanj/qwen38-flash-next-v3` has 33,959 downloads and holds the byte-identical 3-shard GGUF weights (matching SHA256) as `Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF`. Updated `README.md`, Desktop pack, and Reddit post draft to point directly to `nitinpanj/qwen38-flash-next-v3` for base model downloads and `nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF` for the new Swift KV-sparse model. Pushed to `origin main`.
+Blocked on: nothing.
+
+
+
 
 
