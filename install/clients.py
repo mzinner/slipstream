@@ -117,7 +117,12 @@ def command(
         raise ClientError("The server did not report a valid context limit")
     environment = dict(os.environ if environment is None else environment)
     endpoint = base_url.rstrip("/") + "/v1"
-    api_key = environment.get("SPLASH_API_KEY") or "local"
+    api_key = (
+        environment.get("SLIPSTREAM_V2_API_KEY")
+        or environment.get("SLIPSTREAM_API_KEY")
+        or environment.get("SPLASH_API_KEY")
+        or "local"
+    )
 
     if name == "claude":
         environment.update(
@@ -157,24 +162,24 @@ def command(
         output = _output_budget(context)
         try:
             config = json.loads(environment.get("OPENCODE_CONFIG_CONTENT", "{}"))
-            config.update(model=f"splash/{model}", small_model=f"splash/{model}")
+            config.update(model=f"slipstream-v2/{model}", small_model=f"slipstream-v2/{model}")
             # A user's global config may pin a model per agent, and an
             # agent-level model outranks the top-level one; point the built-in
             # agents at the served model too, leaving their other settings.
             for agent in ("build", "plan", "general", "explore", "title", "compaction"):
                 config.setdefault("agent", {}).setdefault(agent, {})["model"] = (
-                    f"splash/{model}"
+                    f"slipstream-v2/{model}"
                 )
             variants = (
                 config.get("provider", {})
-                .get("splash", {})
+                .get("slipstream-v2", {})
                 .get("models", {})
                 .get(model, {})
                 .get("variants", {})
             )
-            config.setdefault("provider", {})["splash"] = {
+            config.setdefault("provider", {})["slipstream-v2"] = {
                 "npm": "@ai-sdk/openai-compatible",
-                "name": "Splash",
+                "name": "Slipstream v2",
                 "options": {"baseURL": endpoint, "apiKey": api_key},
                 "models": {
                     model: {
@@ -212,14 +217,16 @@ def command(
         return [path, *client_args], environment
 
     if name == "codex":
+        environment["SLIPSTREAM_V2_API_KEY"] = api_key
+        environment["SLIPSTREAM_API_KEY"] = api_key
         environment["SPLASH_API_KEY"] = api_key
         settings = {
             "web_search": json.dumps("disabled"),
-            "model_provider": json.dumps("splash"),
-            "model_providers.splash": (
-                '{name="Splash",base_url='
+            "model_provider": json.dumps("slipstream-v2"),
+            "model_providers.slipstream-v2": (
+                '{name="Slipstream v2",base_url='
                 + json.dumps(endpoint)
-                + ',env_key="SPLASH_API_KEY",wire_api="responses"}'
+                + ',env_key="SLIPSTREAM_V2_API_KEY",wire_api="responses"}'
             ),
             "model_context_window": str(context),
             # Override a possible threshold from the user's other model. The

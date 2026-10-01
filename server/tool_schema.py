@@ -243,7 +243,7 @@ def _schema_with_root(schema, root):
         return schema
     root_defs = root.get("$defs", {}) if isinstance(root, dict) else {}
     schema_defs = schema.get("$defs", {}) if isinstance(schema, dict) else {}
-    name = "__splash_root"
+    name = "__slipstream_v2_root"
     while name in root_defs or name in schema_defs:
         name += "_"
     prefix = f"#/$defs/{name}"

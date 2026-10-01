@@ -30,167 +30,180 @@ def prometheus_metrics(status):
         return None
 
     metrics = {
-        "splash_ready": ("ready",),
-        "splash_metal_healthy": ("metal", "healthy"),
-        "splash_transport_pending": ("transport", "pending"),
-        "splash_frontend_active": ("frontend", "active"),
-        "splash_frontend_waiting": ("frontend", "waiting"),
-        "splash_requests_submitted_total": ("requests", "submitted"),
-        "splash_requests_completed_total": ("requests", "completed"),
-        "splash_requests_cancelled_total": ("requests", "cancelled"),
-        "splash_requests_failed_total": ("requests", "failed"),
-        "splash_scheduler_queued": ("scheduler", "queued"),
-        "splash_scheduler_waiting_resources": ("scheduler", "waiting_resources"),
-        "splash_cache_resource_suspensions_total": ("cache", "resource_suspensions"),
-        "splash_cache_resource_resumptions_total": ("cache", "resource_resumptions"),
-        "splash_cache_resource_replay_tokens_total": (
+        "slipstream_ready": ("ready",),
+        "slipstream_metal_healthy": ("metal", "healthy"),
+        "slipstream_transport_pending": ("transport", "pending"),
+        "slipstream_frontend_active": ("frontend", "active"),
+        "slipstream_frontend_waiting": ("frontend", "waiting"),
+        "slipstream_requests_submitted_total": ("requests", "submitted"),
+        "slipstream_requests_completed_total": ("requests", "completed"),
+        "slipstream_requests_cancelled_total": ("requests", "cancelled"),
+        "slipstream_requests_failed_total": ("requests", "failed"),
+        "slipstream_scheduler_queued": ("scheduler", "queued"),
+        "slipstream_scheduler_waiting_resources": ("scheduler", "waiting_resources"),
+        "slipstream_cache_resource_suspensions_total": ("cache", "resource_suspensions"),
+        "slipstream_cache_resource_resumptions_total": ("cache", "resource_resumptions"),
+        "slipstream_cache_resource_replay_tokens_total": (
             "cache",
             "resource_replay_tokens",
         ),
-        "splash_scheduler_prefilling": ("scheduler", "prefilling"),
-        "splash_scheduler_decoding": ("scheduler", "decoding"),
-        "splash_scheduler_waiting_mask": ("scheduler", "waiting_mask"),
-        "splash_scheduler_prefill_batches_total": ("scheduler", "prefill_batches"),
-        "splash_scheduler_prefill_rows_total": ("scheduler", "prefill_rows"),
-        "splash_scheduler_decode_batches_total": ("scheduler", "decode_batches"),
-        "splash_scheduler_decode_b1_total": (
+        "slipstream_scheduler_prefilling": ("scheduler", "prefilling"),
+        "slipstream_scheduler_decoding": ("scheduler", "decoding"),
+        "slipstream_scheduler_waiting_mask": ("scheduler", "waiting_mask"),
+        "slipstream_scheduler_prefill_batches_total": ("scheduler", "prefill_batches"),
+        "slipstream_scheduler_prefill_rows_total": ("scheduler", "prefill_rows"),
+        "slipstream_scheduler_decode_batches_total": ("scheduler", "decode_batches"),
+        "slipstream_scheduler_decode_b1_total": (
             "scheduler",
             "decode_batches_by_width",
             "b1",
         ),
-        "splash_scheduler_decode_b2_total": (
+        "slipstream_scheduler_decode_b2_total": (
             "scheduler",
             "decode_batches_by_width",
             "b2",
         ),
-        "splash_scheduler_decode_b3_total": (
+        "slipstream_scheduler_decode_b3_total": (
             "scheduler",
             "decode_batches_by_width",
             "b3",
         ),
-        "splash_scheduler_decode_b4_total": (
+        "slipstream_scheduler_decode_b4_total": (
             "scheduler",
             "decode_batches_by_width",
             "b4",
         ),
-        "splash_kv_blocks": ("kv", "blocks"),
-        "splash_kv_pages_total": ("kv", "pages_total"),
-        "splash_kv_pages_free": ("kv", "pages_free"),
-        "splash_kv_pages_active": ("kv", "pages_active"),
-        "splash_kv_pages_cache": ("kv", "pages_cache"),
-        "splash_kv_pages_resident": ("kv", "pages_resident"),
-        "splash_kv_pages_free_resident": ("kv", "pages_free_resident"),
-        "splash_kv_resident_backing_bytes": ("kv", "resident_backing_bytes"),
-        "splash_kv_reclaimable_backing_bytes": ("kv", "reclaimable_backing_bytes"),
-        "splash_kv_sparse_tile_bytes": ("kv", "sparse_tile_bytes"),
-        "splash_kv_pending_unmaps": ("kv", "pending_unmaps"),
-        "splash_kv_pending_unmap_ms": ("kv", "pending_unmap_ms"),
-        "splash_kv_unmaps_completed": ("kv", "unmaps_completed"),
-        "splash_kv_unmap_last_ms": ("kv", "unmap_last_ms"),
-        "splash_kv_unmap_max_ms": ("kv", "unmap_max_ms"),
-        "splash_kv_map_wait_event": ("kv", "map_wait_event"),
-        "splash_kv_pending_map_wait_ms": ("kv", "pending_map_wait_ms"),
-        "splash_kv_map_wait_last_ms": ("kv", "map_wait_last_ms"),
-        "splash_kv_map_wait_max_ms": ("kv", "map_wait_max_ms"),
-        "splash_state_entries": ("state", "entries"),
-        "splash_state_pinned": ("state", "pinned"),
-        "splash_state_bytes": ("state", "bytes"),
-        "splash_state_active_cells": ("state", "active_cells"),
-        "splash_state_hits_total": ("state", "hits"),
-        "splash_state_misses_total": ("state", "misses"),
-        "splash_state_publications_total": ("state", "publications"),
-        "splash_state_evictions_total": ("state", "evictions"),
-        "splash_cache_hits_total": ("cache", "hits"),
-        "splash_cache_cold_misses_total": ("cache", "cold_misses"),
-        "splash_cache_reused_tokens_total": ("cache", "reused_tokens"),
-        "splash_cache_lazy_junctions_total": ("cache", "lazy_junctions"),
-        "splash_target_prefill_rows_total": (
+        "slipstream_kv_blocks": ("kv", "blocks"),
+        "slipstream_kv_pages_total": ("kv", "pages_total"),
+        "slipstream_kv_pages_free": ("kv", "pages_free"),
+        "slipstream_kv_pages_active": ("kv", "pages_active"),
+        "slipstream_kv_pages_cache": ("kv", "pages_cache"),
+        "slipstream_kv_pages_resident": ("kv", "pages_resident"),
+        "slipstream_kv_pages_free_resident": ("kv", "pages_free_resident"),
+        "slipstream_kv_resident_backing_bytes": ("kv", "resident_backing_bytes"),
+        "slipstream_kv_reclaimable_backing_bytes": ("kv", "reclaimable_backing_bytes"),
+        "slipstream_kv_sparse_tile_bytes": ("kv", "sparse_tile_bytes"),
+        "slipstream_kv_pending_unmaps": ("kv", "pending_unmaps"),
+        "slipstream_kv_pending_unmap_ms": ("kv", "pending_unmap_ms"),
+        "slipstream_kv_unmaps_completed": ("kv", "unmaps_completed"),
+        "slipstream_kv_unmap_last_ms": ("kv", "unmap_last_ms"),
+        "slipstream_kv_unmap_max_ms": ("kv", "unmap_max_ms"),
+        "slipstream_kv_map_wait_event": ("kv", "map_wait_event"),
+        "slipstream_kv_pending_map_wait_ms": ("kv", "pending_map_wait_ms"),
+        "slipstream_kv_map_wait_last_ms": ("kv", "map_wait_last_ms"),
+        "slipstream_kv_map_wait_max_ms": ("kv", "map_wait_max_ms"),
+        "slipstream_state_entries": ("state", "entries"),
+        "slipstream_state_pinned": ("state", "pinned"),
+        "slipstream_state_bytes": ("state", "bytes"),
+        "slipstream_state_active_cells": ("state", "active_cells"),
+        "slipstream_state_hits_total": ("state", "hits"),
+        "slipstream_state_misses_total": ("state", "misses"),
+        "slipstream_state_publications_total": ("state", "publications"),
+        "slipstream_state_evictions_total": ("state", "evictions"),
+        "slipstream_cache_hits_total": ("cache", "hits"),
+        "slipstream_cache_cold_misses_total": ("cache", "cold_misses"),
+        "slipstream_cache_reused_tokens_total": ("cache", "reused_tokens"),
+        "slipstream_cache_lazy_junctions_total": ("cache", "lazy_junctions"),
+        "slipstream_target_prefill_rows_total": (
             "draft_context",
             "target_prefill_rows",
         ),
-        "splash_draft_context_active_rows_total": (
+        "slipstream_draft_context_active_rows_total": (
             "draft_context",
             "active_rows",
         ),
-        "splash_draft_context_materialization_rows_total": (
+        "slipstream_draft_context_materialization_rows_total": (
             "draft_context",
             "materialization_rows",
         ),
-        "splash_draft_context_avoided_rows_total": (
+        "slipstream_draft_context_avoided_rows_total": (
             "draft_context",
             "avoided_rows",
         ),
-        "splash_draft_state_restore_skipped_total": (
+        "slipstream_draft_state_restore_skipped_total": (
             "draft_context",
             "restore_skipped",
         ),
-        "splash_draft_state_resets_total": ("draft_context", "resets"),
-        "splash_constraint_mask_overlap_batches_total": (
+        "slipstream_draft_state_resets_total": ("draft_context", "resets"),
+        "slipstream_constraint_mask_overlap_batches_total": (
             "constraint_masks",
             "overlap_batches",
         ),
-        "splash_constraint_mask_overlap_requests_total": (
+        "slipstream_constraint_mask_overlap_requests_total": (
             "constraint_masks",
             "overlap_requests",
         ),
-        "splash_constraint_mask_target_forward_gpu_milliseconds": (
+        "slipstream_constraint_mask_target_forward_gpu_milliseconds": (
             "constraint_masks",
             "last_target_forward_gpu_ms",
         ),
-        "splash_constraint_mask_residual_wait_milliseconds": (
+        "slipstream_constraint_mask_residual_wait_milliseconds": (
             "constraint_masks",
             "last_residual_wait_ms",
         ),
-        "splash_memory_current_bytes": ("memory_actual", "current_bytes"),
-        "splash_memory_peak_bytes": ("memory_actual", "peak_bytes"),
-        "splash_memory_denied_reservations_total": (
+        "slipstream_memory_current_bytes": ("memory_actual", "current_bytes"),
+        "slipstream_memory_peak_bytes": ("memory_actual", "peak_bytes"),
+        "slipstream_memory_denied_reservations_total": (
             "memory_governor",
             "denied_reservations",
         ),
-        "splash_memory_limit_bytes": ("memory_governor", "limit_bytes"),
-        "splash_memory_headroom_bytes": ("memory_governor", "headroom_bytes"),
-        "splash_admission_waiting_memory": ("admission", "waiting_memory"),
-        "splash_admission_waiting_concurrency": ("admission", "waiting_concurrency"),
-        "splash_admission_suspended": ("admission", "suspended"),
-        "splash_admission_oldest_wait_milliseconds": ("admission", "oldest_wait_ms"),
-        "splash_ttft_p50_milliseconds": ("metrics", "ttft_ms", "p50"),
-        "splash_ttft_p95_milliseconds": ("metrics", "ttft_ms", "p95"),
-        "splash_itl_p50_milliseconds": ("metrics", "itl_ms", "p50"),
-        "splash_itl_p95_milliseconds": ("metrics", "itl_ms", "p95"),
-        "splash_prefill_input_tokens_total": ("metrics", "prefill_input_tokens"),
-        "splash_prefill_wall_milliseconds_total": ("metrics", "prefill_wall_ms"),
-        "splash_prefill_tokens_per_second": (
+        "slipstream_memory_limit_bytes": ("memory_governor", "limit_bytes"),
+        "slipstream_memory_headroom_bytes": ("memory_governor", "headroom_bytes"),
+        "slipstream_admission_waiting_memory": ("admission", "waiting_memory"),
+        "slipstream_admission_waiting_concurrency": ("admission", "waiting_concurrency"),
+        "slipstream_admission_suspended": ("admission", "suspended"),
+        "slipstream_admission_oldest_wait_milliseconds": ("admission", "oldest_wait_ms"),
+        "slipstream_ttft_p50_milliseconds": ("metrics", "ttft_ms", "p50"),
+        "slipstream_ttft_p95_milliseconds": ("metrics", "ttft_ms", "p95"),
+        "slipstream_itl_p50_milliseconds": ("metrics", "itl_ms", "p50"),
+        "slipstream_itl_p95_milliseconds": ("metrics", "itl_ms", "p95"),
+        "slipstream_prefill_input_tokens_total": ("metrics", "prefill_input_tokens"),
+        "slipstream_prefill_wall_milliseconds_total": ("metrics", "prefill_wall_ms"),
+        "slipstream_prefill_tokens_per_second": (
             "metrics",
             "prefill_tokens_per_second",
         ),
-        "splash_decode_output_tokens_total": ("metrics", "decode_output_tokens"),
-        "splash_decode_wall_milliseconds_total": ("metrics", "decode_wall_ms"),
-        "splash_decode_tokens_per_second": (
+        "slipstream_decode_output_tokens_total": ("metrics", "decode_output_tokens"),
+        "slipstream_decode_wall_milliseconds_total": ("metrics", "decode_wall_ms"),
+        "slipstream_decode_tokens_per_second": (
             "metrics",
             "decode_tokens_per_second",
         ),
-        "splash_drafted_tokens_total": ("metrics", "drafted_tokens"),
-        "splash_accepted_draft_tokens_total": ("metrics", "accepted_draft_tokens"),
-        "splash_draft_acceptance_ratio": ("metrics", "draft_acceptance_rate"),
-        "splash_capacity_failures_total": ("metrics", "capacity_failures"),
-        "splash_metal_failures_total": ("metrics", "metal_failures"),
-        "splash_response_store_entries": ("response_store", "entries"),
-        "splash_response_store_bytes": ("response_store", "bytes"),
+        "slipstream_drafted_tokens_total": ("metrics", "drafted_tokens"),
+        "slipstream_accepted_draft_tokens_total": ("metrics", "accepted_draft_tokens"),
+        "slipstream_draft_acceptance_ratio": ("metrics", "draft_acceptance_rate"),
+        "slipstream_capacity_failures_total": ("metrics", "capacity_failures"),
+        "slipstream_metal_failures_total": ("metrics", "metal_failures"),
+        "slipstream_response_store_entries": ("response_store", "entries"),
+        "slipstream_response_store_bytes": ("response_store", "bytes"),
     }
     lines = [
-        "# HELP splash_info Splash runtime metrics.",
+        "# HELP slipstream_v2_info Slipstream v2 runtime metrics.",
+        "# TYPE slipstream_v2_info gauge",
+        'slipstream_v2_info{runtime="native"} 1',
+        "# HELP slipstream_info Slipstream runtime metrics (compatibility alias).",
+        "# TYPE slipstream_info gauge",
+        'slipstream_info{runtime="native"} 1',
+        "# HELP splash_info Splash runtime metrics (compatibility alias).",
         "# TYPE splash_info gauge",
         'splash_info{runtime="native"} 1',
     ]
     pressure = status.get("memory_pressure")
     for state in ("normal", "warning", "critical"):
-        lines.append(
-            f'splash_memory_pressure{{state="{state}"}} {1 if pressure == state else 0}'
-        )
+        val = 1 if pressure == state else 0
+        lines.append(f'slipstream_v2_memory_pressure{{state="{state}"}} {val}')
+        lines.append(f'slipstream_memory_pressure{{state="{state}"}} {val}')
+        lines.append(f'splash_memory_pressure{{state="{state}"}} {val}')
     for name, path in metrics.items():
         metric_value = value(path)
         if metric_value is not None:
-            lines.append(f"{name} {metric_value}")
+            if name.startswith("slipstream_"):
+                suffix = name[len("slipstream_"):]
+                lines.append(f"slipstream_v2_{suffix} {metric_value}")
+                lines.append(f"{name} {metric_value}")
+                lines.append(f"splash_{suffix} {metric_value}")
+            else:
+                lines.append(f"{name} {metric_value}")
     return "\n".join(lines) + "\n"
 
 

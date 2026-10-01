@@ -25,7 +25,7 @@ except ImportError:  # Executed directly by the source or packaged entry point.
 
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
-PORT = 8000
+PORT = 8090
 BASE_URL = f"http://127.0.0.1:{PORT}"
 
 
@@ -35,7 +35,11 @@ class LauncherError(RuntimeError):
 
 def _request_json(path, timeout=2):
     request = urllib.request.Request(BASE_URL + path)
-    if key := os.environ.get("SPLASH_API_KEY"):
+    if key := (
+        os.environ.get("SLIPSTREAM_V2_API_KEY")
+        or os.environ.get("SLIPSTREAM_API_KEY")
+        or os.environ.get("SPLASH_API_KEY")
+    ):
         request.add_header("Authorization", f"Bearer {key}")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -43,7 +47,7 @@ def _request_json(path, timeout=2):
     except urllib.error.HTTPError as error:
         if error.code == 401:
             raise LauncherError(
-                "Splash authentication failed; set SPLASH_API_KEY to the server's key"
+                "Slipstream v2 authentication failed; set SLIPSTREAM_V2_API_KEY to the server's key"
             ) from None
         return None
     except (
@@ -115,10 +119,10 @@ def serve(args):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise LauncherError(
-                f"Splash is already serving{_serve_lock_owner(lock)}; "
+                f"Slipstream v2 is already serving{_serve_lock_owner(lock)}; "
                 "stop it with Ctrl+C first"
             ) from None
-        port = getattr(args, "port", None) or 8090
+        port = getattr(args, "port", None) or PORT
         lock.seek(0)
         lock.truncate()
         json.dump({"pid": os.getpid(), "model": args.model, "port": port}, lock)
@@ -186,6 +190,8 @@ def serve(args):
             os.environ, PYTHONUNBUFFERED="1", TRANSFORMERS_VERBOSITY="error"
         )
         if args.api_key is not None:
+            environment["SLIPSTREAM_V2_API_KEY"] = args.api_key
+            environment["SLIPSTREAM_API_KEY"] = args.api_key
             environment["SPLASH_API_KEY"] = args.api_key
         # Detached, because execve replaces this process a line later and a
         # thread would not survive it. Failure is silent by design.
@@ -199,7 +205,7 @@ def coding_client(args):
     snapshot = _running_status()
     if snapshot is None:
         raise LauncherError(
-            "No ready Splash server. Run 'splash serve --model <HF_REPO_ID>' "
+            "No ready Slipstream v2 server. Run 'slipstream-v2 serve --model <HF_REPO_ID>' "
             "in another terminal first."
         )
     catalog = _request_json("/v1/models")
@@ -208,13 +214,13 @@ def coding_client(args):
         not isinstance(models, list)
         or len(models) != 1
         or not isinstance(models[0], dict)
-        or models[0].get("owned_by") != "splash"
+        or models[0].get("owned_by") not in ("slipstream-v2", "slipstream", "splash")
     ):
-        raise LauncherError("Could not identify the local Splash server")
+        raise LauncherError("Could not identify the local Slipstream v2 server")
     model, context = models[0].get("id"), snapshot.get("maximum_context_tokens")
     if type(context) is not int or context <= 0:
         raise LauncherError(
-            "Splash is running but its context limit is not available yet; wait and retry"
+            "Slipstream v2 is running but its context limit is not available yet; wait and retry"
         )
     command, environment = clients.command(
         args.command,
@@ -234,7 +240,7 @@ def coding_client(args):
         )
     elif args.command == "codex":
         print(
-            "Codex hosted WebSearch is disabled: Splash does not provide "
+            "Codex hosted WebSearch is disabled: Slipstream v2 does not provide "
             "OpenAI's search service. Local tools and MCP are unchanged.",
             flush=True,
         )
@@ -281,8 +287,8 @@ def _parse_max_context(value):
 
 def _version():
     if not paths.PACKAGED:
-        return "Splash (source checkout)"
-    return "Splash " + str(
+        return "Slipstream v2 (source checkout)"
+    return "Slipstream v2 " + str(
         json.loads((paths.ROOT / "release.json").read_text())["version"]
     )
 
@@ -304,7 +310,7 @@ def parse_args(argv=None):
     elif "--" in argv:
         boundary = argv.index("--")
         argv, client_args = argv[:boundary], argv[boundary + 1 :]
-    parser = argparse.ArgumentParser(prog="splash", description=__doc__)
+    parser = argparse.ArgumentParser(prog="slipstream-v2", description=__doc__)
     parser.add_argument("--version", action="version", version=_version())
     commands = parser.add_subparsers(dest="command", required=True)
     server = commands.add_parser("serve", help="run the local server; Ctrl+C stops it")
@@ -337,14 +343,18 @@ def parse_args(argv=None):
     )
     server.add_argument(
         "--api-key",
-        default=os.environ.get("SPLASH_API_KEY"),
-        help="API key (default: SPLASH_API_KEY environment variable)",
+        default=(
+            os.environ.get("SLIPSTREAM_V2_API_KEY")
+            or os.environ.get("SLIPSTREAM_API_KEY")
+            or os.environ.get("SPLASH_API_KEY")
+        ),
+        help="API key (default: SLIPSTREAM_V2_API_KEY environment variable)",
     )
     server.add_argument(
         "--port",
         type=int,
-        default=8090,
-        help="HTTP serving port (default: 8090)",
+        default=PORT,
+        help=f"HTTP serving port (default: {PORT})",
     )
     server.add_argument("--no-webui", action="store_true", help="disable the chat page")
     for name in clients.INSTALL_URLS:

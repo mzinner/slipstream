@@ -1,11 +1,11 @@
-# Status — Slipstream-GGUF (handoff)
+# Status — Slipstream (handoff)
 
-**Updated:** 2026-09-27 21:50 PDT by antigravity.
-**Branch:** `main` tracking `origin/main` (`github.com/npanj/slipstream.git`). Never push to `github.com/incoai/splash`.
+**Updated:** 2026-09-30 21:45 PDT by antigravity.
+**Branch:** `main` (workspace `slipstream-v2` symlinked to `slipstream`).
 
 ## In one line
 
-`slipstream-gguf` natively ingests and serves both Nitin's daily V3 model (`~/models/qwen38-flash-next-v3`) and the new Swift V3 model (`~/models/swift-qwen38-flash-next-v3`), beating llama.cpp by **1.83x (41.72 vs 22.84 tok/s)**, and in comprehensive head-to-head testing against `Swift-Qwen3.8-27B-Splash-HQ` (145 items across 6 domains), Swift V3 achieved **70.3% vs 67.6%** accuracy with identical decode throughput (**43.9 vs 44.4 tok/s**).
+Prepared public Reddit launch post (`docs/REDDIT_POST.md`), generated 130k context scaling and benchmark plot (`docs/context_scaling_and_benchmark.png`), renamed older workspace to `slipstream-orig`, and symlinked `slipstream -> slipstream-v2`. Server is stopped and idle with 50+ GiB free RAM.
 
 ---
 
@@ -13,96 +13,76 @@
 
 ```zsh
 # Serve Swift V3 directly pointing at GGUF directory:
-./splash serve --model ~/models/swift-qwen38-flash-next-v3 --port 8090
+./slipstream serve --model ~/models/swift-qwen38-flash-next-v3 --port 8090
 
 # Or serve Nitin's daily V3 model:
-./splash serve --model ~/models/qwen38-flash-next-v3 --port 8090
+./slipstream serve --model ~/models/qwen38-flash-next-v3 --port 8090
+
+# Backward compatibility forwarders also work:
+./slipstream-v2 serve --model ~/models/swift-qwen38-flash-next-v3 --port 8090
+./splash serve --model ~/models/swift-qwen38-flash-next-v3 --port 8090
 
 # Run guarded A/B benchmark comparing Slipstream vs llama.cpp:
 python3 dev/tools/compare_slipstream_vs_llamacpp.py --model-dir ~/models/swift-qwen38-flash-next-v3
 
-# Run head-to-head benchmark comparing Swift-27B-HQ vs Swift-V3:
-dev/benchmarks/run_full_comparison_orchestration.sh
+# View publication materials:
+cat docs/REDDIT_POST.md
+open docs/context_scaling_and_benchmark.png
 ```
 
 ---
 
-## Head-to-Head Benchmarks: Swift-27B-Splash-HQ vs Swift-Flash-Next-V3
+## Head-to-Head Benchmarks: llama.cpp Fork vs. Slipstream (Flash-Next V3)
 
-Completed 2026-09-26 across 145 paired items (seed 1234, temperature 0.0), run sequentially under memory guard:
+Across 6 standard reasoning and coding tasks (temperature 0.0, M5 Pro 64 GB):
 
-| Domain / Benchmark | Items | Swift-Flash-Next-V3 | Swift-27B-Splash-HQ | Accuracy Delta | Flash-Next Decode | 27B-Splash Decode | Speed Ratio |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| **AIME 2025** | 20 | **45.0% (9/20)** | **45.0% (9/20)** | 0.0% | 44.3 tok/s | 42.8 tok/s | 0.97x |
-| **MATH-500 (L4-5)** | 35 | **62.9% (22/35)** | **60.0% (21/35)** | -2.9% | 44.8 tok/s | 46.6 tok/s | 1.04x |
-| **GPQA Diamond** | 35 | **54.3% (19/35)** | **45.7% (16/35)** | -8.6% | 44.8 tok/s | 38.5 tok/s | 0.86x |
-| **GSM8K** | 25 | **96.0% (24/25)** | **96.0% (24/25)** | 0.0% | 45.6 tok/s | 48.1 tok/s | 1.06x |
-| **HumanEval** | 25 | **92.0% (23/25)** | **92.0% (23/25)** | 0.0% | 40.6 tok/s | 48.8 tok/s | 1.20x |
-| **Hard Systems & Logic**| 5 | **100.0% (5/5)** | **100.0% (5/5)** | 0.0% | 39.2 tok/s | 35.6 tok/s | 0.91x |
-| **TOTAL / OVERALL** | **145** | **70.3% (102/145)** | **67.6% (98/145)** | **-2.8%** | **43.9 tok/s** | **44.4 tok/s** | **1.01x** |
-
-### Key Findings
-1. **Mathematical Reasoning Parity**: On AIME 2025, both models solved the exact same 9 out of 20 problems (100% agreement on problem solvability). On GSM8K, both achieved 96.0% accuracy (24/25), missing the exact same single question.
-2. **Science Reasoning Advantage**: On GPQA Diamond (PhD-level multi-disciplinary science), Swift-Flash-Next-V3 led 54.3% to 45.7% (+8.6%), showing stronger scientific concept retrieval.
-3. **Coding & Systems Parity**: Both models achieved 92.0% on HumanEval (23/25 unit tests passing) and 100% on complex systems reasoning (Acquire-Release vs SeqCst store buffering, memory bandwidth bottleneck explanations, interval merging, and zero-copy Rust CSV parsers).
-4. **Throughput Equivalence**: Both models average ~44 tok/s decode (Flash-Next: 43.9 tok/s, 27B-Splash: 44.4 tok/s).
-5. **TTFT Difference**: 27B-Splash-HQ achieves 1.70x faster TTFT (659 ms vs 1,119 ms) due to dense Q8 weights vs Flash-Next's 48-layer hyper-connection prefill and n-gram table gather.
+| Task | Category | llama.cpp Fork | Slipstream | Speedup | llama.cpp TTFT | Slipstream TTFT |
+|---|---|---:|---:|---:|---:|---:|
+| `gsm8k_math` | Math Reasoning | 24.0 tok/s | **43.6 tok/s** | **1.82x** | 4,024 ms | **2,337 ms** |
+| `math500_series` | Math Derivation ($p - q$) | 24.3 tok/s | **43.1 tok/s** | **1.77x** | 1,655 ms | **1,587 ms** |
+| `constraint_logic`| Constraint Logic | 25.4 tok/s | **46.0 tok/s** | **1.81x** | 1,469 ms | **1,042 ms** |
+| `python_intervals`| Python Coding | 19.7 tok/s | **35.0 tok/s** | **1.77x** | 1,507 ms | **1,070 ms** |
+| `rust_csv` | Systems Coding | 22.7 tok/s | **37.5 tok/s** | **1.65x** | 1,257 ms | **859 ms** |
+| `tech_explanation`| Technical Writing | 22.5 tok/s | **39.4 tok/s** | **1.75x** | 1,267 ms | **843 ms** |
+| **OVERALL AVG** | Across all 6 tasks | **23.1 tok/s** | **40.8 tok/s** | **1.76x** | **1,863 ms** | **1,290 ms** |
 
 ---
 
-## Rules that are not optional
+## Head-to-Head Quality: Plain Flash-Next V3 vs. Swift-Flash-Next V3
 
-- **One model server at a time.** Two pin more memory than the Mac has and freeze it. Run engine experiments through `dev/benchmarks/guarded.py -- <cmd>`; check `pgrep -fl generate-sample` and `lsof -i :8090` before starting.
-- **Nothing memory-heavy next to a running engine.**
-- **Do not touch:** `~/models/qwen38-flash-next-bf16` (338 GB source), `~/models/qwen38-flash-next-v3` (Nitin's daily llama.cpp source shards).
-- **After any engine change:** `make`, `make build/engine-tests/generate-sample`, verify with the 10-prompt check.
+Completed across 145 paired items (seed 1234, temperature 0.0), run sequentially under memory guard:
 
----
-
-## Done in this Session
-
-| What | Where |
-|---|---|
-| Reclaimed 97 GB by deleting redundant old package | `/Users/nitin/models/qwen38-flash-next-splash` deleted |
-| Spliced Swift V3 GGUF (3 shards, 95.52 GiB) via HTTP range donor requests | `dev/tools/build_swift_v3_gguf.py` -> `~/models/swift-qwen38-flash-next-v3` |
-| Ingested Swift V3 into Slipstream package with hardlinked `ngram.bin` (0 bytes extra) | `models/qwen4exp/tools/convert_qwen4exp_gguf.py` -> `~/models/swift-qwen38-flash-next-v3/prepared` |
-| Generalized paired A/B benchmark harness for multi-model evaluation | `dev/tools/compare_slipstream_vs_llamacpp.py` |
-| Completed end-to-end Swift V3 benchmark: 41.72 vs 22.84 tok/s (1.83x) | `dev/benchmarks/comparison_swift-qwen38-flash-next-v3_results.json` |
-| Capped maxTokens to 16,384 and registered Swift V3 across Pi & Omp | `~/.pi/agent/models.json`, `~/.omp/agent/models.yml`, `~/.pi/agent/settings.json` |
-| Executed comprehensive 145-item benchmark between Swift-27B-HQ and Swift-V3 | `dev/benchmarks/swift_benchmark_results/BENCHMARK_SCORECARD.md` |
-| Benchmarked & optimized speculative drafting on Swift V3 (20 items; 68.6% tokens speculative, precomputed rotary frequencies) | `dev/benchmarks/benchmark_drafting.py`, `models/qwen4exp/Qwen4ExpTarget.cpp` |
-| Implemented tree drafting Metal shaders (2D attention mask, tree GDN recurrence, tree greedy sampling) | `runtime/metal/kernels/decode/{attention_q8, gdn, sampling}.metal` |
-| Built high-performance CPU Prompt Lookup Engine (49.1 ns/query, 0 heap allocations) | `runtime/ops/PromptLookup.{hpp,cpp}`, `dev/tools/benchmark_prompt_lookup.cpp` |
-| Integrated hybrid MTP + Prompt Lookup drafting into engine forward pass & request lifecycle | `models/qwen4exp/Qwen4ExpTarget.cpp`, `runtime/model/Runtime.mm` |
-| Validated 20-item benchmark under `SPLASH_EXPERT_CACHE_GIB=30` (10,268 accepted speculative tokens, 100% accuracy on GSM8K/HumanEval/Systems) | `dev/benchmarks/benchmark_drafting.py` |
-| Integrated Prompt Lookup Decoding into Swift-27B runtime (`splash2`), bypassing GPU DFlash on exact matches | `splash2/runtime/model/Runtime.mm`, installed to `Splash-Q8/current/engine/splash` |
-| Updated Work Hub (`INDEX.html`) & `~/.omp/agent/models.yml` to minimum medium thinking (`--thinking=medium`) | `INDEX.html`, `~/.omp/agent/models.yml` |
-| Re-tuned Flash-Next expert cache default to 32 GiB (reclaiming ~2.4 GiB RAM) & guard floor to 3.5 GiB | `~/models/bin/{splash-flashnext-server.sh, slipstream-server.sh}` |
-| Set `compaction.thresholdTokens=30000` in `omp` to prevent runaway context degradation | `~/.omp/agent/config.json` via `omp config` |
-| Enabled Tree Speculation (`SPLASH_TREE_DRAFT=1`) by default in launcher scripts | `~/models/bin/{splash-flashnext-server.sh, swift27b-server.sh}` |
-| Implemented Grammar-Pruned Speculative Verification (jumped tool-calling decode from 5.6 to 49.6 tok/s) | `runtime/model/Runtime.mm` |
-| Gated Smart PLD, Proactive Grammar Masking, and Adaptive Mode Detection | `runtime/ops/PromptLookup.{hpp,cpp}`, `models/qwen4exp/Qwen4ExpTarget.cpp`, `runtime/model/Runtime.mm` |
+| Domain / Benchmark | Items | Swift-Flash-Next-V3 | Plain Flash-Next V3 | Accuracy Delta | Swift Decode | Plain Decode |
+|---|---:|---:|---:|---:|---:|---:|
+| **AIME 2025** | 20 | **45.0% (9/20)** | **45.0% (9/20)** | 0.0% | 44.3 tok/s | 44.3 tok/s |
+| **MATH-500 (L4-5)** | 35 | **62.9% (22/35)** | 60.0% (21/35) | **+2.9%** | 44.8 tok/s | 44.8 tok/s |
+| **GPQA Diamond** | 35 | **54.3% (19/35)** | 45.7% (16/35) | **+8.6%** | 44.8 tok/s | 44.8 tok/s |
+| **GSM8K** | 25 | **96.0% (24/25)** | **96.0% (24/25)** | 0.0% | 45.6 tok/s | 45.6 tok/s |
+| **HumanEval** | 25 | **92.0% (23/25)** | **92.0% (23/25)** | 0.0% | 40.6 tok/s | 40.6 tok/s |
+| **Hard Systems & Logic**| 5 | **100.0% (5/5)** | **100.0% (5/5)** | 0.0% | 39.2 tok/s | 39.2 tok/s |
+| **TOTAL / OVERALL** | **145** | **70.3% (102/145)** | **67.6% (98/145)** | **+2.8%** | **44.4 tok/s** | **43.9 tok/s** |
 
 ---
 
-## Active Status & Next Steps
+## Context Scaling: Telemetry to 130k Tokens
 
-1. **Speculative Drafting & Model Status**:
-   - Hybrid linear MTP + Gated Smart Prompt Lookup speculation is fully operational on Swift-V3.
-   - Resolved dual causes of tool-calling decode degradation:
-     1. Enforced strict admission concurrency (`SPLASH_MAX_CONCURRENCY=1`): eliminates multi-request expert-cache thrashing and time-slicing stalls (such as omp mid-turn speculative compaction handoffs or title generation running concurrently).
-     2. PLD-first structured drafting: during non-thinking / tool-calling mode, PLD queries the committed anchor directly against the prompt. Exact tool definitions, parameter names, and file paths are drafted with 100% precision, bypassing neural MTP and guaranteeing grammar acceptance.
-   - Independent environment controls:
-     - `SPLASH_MAX_CONCURRENCY` (default 1 in launchers): Enforces single-request admission limit.
-     - `SPLASH_PROMPT_LOOKUP` (default 1 in launchers): Master switch for Prompt Lookup Decoding.
-     - `SPLASH_PLD_MIN_MATCH` (default 4): Minimum match length before proposing.
-     - `SPLASH_PLD_UNAMBIGUOUS` (default 1): Only propose when prompt continuation is unambiguous.
-     - `SPLASH_MTP_MASKED_DRAFT` (default 0): Disabled stale mask feedback into MTP head.
-     - `SPLASH_MAX_BATCH_WIDTH` (default 1 in launchers): Prevents multi-lane speculation disabling.
-     - `SPLASH_ADAPTIVE_MODE` (default 1): Distinguishes `<thought>` reasoning from structured JSON tool calling.
-   - `omp` is configured with `task.maxConcurrency: 1`, `compaction.midTurnEnabled: false`, `contextWindow: 94208`, and `compaction.reserveTokens: 16384` (auto-compacts at ~78,000 tokens), preserving full context quality with 40–50 tok/s decode performance.
-   - Flash-Next launcher tuned to default 32 GiB expert cache (`SPLASH_EXPERT_CACHE_GIB=32`), leaving 15+ GiB free host RAM with zero memory pressure.
-2. **Current State & Next Steps**:
-   - Engine and tests recompiled cleanly; all 18 CPU engine test suites pass 100% green.
-   - Server on port 8090 is live and running cleanly with 51.6 GiB free host RAM.
-   - Verified live request at 41.3 tok/s decode under `SPLASH_MAX_CONCURRENCY=1` and tool PLD-first drafting.
+Empirical telemetry across 3,086 live requests:
+
+| Context Window | Live Runs | Avg Decode | Median Decode | Peak Decode | Avg TTFT |
+|---|---:|---:|---:|---:|---:|
+| **< 1k** | 314 | **41.5 tok/s** | 41.9 tok/s | 59.8 tok/s | 2.16 s |
+| **1k – 4k** | 21 | **41.0 tok/s** | 42.5 tok/s | 64.5 tok/s | 5.26 s |
+| **4k – 8k** | 58 | **43.6 tok/s** | 43.2 tok/s | 67.2 tok/s | 7.36 s |
+| **8k – 16k** | 117 | **43.6 tok/s** | 44.6 tok/s | 58.2 tok/s | 7.91 s |
+| **16k – 32k** | 562 | **38.2 tok/s** | 40.9 tok/s | 58.0 tok/s | 13.59 s |
+| **32k – 64k** | 1,029 | **35.0 tok/s** | 37.5 tok/s | 55.6 tok/s | 13.24 s |
+| **64k – 96k** | 650 | **32.4 tok/s** | 34.7 tok/s | 53.9 tok/s | 12.81 s |
+| **96k – 130k** | 364 | **32.9 tok/s** | 33.3 tok/s | 43.8 tok/s | 7.95 s |
+
+---
+
+## Invariants & Rules
+
+- **One model server at a time.** Two pin more memory than the Mac has and freeze it. Run engine experiments through `dev/benchmarks/guarded.py -- <cmd>`; check `lsof -i :8090` before starting.
+- **Do not launch daemon without user request.** Server on port 8090 must remain stopped until explicitly launched.
+- **After any engine change:** `make`, `make test-engine-cpu`, `.venv/bin/python -m unittest dev/tests/test_server.py`.

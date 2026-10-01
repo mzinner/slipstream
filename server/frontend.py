@@ -603,7 +603,7 @@ class Frontend:
         )
         return job, thinking, bool(tools)
 
-    def prepare_responses(self, body, *, deadline=None):
+    def prepare_responses(self, body, *, deadline=None, clamp_output_budget=False):
         if deadline is None:
             deadline = self.request_deadline(body)
         store = body.get("store")
@@ -623,7 +623,9 @@ class Frontend:
         previous_items = previous.history_items if previous is not None else []
         chat = responses_to_chat_body(body, previous_items)
         namespaces = chat.pop("_tool_namespaces")
-        job, thinking, has_tools = self.prepare(chat, namespaces, deadline=deadline)
+        job, thinking, has_tools = self.prepare(
+            chat, namespaces, deadline=deadline, clamp_output_budget=clamp_output_budget
+        )
         job.response_store = store
         job.response_previous_id = previous_id
         job.response_history_items = [

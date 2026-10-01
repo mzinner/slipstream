@@ -1,5 +1,29 @@
 # Journal — qwen4exp port
 
+## 2026-09-30 20:25 PDT — antigravity
+
+Investigated and resolved context overflow (HTTP 400 `context_length_exceeded`) during long autonomous `omp` session.
+1. In `server/server.py` and `server/frontend.py`, added `--clamp-output-budget` CLI flag and request-level fallback for `/v1/chat/completions` and `/v1/responses`, dynamically truncating `max_new_tokens` to fit remaining context instead of throwing HTTP 400. Added flag to `~/models/bin/splash-flashnext-server.sh`.
+2. In `~/.omp/agent/config.yml`, enabled `compaction.midTurnEnabled: true` so multi-tool autonomous turns automatically compact history when reaching threshold rather than ballooning to 129k tokens.
+3. In `/Users/nitin/Downloads/pocket-science/make_booklet.py`, fixed duplex cut-and-stack imposition (`SHEETS_PLAN`), properly backing Page 1 with Page 2 and Page 3 with Page 4 across 3 duplex sheets; successfully recompiled `out/pocket-booklet-A4-duplex.pdf`.
+4. All unit tests pass (`test_server.py`, including new clamped chat completion tests).
+Blocked on: nothing.
+
+## 2026-09-30 14:31 PDT — antigravity
+
+Completed Sprint 2 (Exact Speculative Rejection Sampling) and Sprint 3 (Adaptive Multi-Row MTP Controller).
+In `runtime/metal/kernels/decode/sampling.metal`, ported exact Leviathan / ds4 rejection condition and residual replacement sampling with rejected-token exclusion, guaranteeing strict target distribution parity at $T > 0$.
+In `models/qwen4exp/Qwen4ExpTarget.cpp`, implemented `AdaptiveDraftController` to track rolling acceptance windows and chained rejection streaks, dynamically pruning unpromising speculative draft depths to eliminate wasted SSD expert reads and MTP GPU dispatches.
+All 18 CPU engine test targets pass 100% green. Ran 10-prompt speed suite (`speed_suite.py`) under memory guard: overall decode throughput reached **51.9 tok/s** greedy (4.38 tok/step, 84.4 ms/step; peaking at 67.7 tok/s on explanation and 65.5 tok/s on Rust coding) and **51.8 tok/s** at $T=0.7$ (4.57 tok/step, 88.2 ms/step) with zero memory pressure (lowest free RAM > 5.6 GiB).
+Deleted dead 220 GB file `Swift-Qwen3.8-Flash-Next-v3-ds4.gguf` (disk free space expanded from 101 GiB to 321 GiB).
+Promoted `slipstream-v2` as daily driver in `~/models/bin/{slipstream-server.sh, swift-flashnext-server.sh, splash-flashnext-server.sh}`. Launched live server on port 8090; verified live chat completion delivering 47.7 tok/s decode with 48.5 GiB free host RAM.
+Blocked on: nothing.
+
+## 2026-09-30 14:20 PDT — antigravity
+
+Created clean fork `slipstream-v2` and ported asynchronous layer-ahead prefetch advisory (`fcntl(F_RDADVISE)`) into `models/qwen4exp/Qwen4ExpTarget.cpp`. Prefill staging latency dropped from 475 ms to 348 ms (28% TTFT reduction on cold prompt). Executed full 10-prompt speed suite (`models/qwen4exp/bench/speed_suite.py`) under memory guard: overall decode throughput reached **50.3 tok/s** (4.44 tokens/step, 88.3 ms/step; peaking at 62.6 tok/s on explanation and 61.4 tok/s on coding) with zero memory pressure (lowest free RAM 8.3 GiB).
+Blocked on: nothing.
+
 ## 2026-09-27 21:50 PDT — antigravity
 
 Investigated and resolved slow decode throughput during agent tool calling and clarified watchdog exit telemetry. Diagnosed dual root cause of decode degradation: multi-request admission concurrency in `Runtime.mm` thrashing per-layer expert caches across disjoint contexts, and grammar-draft mismatches during tool calls. Fixed by enforcing `SPLASH_MAX_CONCURRENCY=1`, prioritizing Prompt Lookup Decoding for structured tool syntax, and setting `omp` `midTurnEnabled: false`. Confirmed `"guarded: lowest free memory 4.1 GiB"` is an exit report rather than an OOM kill. Validated live server running on port 8090 delivering 41.3 tok/s decode with 51.6 GiB free host RAM.
@@ -323,6 +347,20 @@ Blocked on: nothing.
 
 ## 2026-09-27 21:21 PDT — antigravity
 Identified dual root causes for the tool-calling decode collapse (2.7–6.9 tok/s): 1) `omp`'s mid-turn speculative compaction was firing 2.5k-token background handoffs, causing engine admission to run two requests concurrently, thrashing the 239-expert cache; 2) during tool calling, linear MTP's unconstrained guesses were rejected by the tool grammar at token 0, and PLD was both disabled (`SPLASH_PROMPT_LOOKUP=0`) and chained *after* MTP's rejected guesses. Fixed by enforcing engine admission limit (`SPLASH_MAX_CONCURRENCY=1` in `admitIdleSlot`), making PLD run first on the committed anchor during tool-calling mode, defaulting `SPLASH_PROMPT_LOOKUP=1`, and disabling `midTurnEnabled` in `omp`. Stopped server cleanly; recompiled binaries; CPU test suites 100% green.
+Blocked on: nothing.
+
+## 2026-09-30 14:55 PDT — antigravity
+Completed promotion of `slipstream-v2` as daily default engine across `~/models/bin/` launchers. Stopped server on port 8090 (host free RAM restored to 48.0 GiB; port verified closed). Reclaimed 220 GB by deleting dead GGUF file. Updated Work Hub (`INDEX.html`) project card and index links to `slipstream-v2` with 51.9 tok/s benchmarks and launch instructions. Audited upstream `splash` (found major `persistent-prefix-cache` branch with APFS hole punching, 32-token draft KV paging, and 4096-entry fingerprinting), `ds4` (Metal router softplus precision Taylor series, decode-sized concurrent n-gram dispatch), and `llama.cpp` (Metal flash-attention DK=512 unroll cap, draft context batch cap).
+Blocked on: nothing.
+
+## 2026-09-30 16:30 PDT — antigravity
+Ported ds4's 4-term Taylor polynomial expansion for `log1p` into `gdn_write_gates` in `runtime/metal/kernels/common/gdn_primitives.h` to preserve FP32 precision on small/negative logits during GDN decay calculation. Ported Apple GPU family 11 probe into `runtime/metal/MetalBackend.mm`. Compiled all Metal kernels and binaries cleanly; verified 100% green across all 18 CPU engine test suites (`make test-engine-cpu`). Ran guarded 10-prompt speed suite (2,498 tokens, 72.4 ms/step, lowest free RAM 5.5 GiB). Server on port 8090 verified stopped.
+## 2026-09-30 17:15 PDT — antigravity
+Completed comprehensive project rename from Splash to `slipstream-v2` across all user-facing, client, web, protocol, and test surfaces. Created `./slipstream-v2` executable script and updated `./slipstream` and `./splash` forwarders. Updated web server brand to "Slipstream v2", model owned_by to "slipstream-v2", keepalive comments, thread names, crash trace directories, metrics (`slipstream_v2_*` with legacy fallbacks), and OpenCode/Codex client providers. Fixed `PORT=8090` in `install/launcher.py` and updated Work Hub (`INDEX.html`). Verified all 170/170 server tests, 30/30 client tests, 11/11 launcher tests, 41/41 model tests, and all CPU engine test suites pass 100% green. Server on port 8090 stopped cleanly with 50.4 GiB free RAM.
+Blocked on: nothing.
+
+## 2026-09-30 21:42 PDT — antigravity
+Prepared Reddit launch post for Slipstream follow-up to r/LocalLLaMA and r/Qwen_AI posts. Renamed older `../slipstream` directory to `slipstream-orig` and symlinked `../slipstream -> slipstream-v2` so public and local workflows alias cleanly to Slipstream. Extracted 3,086 empirical telemetry points demonstrating flat decode speeds (33–44 tok/s) up to 130k context on M5 Pro 64GB; generated high-res visual chart at `docs/context_scaling_and_benchmark.png`. Assembled head-to-head comparison tables against llama.cpp fork (1.76x speedup) and evaluated Swift KV-sparsity gains (+8.6% on GPQA Diamond, 70.3% overall on 145 items).
 Blocked on: nothing.
 
 

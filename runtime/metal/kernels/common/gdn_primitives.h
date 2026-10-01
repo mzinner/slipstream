@@ -59,10 +59,12 @@ inline void gdn_write_gates(device const bfloat *packed_row,
   beta = bfloat(1.0f / (1.0f + fast::exp2(-1.44269504089f * b)));
   bfloat x = bfloat(float(packed_row[a_offset + head]) + float(dt_bias[head]));
   float xf = float(x);
-  bfloat softplus =
-      bfloat(max(xf, 0.0f) +
-             fast::log2(1.0f + fast::exp2(-1.44269504089f * abs(xf))) *
-                 0.69314718056f);
+  // Log1p Taylor series for small exp(-|xf|), where adding 1 loses floating-point precision (ds4 #1039)
+  float u = fast::exp2(-1.44269504089f * abs(xf));
+  float log1p_u = (u < 0.03125f)
+      ? u * (1.0f - u * (0.5f - u * (0.33333333333f - 0.25f * u)))
+      : fast::log2(1.0f + u) * 0.69314718056f;
+  bfloat softplus = bfloat(max(xf, 0.0f) + log1p_u);
   decay = fast::exp(a_scale[head] * float(softplus));
 }
 

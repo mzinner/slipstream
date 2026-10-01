@@ -27,6 +27,7 @@
 #include <stdexcept>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <fcntl.h>
 
 namespace splash::model {
 namespace {
@@ -383,6 +384,38 @@ uint32_t readPieces() noexcept {
     return value ? static_cast<uint32_t>(std::clamp(std::atoi(value), 1, 16)) : 1u;
   }();
   return pieces;
+}
+
+// Asynchronously advises the macOS XNU kernel (via F_RDADVISE) to begin
+// background NVMe DMA transfers for missed expert matrices into the unified
+// buffer cache before pread is called.
+template <class Miss>
+void adviseMissedExperts(const Qwen4ExpExpertSource &source, const Miss *misses,
+                         size_t count, uint64_t stride) {
+#if defined(F_RDADVISE)
+  static const bool enabled = [] {
+    const char *v = std::getenv("SPLASH_DISABLE_RDADVISE");
+    return !(v && std::atoi(v) != 0);
+  }();
+  if (!enabled || !count || source.fd < 0)
+    return;
+  for (size_t i = 0; i < count; ++i) {
+    const uint64_t expert = misses[i].expert;
+    struct radvisory ra;
+    ra.ra_count = static_cast<int>(std::min<uint64_t>(stride, static_cast<uint64_t>(INT_MAX)));
+    ra.ra_offset = static_cast<off_t>(source.gate + expert * stride);
+    (void)::fcntl(source.fd, F_RDADVISE, &ra);
+    ra.ra_offset = static_cast<off_t>(source.up + expert * stride);
+    (void)::fcntl(source.fd, F_RDADVISE, &ra);
+    ra.ra_offset = static_cast<off_t>(source.down + expert * stride);
+    (void)::fcntl(source.fd, F_RDADVISE, &ra);
+  }
+#else
+  (void)source;
+  (void)misses;
+  (void)count;
+  (void)stride;
+#endif
 }
 
 // Reads missed experts straight from the layer file into their cache slots:
@@ -1266,6 +1299,13 @@ void Qwen4ExpTarget::addPrefill(
     std::vector<uint32_t> keepMisses, restMisses;
     for (uint32_t e : used)
       if (cache.expertToSlot[e] < 0) (keep[e] ? keepMisses : restMisses).push_back(e);
+    struct AdviseMiss { uint32_t expert; };
+    std::vector<AdviseMiss> allMisses;
+    allMisses.reserve(keepMisses.size() + restMisses.size());
+    for (uint32_t e : keepMisses) allMisses.push_back({e});
+    for (uint32_t e : restMisses) allMisses.push_back({e});
+    adviseMissedExperts(weights.layers[L].expertSource, allMisses.data(), allMisses.size(),
+                        weights.layers[L].ffn.expertGate.expertStrideBytes);
     std::vector<Wave> waves(1);
     for (uint32_t e : hits)
       waves[0].loads.push_back({e, static_cast<uint32_t>(cache.expertToSlot[e])});
@@ -1482,6 +1522,31 @@ void Qwen4ExpTarget::addPrefill(
     (void)backend.submitCommandAsync(stepGraph.dispatches()).wait();
     auto tg1 = std::chrono::steady_clock::now();
     totalGpuMs += std::chrono::duration<double, std::milli>(tg1 - tg0).count();
+
+    // Layer L + 1 router has completed on the GPU; advise kernel of its missed experts early
+    if (L + 1 < geometry.layers) {
+      const auto &nextSource = weights.layers[L + 1].expertSource;
+      const auto &nextCache = weights.layers[L + 1].expertCache;
+      const uint64_t nextStride = weights.layers[L + 1].ffn.expertGate.expertStrideBytes;
+      const auto *selPtr = static_cast<const uint32_t *>(buffers.selectedExperts.contents());
+      const uint32_t routesPerRow = moePlan.shape().routesPerToken();
+      const uint32_t perToken = weights.layout.expertsPerToken;
+      std::bitset<512> nextSeen;
+      struct AdviseMiss { uint32_t expert; };
+      std::vector<AdviseMiss> nextMisses;
+      for (uint32_t r = 0; r < rows; ++r) {
+        for (uint32_t k = 0; k < perToken; ++k) {
+          uint32_t exp = selPtr[r * routesPerRow + k];
+          if (exp < weights.layout.experts && !nextSeen.test(exp)) {
+            nextSeen.set(exp);
+            if (nextCache.expertToSlot[exp] < 0) {
+              nextMisses.push_back({exp});
+            }
+          }
+        }
+      }
+      adviseMissedExperts(nextSource, nextMisses.data(), nextMisses.size(), nextStride);
+    }
   }
 
   const uint32_t lastL = geometry.layers - 1;
@@ -2332,7 +2397,65 @@ void Qwen4ExpTarget::addVerify(
   // -------------------------------------------------------------------------
   uint32_t drafted = 0;
   // Guesses per step, at most one per verify row after the anchor.
-  const uint32_t maxDrafts = mtpDraftLimit();
+  struct AdaptiveDraftController {
+    uint32_t rollingWindow = 0xFF;
+    uint32_t cycles = 0;
+    uint32_t reject2Streak = 0;
+    uint32_t lastProposed = 0;
+
+    void update(uint32_t retained) {
+      if (lastProposed == 0) return;
+      uint32_t acceptedDrafts = (retained > 0) ? (retained - 1) : 0;
+      bool acceptedFirst = (acceptedDrafts >= 1);
+      rollingWindow = ((rollingWindow << 1) | (acceptedFirst ? 1u : 0u)) & 0xFFu;
+      cycles++;
+
+      if (lastProposed >= 2) {
+        if (acceptedDrafts >= 2) {
+          reject2Streak = 0;
+        } else if (acceptedDrafts == 1) {
+          reject2Streak++;
+        }
+      }
+    }
+
+    uint32_t calculateMaxDrafts(uint32_t configuredMax) const {
+      static const int overrideDepth = [] {
+        const char *env = std::getenv("SPLASH_MTP_DEPTH");
+        return (env && env[0]) ? std::atoi(env) : 0;
+      }();
+      if (overrideDepth > 0) {
+        return static_cast<uint32_t>(std::clamp(overrideDepth, 1, static_cast<int>(configuredMax)));
+      }
+
+      static const bool adaptiveEnabled = [] {
+        const char *env = std::getenv("SPLASH_MTP_ADAPTIVE_DEPTH");
+        return env ? (std::atoi(env) != 0) : true;
+      }();
+      if (!adaptiveEnabled || configuredMax <= 2) {
+        return configuredMax;
+      }
+
+      uint32_t bits = 0;
+      for (uint32_t i = 0; i < 8; ++i) {
+        bits += (rollingWindow >> i) & 1u;
+      }
+
+      if (reject2Streak >= 2 || (cycles >= 8 && bits < 4)) {
+        return std::min(configuredMax, 2u);
+      }
+      if (cycles >= 8 && bits < 6) {
+        return std::min(configuredMax, 3u);
+      }
+      return configuredMax;
+    }
+  };
+  static AdaptiveDraftController adaptiveController;
+  if (lanes == 1 && buffers.mtp[0].rows > 0) {
+    adaptiveController.update(buffers.mtp[0].rows);
+  }
+  const uint32_t baseMaxDrafts = mtpDraftLimit();
+  const uint32_t maxDrafts = adaptiveController.calculateMaxDrafts(baseMaxDrafts);
   std::array<std::array<uint32_t, 16>, 7> draftCandidates{};
   std::array<std::array<float, 16>, 7> draftProbabilities{};
   // SPLASH_TRACE=path appends one JSON line per verify step: the head's
@@ -2872,6 +2995,7 @@ void Qwen4ExpTarget::addVerify(
                   std::chrono::steady_clock::now() - mtpStart).count();
     }
     if (!buffers.mtpShadow) {
+      adaptiveController.lastProposed = drafted;
       buffers.liveRowsPerLane = 1 + drafted;
       setLiveRows();
       if (buffers.mtpProposedOut)

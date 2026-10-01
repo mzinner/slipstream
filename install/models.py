@@ -36,13 +36,28 @@ TOKENIZER_FILES = {
     "tokenizer_config.json",
     "vocab.json",
 }
+# Qwen4Exp packages ship the chat template inline in tokenizer_config.json.
+QWEN4EXP_TOKENIZER_FILES = TOKENIZER_FILES - {"chat_template.jinja"}
+# The draft-vocab ranking table is a u32 id list the runtime reads with
+# pread(); it is not an mmap'd packed weight file, so the section alignment
+# rule does not apply to it.
+UNALIGNED_DATA_FILES = {"target/draft-vocab.bin"}
 REPO_ID = re.compile(
     r"[A-Za-z0-9_](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?/"
     r"[A-Za-z0-9_](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9_])?"
 )
 PACKAGE_FORMATS = {
-    "splash-packed-q4": (3, "MDFL0006"),
-    "splash-packed-q4-moe": (4, "MDFM0001"),
+    "splash-packed-q4": (3, "MDFL0006", {}),
+    "splash-packed-q4-moe": (
+        4,
+        "MDFM0001",
+        {"target": "qwen3_5_moe", "draft": "DFlash2DraftModel"},
+    ),
+    "splash-packed-q4-qwen4exp": (
+        5,
+        "MDFN0031",
+        {"target": "qwen4exp", "draft": "DFlash2DraftModel"},
+    ),
 }
 
 
@@ -122,19 +137,15 @@ def validate_package_manifest(path: Path):
         for key, value in expected_format.items()
     ):
         raise ModelError("runtime package has an unsupported packed weight format")
-    if layout[0] == 4:
-        for key, architecture in (
-            ("target", "qwen3_5_moe"),
-            ("draft", "DFlash2DraftModel"),
+    for key, architecture in layout[2].items():
+        declaration = manifest.get(key)
+        if (
+            not isinstance(declaration, dict)
+            or declaration.get("architecture") != architecture
         ):
-            declaration = manifest.get(key)
-            if (
-                not isinstance(declaration, dict)
-                or declaration.get("architecture") != architecture
-            ):
-                raise ModelError(
-                    f"runtime package has an unsupported {key} architecture"
-                )
+            raise ModelError(
+                f"runtime package has an unsupported {key} architecture"
+            )
 
     records = manifest.get("artifacts")
     if not isinstance(records, list) or not records:
@@ -163,7 +174,11 @@ def validate_package_manifest(path: Path):
             raise ModelError("runtime package manifest has an invalid artifact")
         if record["path"] in artifact_paths:
             raise ModelError("runtime package artifact paths are not unique")
-        if pure.suffix == ".bin" and record["size"] % ALIGNMENT:
+        if (
+            pure.suffix == ".bin"
+            and record["path"] not in UNALIGNED_DATA_FILES
+            and record["size"] % ALIGNMENT
+        ):
             raise ModelError(
                 f"runtime package packed file is unaligned: {record['path']}"
             )
@@ -174,16 +189,30 @@ def validate_package_manifest(path: Path):
         for parent in PurePosixPath(name).parents
     ):
         raise ModelError("runtime package artifact paths overlap")
-    target_layers, draft_layers = (64, 5) if layout[0] == 3 else (40, 6)
-    required_files = {
-        "target/embedding.bin",
-        "target/head.bin",
-        "draft/model.bin",
-        "vision/model.bin",
-        *(f"target/layer-{index}.bin" for index in range(target_layers)),
-        *(f"draft/layer-{index}.bin" for index in range(draft_layers)),
-        *(f"tokenizer/{name}" for name in TOKENIZER_FILES),
-    }
+    if layout[0] == 5:
+        required_files = {
+            "target/embedding.bin",
+            "target/head.bin",
+            "target/ngram.bin",
+            "target/draft-vocab.bin",
+            "target/mtp-layer.bin",
+            "target/mtp-combiner.bin",
+            "draft/model.bin",
+            *(f"target/layer-{index}.bin" for index in range(48)),
+            *(f"draft/layer-{index}.bin" for index in range(5)),
+            *(f"tokenizer/{name}" for name in QWEN4EXP_TOKENIZER_FILES),
+        }
+    else:
+        target_layers, draft_layers = (64, 5) if layout[0] == 3 else (40, 6)
+        required_files = {
+            "target/embedding.bin",
+            "target/head.bin",
+            "draft/model.bin",
+            "vision/model.bin",
+            *(f"target/layer-{index}.bin" for index in range(target_layers)),
+            *(f"draft/layer-{index}.bin" for index in range(draft_layers)),
+            *(f"tokenizer/{name}" for name in TOKENIZER_FILES),
+        }
     missing = required_files - artifact_paths
     if missing:
         raise ModelError(
@@ -197,7 +226,11 @@ def verify_artifacts(root: Path, manifest, *, full: bool):
         path = root / record["path"]
         if not path.is_file() or path.stat().st_size != record["size"]:
             raise ModelError(f"installed artifact has the wrong size: {record['path']}")
-        if path.suffix == ".bin" and record["size"] % ALIGNMENT:
+        if (
+            path.suffix == ".bin"
+            and record["path"] not in UNALIGNED_DATA_FILES
+            and record["size"] % ALIGNMENT
+        ):
             raise ModelError(f"installed packed file is unaligned: {record['path']}")
         if full and sha256(path) != record["sha256"].lower():
             raise ModelError(f"installed artifact checksum changed: {record['path']}")

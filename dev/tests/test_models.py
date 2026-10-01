@@ -61,19 +61,38 @@ class ModelArtifactTest(unittest.TestCase):
             / "snapshots"
             / (revision or self.REVISION)
         )
-        target_layers, draft_layers = (64, 5) if schema == 3 else (40, 6)
-        for name in (
+        target_layers, draft_layers = {3: (64, 5), 4: (40, 6), 5: (48, 5)}[schema]
+        names = [
             "target/embedding.bin",
             "target/head.bin",
             "draft/model.bin",
-            "vision/model.bin",
             *(f"target/layer-{index}.bin" for index in range(target_layers)),
             *(f"draft/layer-{index}.bin" for index in range(draft_layers)),
-        ):
+        ]
+        if schema == 5:
+            names += [
+                "target/ngram.bin",
+                "target/mtp-layer.bin",
+                "target/mtp-combiner.bin",
+            ]
+        else:
+            names.append("vision/model.bin")
+        for name in names:
             self.packed_file(snapshot / name)
+        if schema == 5:
+            # The real draft-vocab ranking table is a u32 id list whose size
+            # is vocab * 4, not a multiple of the packed-file alignment.
+            ranking = snapshot / "target/draft-vocab.bin"
+            ranking.parent.mkdir(parents=True, exist_ok=True)
+            ranking.write_bytes(b"\0" * (artifacts.ALIGNMENT * 2 + 10240))
         tokenizer = snapshot / "tokenizer"
         tokenizer.mkdir()
-        for name in artifacts.TOKENIZER_FILES:
+        tokenizer_files = (
+            artifacts.QWEN4EXP_TOKENIZER_FILES
+            if schema == 5
+            else artifacts.TOKENIZER_FILES
+        )
+        for name in tokenizer_files:
             (tokenizer / name).write_text(f"{name}\n")
         if schema == 4:
             (snapshot / "layout.json").write_text("{}\n")
@@ -85,13 +104,19 @@ class ModelArtifactTest(unittest.TestCase):
             }
             for path in sorted(item for item in snapshot.rglob("*") if item.is_file())
         ]
+        names_and_magics = {
+            3: ("splash-packed-q4", "MDFL0006"),
+            4: ("splash-packed-q4-moe", "MDFM0001"),
+            5: ("splash-packed-q4-qwen4exp", "MDFN0031"),
+        }
+        format_name, target_magic = names_and_magics[schema]
         manifest = {
             "schema_version": schema,
             "model": "Community fine-tuned model",
             "format": {
-                "name": "splash-packed-q4" + ("-moe" if schema == 4 else ""),
+                "name": format_name,
                 "section_alignment_bytes": artifacts.ALIGNMENT,
-                "target_layer_magic": "MDFM0001" if schema == 4 else "MDFL0006",
+                "target_layer_magic": target_magic,
                 "draft_layer_magic": "MDFD0004",
                 "vision_magic": "MDFV0001",
             },
@@ -101,6 +126,11 @@ class ModelArtifactTest(unittest.TestCase):
         if schema == 4:
             manifest.update(
                 target={"architecture": "qwen3_5_moe"},
+                draft={"architecture": "DFlash2DraftModel"},
+            )
+        if schema == 5:
+            manifest.update(
+                target={"architecture": "qwen4exp"},
                 draft={"architecture": "DFlash2DraftModel"},
             )
         self.write_manifest(snapshot, manifest)
@@ -206,8 +236,8 @@ class ModelArtifactTest(unittest.TestCase):
         with self.assertRaisesRegex(artifacts.ModelError, "checksum changed"):
             artifacts.verify_installed(models, model_id=self.MODEL_ID, full=True)
 
-    def test_accepts_both_formats_with_arbitrary_display_name_and_metadata(self):
-        for schema in (3, 4):
+    def test_accepts_all_formats_with_arbitrary_display_name_and_metadata(self):
+        for schema in (3, 4, 5):
             with self.subTest(schema=schema):
                 snapshot, manifest = self.package_fixture(schema=schema)
                 # Aggregate digest algorithms and descriptive metadata are producer-owned.
@@ -243,33 +273,49 @@ class ModelArtifactTest(unittest.TestCase):
                 self.download.assert_not_called()
 
     def test_format_magic_and_moe_architecture_are_checked(self):
-        snapshot, original = self.package_fixture(schema=4)
-        for section, key, value in (
-            ("format", "target_layer_magic", "WRONG"),
-            ("format", "section_alignment_bytes", 1),
-            ("target", "architecture", "unsupported"),
-            ("draft", "architecture", "unsupported"),
-        ):
-            with self.subTest(section=section, key=key):
-                manifest = copy.deepcopy(original)
-                manifest[section][key] = value
-                self.write_manifest(snapshot, manifest)
-                with self.assertRaises(artifacts.ModelError):
-                    artifacts.validate_package_manifest(snapshot / "manifest.json")
+        for schema, target_architecture in ((4, "qwen3_5_moe"), (5, "qwen4exp")):
+            snapshot, original = self.package_fixture(schema=schema)
+            for section, key, value in (
+                ("format", "target_layer_magic", "WRONG"),
+                ("format", "section_alignment_bytes", 1),
+                ("target", "architecture", "unsupported"),
+                ("draft", "architecture", "unsupported"),
+            ):
+                with self.subTest(schema=schema, section=section, key=key):
+                    manifest = copy.deepcopy(original)
+                    manifest[section][key] = value
+                    self.write_manifest(snapshot, manifest)
+                    with self.assertRaises(artifacts.ModelError):
+                        artifacts.validate_package_manifest(
+                            snapshot / "manifest.json"
+                        )
+            self.assertEqual(
+                original["target"]["architecture"], target_architecture
+            )
+            snapshot_ok, manifest_ok = self.package_fixture(schema=schema)
+            artifacts.validate_package_manifest(snapshot_ok / "manifest.json")
+            del manifest_ok
 
     def test_manifest_must_list_every_file_the_runtime_reads(self):
-        for schema in (3, 4):
+        for schema in (3, 4, 5):
             snapshot, original = self.package_fixture(schema=schema)
-            for name in (
+            last_target = {3: 63, 4: 39, 5: 47}[schema]
+            last_draft = {3: 4, 4: 5, 5: 4}[schema]
+            names = [
                 "target/embedding.bin",
                 "target/head.bin",
                 "target/layer-0.bin",
-                f"target/layer-{63 if schema == 3 else 39}.bin",
+                f"target/layer-{last_target}.bin",
                 "draft/model.bin",
-                f"draft/layer-{4 if schema == 3 else 5}.bin",
-                "vision/model.bin",
+                f"draft/layer-{last_draft}.bin",
                 "tokenizer/config.json",
-            ):
+            ]
+            names += (
+                ["target/ngram.bin", "target/mtp-combiner.bin"]
+                if schema == 5
+                else ["vision/model.bin"]
+            )
+            for name in names:
                 with self.subTest(schema=schema, missing=name):
                     manifest = {
                         **original,

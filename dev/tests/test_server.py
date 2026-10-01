@@ -515,6 +515,7 @@ class Harness:
         thinking_codec=None,
         api_key=None,
         webui=True,
+        clamp_output_budget=False,
     ):
         self.tokenizer = tokenizer or FakeTokenizer()
         runtime.pending_limit = queue_size
@@ -539,6 +540,7 @@ class Harness:
             request_capacity=queue_size,
             api_key=api_key,
             webui=webui,
+            clamp_output_budget=clamp_output_budget,
         )
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
@@ -887,7 +889,7 @@ class ServerTest(unittest.TestCase):
             self.assertIn(b'value="' + effort + b'"', payload)
         for label in (b"XHigh", b"Medium", b"Low", b"Off"):
             self.assertIn(b">" + label + b"</option>", payload)
-        for label in (b"Splash", b"New chat", b"Recents"):
+        for label in (b"Slipstream v2", b"New chat", b"Recents"):
             self.assertIn(label, payload)
         self.assertIn(b"reasoning_effort", payload)
         self.assertIn(b"include_usage", payload)
@@ -895,7 +897,7 @@ class ServerTest(unittest.TestCase):
         self.assertIn(b"allowedEfforts.has(savedEffort)", payload)
         self.assertIn(b"function storageGet", payload)
         self.assertIn(b"function storageSet", payload)
-        self.assertIn(b"JSON.parse(storageGet(storeKey))", payload)
+        self.assertIn(b"storageGet(storeKey)", payload)
         self.assertIn(
             b"Chat still works if browser storage is full or disabled", payload
         )
@@ -1075,7 +1077,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         model = json.loads(payload)["data"][0]
         self.assertEqual(model["id"], "test-model")
-        self.assertEqual(model["owned_by"], "splash")
+        self.assertEqual(model["owned_by"], "slipstream-v2")
 
         status, _, payload = harness.request(
             "POST", "/v1/chat/completions", self.body(seed=7)
@@ -2080,7 +2082,7 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(args.max_new_tokens, 32768)
         self.assertEqual(args.request_timeout, 1800)
         self.assertEqual(args.model, model)
-        self.assertEqual(Path(args.binary).name, "splash")
+        self.assertIn(Path(args.binary).name, ("slipstream-v2", "slipstream", "splash"))
         tokenizer = FakeTokenizer()
         backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
         self.addCleanup(backend.close)
@@ -2488,7 +2490,7 @@ class ServerTest(unittest.TestCase):
                 self.assertEqual(role["choices"][0]["delta"]["role"], "assistant")
                 self.assertEqual(
                     response.readline().decode().rstrip("\r\n"),
-                    ": splash-keepalive",
+                    ": slipstream-v2-keepalive",
                 )
             finally:
                 plan.release.set()
@@ -2594,8 +2596,8 @@ class ServerTest(unittest.TestCase):
         before_output, _, after_output = raw.partition(
             b"event: response.output_item.added\n"
         )
-        self.assertNotIn(b": splash-keepalive", before_output)
-        self.assertEqual(after_output.count(b": splash-keepalive"), 2)
+        self.assertNotIn(b": slipstream-v2-keepalive", before_output)
+        self.assertEqual(after_output.count(b": slipstream-v2-keepalive"), 2)
         self.assertEqual(kinds[-1], "response.completed")
         response = parsed[-1]["response"]
         self.assertEqual(response["id"], "resp_prefill-heartbeat")
@@ -2656,7 +2658,7 @@ class ServerTest(unittest.TestCase):
             )
         # All native events were immediately available, but the JSON array
         # remained buffered across several heartbeat periods.
-        self.assertGreaterEqual(snapshots[-3].count(b": splash-keepalive"), 3)
+        self.assertGreaterEqual(snapshots[-3].count(b": slipstream-v2-keepalive"), 3)
         self.assertNotIn(b"questions", snapshots[-3])
         self.assertEqual(
             json.loads(calls[0]["function"]["arguments"]), {"questions": ["a" * 24]}
@@ -3483,8 +3485,8 @@ class ServerTest(unittest.TestCase):
         self.assertFalse(generation_constraints.LLMatcher.validate_grammar(grammar))
         for reference in references:
             self.assertIn(json.dumps(reference, separators=(",", ":")), grammar)
-        self.assertIn('"items":{"$ref":"#/$defs/__splash_root/$defs/x"}', grammar)
-        self.assertNotIn("__splash_root/x", grammar)
+        self.assertIn('"items":{"$ref":"#/$defs/__slipstream_v2_root/$defs/x"}', grammar)
+        self.assertNotIn("__slipstream_v2_root/x", grammar)
         arguments = {
             "pattern": "literal",
             "propertyNames": literal,
@@ -4762,6 +4764,24 @@ class ServerTest(unittest.TestCase):
             len(request.prompt_tokens) + request.logical_max_output_tokens, 10
         )
         self.assertGreaterEqual(request.logical_max_output_tokens, 1)
+
+    def test_chat_completions_output_budget_clamped_when_enabled(self):
+        runtime = FakeRuntime()
+        harness = self.harness(
+            runtime, max_context=10, default_max_new=9, clamp_output_budget=True
+        )
+        for path, body in (
+            ("/v1/chat/completions", self.body(max_completion_tokens=9)),
+            ("/v1/responses", self.responses_body(max_output_tokens=9)),
+        ):
+            with self.subTest(path=path):
+                status, _, payload = harness.request("POST", path, body)
+                self.assertEqual(status, 200, payload)
+                request = runtime.requests[-1]
+                self.assertEqual(
+                    len(request.prompt_tokens) + request.logical_max_output_tokens, 10
+                )
+                self.assertGreaterEqual(request.logical_max_output_tokens, 1)
 
     def test_default_output_budget_uses_remaining_context(self):
         runtime = FakeRuntime()

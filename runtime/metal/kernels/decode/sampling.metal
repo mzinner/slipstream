@@ -343,27 +343,64 @@ inline uint sparse_residual_sample(device const uint *target_ids,
                                    device const float *target_probs,
                                    device const uint *draft_ids,
                                    device const float *draft_probs,
+                                   uint rejected_token,
                                    float uniform) {
   float total = 0.0f;
   for (uint i = 0; i < 32; ++i) {
-    float q = sparse_lookup(draft_ids, draft_probs, 16, target_ids[i]);
-    total += max(target_probs[i] - q, 0.0f);
+    uint token = target_ids[i];
+    if (token == 0xffffffffu || token == rejected_token)
+      continue;
+    float q = sparse_lookup(draft_ids, draft_probs, 16, token);
+    float p = target_probs[i];
+    total += max(p - q, 0.0f);
   }
   if (!(total > 0.0f)) {
-    return sparse_sample(target_ids, target_probs, uniform);
+    // If residual distribution is empty across the sparse window,
+    // sample from target distribution strictly excluding the rejected draft token.
+    float target_total = 0.0f;
+    for (uint i = 0; i < 32; ++i) {
+      uint token = target_ids[i];
+      if (token == 0xffffffffu || token == rejected_token)
+        continue;
+      if (target_probs[i] > 0.0f)
+        target_total += target_probs[i];
+    }
+    if (!(target_total > 0.0f)) {
+      for (uint i = 0; i < 32; ++i) {
+        if (target_ids[i] != 0xffffffffu && target_ids[i] != rejected_token)
+          return target_ids[i];
+      }
+      return target_ids[0];
+    }
+    float threshold = uniform * target_total;
+    float cumulative = 0.0f;
+    uint fallback = target_ids[0];
+    for (uint i = 0; i < 32; ++i) {
+      uint token = target_ids[i];
+      if (token == 0xffffffffu || token == rejected_token || !(target_probs[i] > 0.0f))
+        continue;
+      fallback = token;
+      cumulative += target_probs[i];
+      if (cumulative > threshold)
+        return token;
+    }
+    return fallback;
   }
   float threshold = uniform * total;
   float cumulative = 0.0f;
   uint fallback = target_ids[0];
   for (uint i = 0; i < 32; ++i) {
-    float q = sparse_lookup(draft_ids, draft_probs, 16, target_ids[i]);
+    uint token = target_ids[i];
+    if (token == 0xffffffffu || token == rejected_token)
+      continue;
+    float q = sparse_lookup(draft_ids, draft_probs, 16, token);
     float residual = max(target_probs[i] - q, 0.0f);
     if (!(residual > 0.0f))
       continue;
-    fallback = target_ids[i];
+    fallback = token;
     cumulative += residual;
     if (cumulative > threshold)
-      return target_ids[i];
+      return token;
   }
   return fallback;
 }
@@ -410,8 +447,17 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
                             draft_probs + accepted * 16, 16, token);
     float p = sparse_lookup(target_ids + accepted * 32,
                             target_probs + accepted * 32, 32, token);
-    if (!(uniforms[accepted + SPLASH_TARGET_VERIFY_ROWS] * q < p))
+    float u = uniforms[accepted + SPLASH_TARGET_VERIFY_ROWS];
+
+    // Leviathan et al. / ds4 exact speculative rejection sampling:
+    if (!(q > 0.0f) || !isfinite(q))
       break;
+    if (p >= q) {
+      // Deterministic accept when target probability >= proposal probability
+    } else {
+      if (!(p > 0.0f) || !isfinite(p) || !(u * q < p))
+        break;
+    }
     output_tokens[accepted] = token;
     ++accepted;
   }
@@ -421,9 +467,11 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
                       target_probs + SPLASH_DRAFT_PROPOSAL_TOKENS * 32,
                       uniforms[2 * SPLASH_TARGET_VERIFY_ROWS - 1]);
   } else {
+    uint rejected_token = draft_tokens[accepted];
     output_tokens[accepted] = sparse_residual_sample(
         target_ids + accepted * 32, target_probs + accepted * 32,
         draft_ids + accepted * 16, draft_probs + accepted * 16,
+        rejected_token,
         uniforms[2 * SPLASH_TARGET_VERIFY_ROWS - 1]);
   }
   finish_acceptance(output_tokens, accepted, params, retained, next_anchor,

@@ -714,7 +714,7 @@ MetalBackend::MetalBackend(std::string metallibPath, double commandTimeoutSecond
         DeviceCapabilities &capabilities = impl_->capabilities;
         capabilities.deviceName = stringFromNSString(impl_->device.name);
         capabilities.gpuCoreCount = gpuCoreCountForDevice(impl_->device.registryID);
-        for (uint32_t family = 10; family >= 7; --family) {
+        for (uint32_t family = 11; family >= 7; --family) {
             if ([impl_->device supportsFamily:
                     static_cast<MTLGPUFamily>(1000 + family)]) {
                 capabilities.appleGpuFamily = family;

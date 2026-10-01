@@ -119,5 +119,53 @@
 - [x] Speculation stall resolution: eliminated stale mask feedback loop in Runtime.mm (SPLASH_MTP_MASKED_DRAFT=0), added SPLASH_MAX_BATCH_WIDTH=1 to Scheduler.cpp, and tuned omp maxConcurrency: 1 with 94k contextWindow
 - [x] Fixed tool-calling decode collapse: enforced strict admission concurrency (`SPLASH_MAX_CONCURRENCY=1` in `Runtime.mm`), refactored `Qwen4ExpTarget.cpp` to run PLD-first during structured tool calling, enabled `SPLASH_PROMPT_LOOKUP=1` in launcher, and disabled `midTurnEnabled` in `omp`.
 
+## Slipstream-V2 (Unified ds4 & Slipstream Plan)
+
+- [x] Create dedicated isolated workspace `slipstream-v2` and verify clean build
+- [x] Audit and autopsy ds4 Qwen plan: confirmed lack of SSD streaming for Qwen and kernel watchdog crash vectors
+- [x] Architecture & language decision: retained C++20 / Objective-C++ (`.mm`) + Metal Shading Language (`.metal`) for zero-allocation RAII safety and Metal ABI compliance
+- [x] **Sprint 1 — Asynchronous Layer-Ahead NVMe Advisory**:
+  - [x] Implemented `adviseMissedExperts` using Darwin `fcntl(fd, F_RDADVISE, &ra)` in `models/qwen4exp/Qwen4ExpTarget.cpp`
+  - [x] Issued non-blocking advisory for current prefill wave sequence and layer $L+1$ router-predicted misses
+  - [x] Prefill staging latency reduced by 28% (475 ms -> 348 ms); speed suite decode reached 50.3 tok/s
+- [x] **Sprint 2 — Exact Speculative Rejection Sampling & Residual Replacement**:
+  - [x] Ported Leviathan / ds4 exact rejection condition into `accept_sampled_lane` in `runtime/metal/kernels/decode/sampling.metal`
+  - [x] Updated `sparse_residual_sample` with explicit `rejected_token` exclusion to prevent verifier re-sampling rejected drafts
+  - [x] Validated stochastic sampling at $T=0.7$ with 51.8 tok/s decode across 10 prompts and mathematical target distribution parity
+- [x] **Sprint 3 — Adaptive Multi-Row MTP Speculation Controller**:
+  - [x] Implemented `AdaptiveDraftController` in `models/qwen4exp/Qwen4ExpTarget.cpp` tracking 8-cycle rolling acceptance and chained rejection streaks
+  - [x] Dynamic backoff between 2 and 5 draft depth to eliminate wasted SSD expert reads and MTP GPU dispatches on divergent text
+  - [x] Verified zero-recomputation GDN prefix commit on partial draft accepts (`ops::GDN::addCommit`)
+  - [x] Overall speed suite decode throughput climbed to 51.9 tok/s (peaking at 67.7 tok/s on explanation and 65.5 tok/s on Rust coding)
+- [x] Full CPU test suite verification (`make test-engine-cpu`: 18/18 targets PASS)
+- [x] Update project handoff state convention in `.agents/{journal.md, status.md, decisions.md, tasks.md}`
+- [x] Delete dead 220 GB file `~/models/swift-qwen38-flash-next-v3/Swift-Qwen3.8-Flash-Next-v3-ds4.gguf` (reclaimed 220 GB, disk free jumped from 101 GiB to 321 GiB)
+- [x] Update `~/models/bin/{slipstream-server.sh, swift-flashnext-server.sh, splash-flashnext-server.sh}` to promote `slipstream-v2` as daily default engine
+- [x] Stop server on port 8090 and verify port 8090 is completely closed
+- [x] Update Work Hub (`INDEX.html`) project card and master index links for `slipstream-v2` (51.9 tok/s, `fcntl(F_RDADVISE)`, adaptive MTP, direct launchers)
+- [x] Comprehensive upstream audit across `splash`, `ds4`, and `llama.cpp` for speed and quality enhancements:
+  - [x] **Port 1: Metal Softplus Taylor Series Precision (`ds4` `0719a0b`)**: Ported 4-term Taylor polynomial expansion `em*(1.0f - em*(0.5f - em*(1.0f/3.0f - 0.25f*em)))` into `runtime/metal/kernels/common/gdn_primitives.h` to prevent FP32 precision loss in recurrent gate decay.
+  - [x] **Port 2: Apple Silicon Next-Gen Probe (`splash` `73ff70b`)**: Updated `runtime/metal/MetalBackend.mm` to probe Apple GPU family 11.
+  - [ ] **Follow-up Port: Persistent Prefix Caching (`splash` `origin/feature/persistent-prefix-cache`)**: Needs dedicated design to map `qwen4exp` recurrent GDN + hyper-connection + MTP draft state into `CacheGroupCoordinator` paged disk extents.
+- [x] Full Rebranding to `slipstream-v2`:
+  - [x] Created `./slipstream-v2` executable script and forwarders `./slipstream` and `./splash`
+  - [x] Updated web server brand to "Slipstream v2", model owned_by to "slipstream-v2", keepalive `: slipstream-v2-keepalive\n\n`, thread names `slipstream-v2-*`, crash trace directory
+  - [x] Updated metrics to primary `slipstream_v2_*` prefix with backward-compatibility aliases for `slipstream_*` and `splash_*`
+  - [x] Updated OpenCode and Codex client configuration in `install/clients.py` and test assertions in `dev/tests/engine/test_clients.py`
+  - [x] Fixed `PORT = 8090` in `install/launcher.py` and updated direct launcher command in `INDEX.html`
+  - [x] Updated Makefile targets (`build/slipstream-v2`, `build/slipstream-v2.metallib`, symlinks `build/slipstream`, `build/splash`)
+  - [x] Verified all test suites pass 100% (170/170 server tests, 30/30 client tests, 11/11 launcher tests, 41/41 model tests, 18/18 CPU engine tests)
+  - [x] Verified port 8090 server is stopped and idle with 50.4 GiB free RAM
+- [x] Public Release & Reddit Follow-up Preparation:
+  - [x] Renamed older inactive `../slipstream` directory to `slipstream-orig` and symlinked `../slipstream -> slipstream-v2`
+  - [x] Extracted and analyzed 3,086 empirical telemetry points across context window up to 130k tokens
+  - [x] Generated high-resolution context scaling and benchmark chart (`docs/context_scaling_and_benchmark.png`)
+  - [x] Compiled head-to-head comparison tables against llama.cpp fork (1.76x speedup) and Swift KV-sparsity gains (+8.6% GPQA Diamond, 70.3% overall)
+  - [x] Authored complete, focused Reddit release post draft in `docs/REDDIT_POST.md` and conversation artifact
+
+
+
+
+
 
 

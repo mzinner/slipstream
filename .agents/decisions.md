@@ -1,5 +1,27 @@
 # Decisions — qwen4exp port
 
+## Graceful Output Budget Clamping for Context Ceilings (2026-09-30)
+
+When prompt tokens approach the context window ceiling (e.g. during lengthy agent tool loops), OpenAI `/v1/chat/completions` previously raised an unrecoverable HTTP 400 `context_length_exceeded` if `prompt_tokens + max_completion_tokens > max_context`. We added `--clamp-output-budget` (and `FrontendServer.clamp_output_budget`) to gracefully clamp the output budget to `max_context - prompt_tokens` and return `finish_reason: "length"`, aligning `/v1/chat/completions` with the graceful behavior of Anthropic `/v1/messages`.
+
+## Exact Speculative Rejection Sampling & Residual Token Replacement (2026-09-30)
+
+Standard speculative decoding (Leviathan et al.) requires that rejected draft proposals are replaced by drawing from the residual distribution $P_{residual}(x) \propto \max(0, P(x) - Q(x))$. In `sampling.metal`, previous implementations failed to exclude the rejected token and allowed acceptance when draft proposal probability was 0.0. We ported `ds4`'s point-mass rejection and replacement math into `sampling.metal`:
+1. Draft acceptance verifies validity ($q > 0.0$ and finite); accepts deterministically if $p \ge q$; otherwise accepts stochastically with probability $p / q$.
+2. In `sparse_residual_sample`, `rejected_token` is explicitly excluded from both the residual accumulator and fallback target distribution, guaranteeing that a rejected token cannot be chosen as its own replacement and preserving exact mathematical target-distribution parity at non-zero temperatures.
+
+## Adaptive Multi-Row MTP Speculation Controller (2026-09-30)
+
+When speculative drafts chain to depth 5 or 7 on divergent or branch-heavy text, subsequent draft guesses are rejected >60% of the time, wasting 3–5 MTP head forward dispatches and forcing the target verifier to load dozens of redundant MoE experts from NVMe. We introduced `AdaptiveDraftController` in `models/qwen4exp/Qwen4ExpTarget.cpp`:
+- Tracks a rolling 8-cycle window of first-draft acceptances and a chained rejection streak (`reject2Streak`).
+- If chained drafts repeatedly reject (`reject2Streak >= 2`) or recent window acceptance is low (<4/8), the controller dynamically throttles speculation to shallow depth (2 drafts = anchor + 2).
+- When acceptance recovers, depth automatically scales back up to the full configured limit (`maxDrafts`).
+- Result: decode throughput jumped from 50.3 to 51.9 tok/s greedy (up to 67.7 tok/s on explanation) while eliminating useless SSD expert thrashing.
+
+## Layer-Ahead NVMe Advisory (`F_RDADVISE`) for Prefill Waves (2026-09-30)
+
+During prefill waves on MoE models, synchronous page reads for missed expert matrices stalled the GPU on NVMe latency (~475 ms per prompt chunk). By issuing non-blocking `fcntl(fd, F_RDADVISE, &ra)` hints to the macOS XNU kernel for all missed expert matrices as soon as a layer's routing finishes (and immediately for the current layer's wave sequence), the kernel streams NVMe pages into the unified buffer cache via background DMA while the GPU executes attention and GDN. Subsequent `::pread` calls hit page cache directly at RAM speed, reducing prefill staging time by 28% (475 ms -> 348 ms) and lifting overall benchmark decode throughput to 50.3 tok/s.
+
 ## The layer order, verified exactly
 
 This is the single most valuable fact in this directory. A layer composed this
@@ -447,4 +469,48 @@ To create a Swift version of Nitin's V3 model (`Swift-Qwen3.8-Flash-Next-V3`) de
    - PLD was previously chained *after* MTP, using MTP's unverified draft tokens as its search query, meaning PLD was never called on tool schemas unless MTP guessed them first.
    - Refactored `Qwen4ExpTarget::addVerify` to run PLD *first* during non-thinking / tool-calling mode using the committed anchor context. When PLD finds an exact match in the prompt (e.g. tool signatures, parameter names, file paths), it drafts up to 4 tokens with 100% precision, bypassing MTP neural drafting and guaranteeing grammar acceptance.
    - Defaulted `SPLASH_PROMPT_LOOKUP=1` in `splash-flashnext-server.sh` and disabled `midTurnEnabled` in `~/.omp/agent/config.yml`.
+## 2026-09-30 — Promotion of Slipstream-V2 as Daily Default & Upstream Architecture Audit
+
+1. **Promotion of `slipstream-v2` as Daily Serving Engine**:
+   - `slipstream-v2` delivers 51.9 tok/s overall decode (peaking at 67.7 tok/s) and 51.8 tok/s at $T=0.7$ with exact rejection sampling, zero memory leaks, and 28% lower prefill staging latency.
+   - All standard launchers in `~/models/bin/` (`slipstream-server.sh`, `swift-flashnext-server.sh`, `splash-flashnext-server.sh`) now target `slipstream-v2` and `local/swift-qwen38-flash-next-v3`.
+   - Work Hub (`INDEX.html`) updated with new direct launchers, updated benchmark metrics, and architecture summaries.
+   - Deleted unused 220 GB GGUF artifact (`Swift-Qwen3.8-Flash-Next-v3-ds4.gguf`), leaving 321 GiB free disk space.
+2. **Upstream Architecture Audit & Evaluation**:
+   - **Splash Persistent Prefix Cache (`origin/feature/persistent-prefix-cache`)**:
+     - Introduces `PersistentCache`, `StateGroupCache`, and `DraftKvCache`. Uses 32-token page alignment for sliding window KV, APFS hole-punching for disk storage, and SQLite extent indexing.
+     - Implements 4,096-entry demand fingerprinting and SSD write-credit admission pacing (256 GiB/h).
+     - *Decision*: Prime candidate for next major architectural upgrade in `slipstream-v2` to make agent turn 2+ TTFT near-zero.
+   - **ds4 Metal Router Softplus Precision (`0719a0b`)**:
+     - Uses a 4-term Taylor polynomial expansion `em*(1.0f - em*(0.5f - em*(1.0f/3.0f - 0.25f*em)))` when $e^x < 0.03125$ to fix catastrophic cancellation and precision loss in Metal FP32.
+     - *Decision*: Evaluate integrating into `gdn_primitives.h` softplus decay calculation to harden numerical precision on deep recurrent sequences.
+   - **ds4 Concurrent Engram Reader (`6c00e2d`, `077a257`)**:
+     - *Decision*: Declined for `slipstream-v2`. `slipstream-v2` already executes `ngram_embedding_gather` directly on the Metal GPU with memory-mapped tables, completely bypassing CPU file descriptor `pread` calls.
+   - **llama.cpp Draft Batch Cap (`63b61fa45`)**:
+     - *Decision*: Confirmed already implemented by construction in `slipstream-v2`. Verification buffers in `Qwen4ExpTarget.cpp` use strict single-lane sizing (`liveRowsPerLane = 1 + drafted`), avoiding the 4–6 GB memory overhead observed in llama.cpp.
+
+## 2026-09-30 — Comprehensive Rebranding to Slipstream-v2 with Compatibility Aliasing
+
+1. **User Surface & CLI**:
+   - Created primary binary target `build/slipstream-v2`, metallib `build/slipstream-v2.metallib`, and CLI script `./slipstream-v2`.
+   - Provided symlinks and forwarders (`./slipstream`, `./splash`, `build/slipstream`, `build/splash`) to preserve seamless invocation across all existing scripts and workflows.
+2. **Server & Protocol Identifiers**:
+   - Web server brand: "Slipstream v2", model `owned_by: "slipstream-v2"`, keepalive `: slipstream-v2-keepalive\n\n`, and thread names `slipstream-v2-*`.
+   - Tool grammar root schema renamed to `__slipstream_v2_root`.
+   - Crash trace logs routed to `~/Library/Logs/Slipstream-v2/crash`.
+3. **Metrics & Observability**:
+   - Emits primary metrics under `slipstream_v2_*` prefix, including `slipstream_v2_info` and `slipstream_v2_memory_pressure`.
+   - Emits `slipstream_*` and `splash_*` aliases to ensure external scrapers and dashboards continue functioning without disruption.
+4. **Client Integrations**:
+   - OpenCode and Codex configured with `slipstream-v2` provider and model prefix `slipstream-v2/<model>`.
+   - Defaults to port 8090 across `install/launcher.py` and Work Hub (`INDEX.html`).
+
+## 2026-09-30 — Public Release Alignment: Publishing as Slipstream & Archiving Old Directory
+
+1. **Workspace and Release Alignment**:
+   - Archived older inactive workspace `../slipstream` to `../slipstream-orig`.
+   - Symlinked `../slipstream` directly to `slipstream-v2`, allowing GitHub release, user documentation, and local scripts to use `Slipstream` uniformly without naming fragmentation.
+   - Public model distribution paths clarified: base Flash-Next V3 (`nitinpanj/Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF`) and Swift KV-sparse variant (`nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF`).
+2. **Upstream Contribution Stance**:
+   - Package Flash-Next architectural extensions, SSD expert streaming, and PLD speculative drafting as an upstream PR/patch to Incoai Splash.
 

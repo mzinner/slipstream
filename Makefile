@@ -13,13 +13,13 @@ INSTALL_LOCK = $(VENV).install.lock
 REQUIREMENTS := install/requirements.txt
 PYTHON_CANDIDATES := python3.13 python3 python3.12 python3.14
 BUILD_ID_PYTHON ?= python3
-SPLASH_MAKEFILE := $(abspath $(firstword $(MAKEFILE_LIST)))
+SLIPSTREAM_MAKEFILE := $(abspath $(firstword $(MAKEFILE_LIST)))
 MODEL_INSTALL = $(PYTHON) install/models.py
 MODEL ?=
 MODEL_ROOT := install/models/$(MODEL)
 
 BUILD := build
-TARGET := $(BUILD)/splash
+TARGET := $(BUILD)/slipstream-v2
 METAL_BUILD := $(BUILD)/metal
 # Shared kernels are grouped by execution phase under
 # runtime/metal/kernels/{prefill,decode,shared}; each model's own kernels live
@@ -49,7 +49,7 @@ PROD_METALFLAGS := -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime -I. \
 ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime -I. \
 	$(MACOS_TARGET_FLAG)
 ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
-LIB := $(BUILD)/splash.metallib
+LIB := $(BUILD)/slipstream-v2.metallib
 .PHONY: all clean force-build-identity install _install \
 	install-environment _install-environment \
 	platform-check model-selection preflight serve verify-models
@@ -58,7 +58,7 @@ all: $(TARGET)
 
 install: model-selection platform-check
 	@/usr/bin/lockf -k "$(INSTALL_LOCK)" $(MAKE) --no-print-directory \
-		-f "$(SPLASH_MAKEFILE)" _install
+		-f "$(SLIPSTREAM_MAKEFILE)" _install
 
 _install: model-selection _install-environment
 	$(MODEL_INSTALL) --model "$(MODEL)" prepare
@@ -71,7 +71,7 @@ model-selection:
 
 platform-check:
 	@test "$(SYSTEM_NAME)" = Darwin && test "$(SYSTEM_ARCH)" = arm64 || { \
-		echo "error: Splash requires an Apple Silicon Mac" >&2; \
+		echo "error: Slipstream v2 requires an Apple Silicon Mac" >&2; \
 		exit 1; \
 	}
 	@command -v "$(XCRUN)" >/dev/null 2>&1 || { \
@@ -87,7 +87,7 @@ platform-check:
 
 install-environment:
 	@/usr/bin/lockf -k "$(INSTALL_LOCK)" $(MAKE) --no-print-directory \
-		-f "$(SPLASH_MAKEFILE)" _install-environment
+		-f "$(SLIPSTREAM_MAKEFILE)" _install-environment
 
 _install-environment:
 	@set -eu; \
@@ -141,7 +141,7 @@ _install-environment:
 
 preflight: model-selection
 	@test -x $(PYTHON) || { \
-		echo "error: Splash is not installed; run 'make install MODEL=$(MODEL)' first" >&2; \
+		echo "error: Slipstream v2 is not installed; run 'make install MODEL=$(MODEL)' first" >&2; \
 		exit 1; \
 	}
 	@$(MODEL_INSTALL) --model "$(MODEL)" verify
@@ -152,7 +152,7 @@ verify-models: preflight
 	@$(MODEL_INSTALL) --model "$(MODEL)" verify --full
 
 serve: preflight $(TARGET)
-	./splash serve --model "$(MODEL)"
+	./slipstream-v2 serve --model "$(MODEL)"
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -172,9 +172,11 @@ $(METAL_BUILD)/models/%.air: models/%.metal $(KERNEL_HEADERS) \
 
 $(LIB): $(PRODUCTION_AIRS)
 	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
+	@ln -sf $(notdir $@) $(BUILD)/slipstream.metallib
+	@ln -sf $(notdir $@) $(BUILD)/splash.metallib
 
 ENGINE_BUILD := $(BUILD)/engine
-ENGINE_LIBRARY := $(ENGINE_BUILD)/libsplash.a
+ENGINE_LIBRARY := $(ENGINE_BUILD)/libslipstream.a
 ENGINE_LINKFLAGS := -framework Foundation -framework Metal -framework IOKit
 ENGINE_DEPFLAGS := -MMD -MP
 # Configuration belongs to each successful output, not to a shared timestamp:
@@ -301,6 +303,8 @@ $(TARGET): $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) $(LIB) \
 		| $(BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
+	@ln -sf $(notdir $@) $(BUILD)/slipstream
+	@ln -sf $(notdir $@) $(BUILD)/splash
 
 clean:
 	rm -rf $(BUILD)

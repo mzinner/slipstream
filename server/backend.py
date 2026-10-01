@@ -260,7 +260,7 @@ class NativeBackend:
         self.terminals = queue.Queue()
         self.finalizer = threading.Thread(
             target=self._finalize_loop,
-            name="splash-http-finalizer",
+            name="slipstream-v2-http-finalizer",
             daemon=True,
         )
         self.finalizer.start()
@@ -328,7 +328,7 @@ class NativeBackend:
                 return
             thread = threading.Thread(
                 target=self._background_status_refresh,
-                name="splash-status-refresh",
+                name="slipstream-v2-status-refresh",
                 daemon=True,
             )
             self.status_refresh_inflight = True

@@ -1,4 +1,4 @@
-"""Strict Python codec for the Splash native protocol.
+"""Strict Python codec for the Slipstream native protocol.
 
 Wire framing and typed payload validation mirror ``runtime/engine/Protocol.*``.
 """

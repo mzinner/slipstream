@@ -22,17 +22,17 @@ class ClientTests(unittest.TestCase):
         for name in clients.INSTALL_URLS:
             with self.subTest(client=name):
                 argv, env = self.command(
-                    name, env={"SPLASH_API_KEY": "test-server-key"}
+                    name, env={"SLIPSTREAM_V2_API_KEY": "test-server-key"}
                 )
                 self.assertNotIn("test-server-key", " ".join(argv))
                 if name == "claude":
                     self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "test-server-key")
                 elif name == "codex":
-                    self.assertEqual(env["SPLASH_API_KEY"], "test-server-key")
+                    self.assertEqual(env["SLIPSTREAM_V2_API_KEY"], "test-server-key")
                 elif name == "opencode":
                     config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
                     self.assertEqual(
-                        config["provider"]["splash"]["options"]["apiKey"],
+                        config["provider"]["slipstream-v2"]["options"]["apiKey"],
                         "test-server-key",
                     )
                 else:
@@ -143,7 +143,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(config["mcp"], user["mcp"])
         self.assertEqual(config["provider"]["other"], user["provider"]["other"])
         self.assertEqual(config["model"], config["small_model"])
-        provider = config["provider"]["splash"]
+        provider = config["provider"]["slipstream-v2"]
         self.assertEqual(provider["options"]["baseURL"], "http://127.0.0.1:8000/v1")
         self.assertEqual(
             provider["models"]["incoai/Qwen3.6-35B-A3B-Splash"]["limit"]["context"],
@@ -159,7 +159,7 @@ class ClientTests(unittest.TestCase):
             with self.subTest(model=model):
                 argv, env = self.command("opencode", model=model)
                 config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-                model_config = config["provider"]["splash"]["models"][model]
+                model_config = config["provider"]["slipstream-v2"]["models"][model]
                 self.assertEqual(
                     model_config["variants"],
                     {
@@ -186,14 +186,14 @@ class ClientTests(unittest.TestCase):
         }
         user = {
             "agent": {"build": {"variant": "brief", "prompt": "Custom prompt"}},
-            "provider": {"splash": {"models": {model: {"variants": variants}}}},
+            "provider": {"slipstream-v2": {"models": {model: {"variants": variants}}}},
         }
         original = {"OPENCODE_CONFIG_CONTENT": json.dumps(user)}
         before = dict(original)
         args = ["run", "--variant", "none", "A prompt"]
         argv, env = self.command("opencode", env=original, client_args=args)
         config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-        configured = config["provider"]["splash"]["models"][model]["variants"]
+        configured = config["provider"]["slipstream-v2"]["models"][model]["variants"]
         self.assertEqual(configured["none"], {"reasoningEffort": "none"})
         self.assertEqual(configured["medium"], {"reasoningEffort": "medium"})
         self.assertEqual(configured["high"], {"reasoningEffort": "high"})
@@ -211,10 +211,10 @@ class ClientTests(unittest.TestCase):
         user = {
             "agent": {
                 "build": {
-                    "model": "splash/incoai/Qwen3.8-27B-Splash",
+                    "model": "slipstream-v2/incoai/Qwen3.8-27B-Splash",
                     "variant": "off",
                 },
-                "title": {"model": "splash/incoai/Qwen3.8-27B-Splash"},
+                "title": {"model": "slipstream-v2/incoai/Qwen3.8-27B-Splash"},
                 "compaction": {"model": "other/cloud-model", "temperature": 0.2},
                 "reviewer": {"model": "other/model", "prompt": "review"},
             }
@@ -226,7 +226,7 @@ class ClientTests(unittest.TestCase):
         for name in ("build", "plan", "general", "explore", "title", "compaction"):
             self.assertEqual(
                 agents[name]["model"],
-                "splash/incoai/Qwen3.6-35B-A3B-Splash",
+                "slipstream-v2/incoai/Qwen3.6-35B-A3B-Splash",
             )
         self.assertEqual(agents["build"]["variant"], "off")
         self.assertEqual(agents["compaction"]["temperature"], 0.2)
@@ -237,7 +237,7 @@ class ClientTests(unittest.TestCase):
             with self.subTest(context=context):
                 _, env = self.command("opencode", context=context)
                 config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
-                limits = config["provider"]["splash"]["models"][
+                limits = config["provider"]["slipstream-v2"]["models"][
                     "incoai/Qwen3.6-35B-A3B-Splash"
                 ]["limit"]
                 self.assertEqual(limits["context"], context)
@@ -267,8 +267,8 @@ class ClientTests(unittest.TestCase):
         )
         self.assertEqual(settings["model_context_window"], 102400)
         self.assertEqual(settings["model_auto_compact_token_limit"], 92160)
-        self.assertEqual(settings["model_provider"], "splash")
-        provider = settings["model_providers"]["splash"]
+        self.assertEqual(settings["model_provider"], "slipstream-v2")
+        provider = settings["model_providers"]["slipstream-v2"]
         self.assertEqual(provider["wire_api"], "responses")
         self.assertEqual(provider["base_url"], "http://127.0.0.1:8000/v1")
         self.assertEqual(env[provider["env_key"]], "local")
@@ -357,7 +357,7 @@ class ClientTests(unittest.TestCase):
                     argv, _ = self.command("codex", client_args=args)
                     self.assertEqual(argv[-len(prefix) - 1 :], [*prefix, args[-1]])
                     self.assertLess(
-                        argv.index('model_provider="splash"'),
+                        argv.index('model_provider="slipstream-v2"'),
                         argv.index('model_reasoning_effort="low"'),
                     )
                     self.assertNotIn("-c", argv[-len(prefix) - 1 :])
@@ -456,7 +456,7 @@ class ClientLifecycleTests(unittest.TestCase):
                 launcher.parse_args(["serve", "--model", "community/model", *payload])
             self.assertEqual(error.exception.code, 2)
 
-    def test_splash_help_does_not_require_a_server(self):
+    def test_slipstream_v2_help_does_not_require_a_server(self):
         for arguments in (["--help"], ["serve", "--help"]):
             with (
                 self.subTest(arguments=arguments),
@@ -497,7 +497,7 @@ class ClientLifecycleTests(unittest.TestCase):
                         "data": [
                             {
                                 "id": "incoai/Qwen3.6-35B-A3B-Splash",
-                                "owned_by": "splash",
+                                "owned_by": "slipstream-v2",
                             }
                         ]
                     },
@@ -536,7 +536,7 @@ class ClientLifecycleTests(unittest.TestCase):
                 mock.patch("sys.stderr", io.StringIO()) as error,
             ):
                 self.assertEqual(launcher.main(["claude", *payload]), 1)
-            self.assertIn("splash serve", error.getvalue())
+            self.assertIn("slipstream-v2 serve", error.getvalue())
             execute.assert_not_called()
             install.assert_not_called()
 
@@ -613,7 +613,7 @@ class InstalledCodexTests(unittest.TestCase):
                     "-c",
                     'cli_auth_credentials_store="ephemeral"',
                     "-c",
-                    "model_providers.splash.stream_max_retries=1",
+                    "model_providers.slipstream-v2.stream_max_retries=1",
                     "-",
                 ],
             )
@@ -797,7 +797,7 @@ class InstalledCodexTests(unittest.TestCase):
                     # Metadata/update probes may run, but the inference
                     # provider must remain local. The proxy blocks all hosts.
                     self.assertNotIn("api.openai.com:443", external)
-                    self.assertIn("provider: splash", stderr)
+                    self.assertIn("provider: slipstream-v2", stderr)
                     for path, authorization, body in requests:
                         self.assertEqual(path, "/v1/responses")
                         self.assertEqual(authorization, "Bearer local")

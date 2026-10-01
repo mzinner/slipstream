@@ -280,7 +280,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def version_string(self):
-        return "Splash"
+        return "Slipstream-v2"
 
     def do_GET(self):
         path = self.path.partition("?")[0]
@@ -323,7 +323,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 "id": self.app.model,
                 "object": "model",
                 "created": 0,
-                "owned_by": "splash",
+                "owned_by": "slipstream-v2",
             }
             if path == "/v1/models":
                 self._json(200, {"object": "list", "data": [model]})
@@ -437,8 +437,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 )
                 stream_options = None
             elif responses:
+                clamp = getattr(self.server, "clamp_output_budget", False) or bool(
+                    body.get("clamp_output_budget", False)
+                )
                 job, thinking, has_tools = self.app.prepare_responses(
-                    body, deadline=deadline
+                    body, deadline=deadline, clamp_output_budget=clamp
                 )
                 stream_options = None
             else:
@@ -451,7 +454,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     or not isinstance(stream_options.get("include_usage", False), bool)
                 ):
                     raise APIError(400, "invalid streaming options")
-                job, thinking, has_tools = self.app.prepare(body, deadline=deadline)
+                clamp = getattr(self.server, "clamp_output_budget", False) or bool(
+                    body.get("clamp_output_budget", False)
+                )
+                job, thinking, has_tools = self.app.prepare(
+                    body, deadline=deadline, clamp_output_budget=clamp
+                )
             job.return_progress = return_progress
             remaining_request_time(deadline)
             if self._client_disconnected():
@@ -917,7 +925,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         # transport progress. Long prefill and resource waits must not look
         # like dead connections to strict local-agent idle timers.
         self._start_event_stream()
-        self.wfile.write(b": splash-keepalive\n\n")
+        self.wfile.write(b": slipstream-v2-keepalive\n\n")
         self.wfile.flush()
         self._last_sse_write = time.monotonic()
 
@@ -1396,12 +1404,14 @@ class FrontendServer(ThreadingHTTPServer):
         allowed_hosts=(),
         api_key=None,
         webui=True,
+        clamp_output_budget=False,
     ):
         if not is_finite_number(io_timeout) or io_timeout <= 0:
             raise ValueError("io_timeout must be positive and finite")
         self.io_timeout = io_timeout
         self.api_key = validate_api_key(api_key) if api_key is not None else None
         self.webui = webui
+        self.clamp_output_budget = bool(clamp_output_budget)
         self.allowed_hosts = {
             host.lower().rstrip(".")
             for host in (*allowed_hosts, address[0], "localhost", "127.0.0.1", "::1")
@@ -1556,10 +1566,38 @@ def parse_args(argv=None):
     parser.add_argument("--queue-size", type=int, default=32)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--allowed-host", action="append", default=[])
-    parser.add_argument("--api-key", default=os.environ.get("SPLASH_API_KEY"))
+    parser.add_argument(
+        "--api-key",
+        default=(
+            os.environ.get("SLIPSTREAM_V2_API_KEY")
+            or os.environ.get("SLIPSTREAM_API_KEY")
+            or os.environ.get("SPLASH_API_KEY")
+        ),
+    )
     parser.add_argument("--no-webui", action="store_true")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--binary", default=str(ROOT / "build" / "splash"))
+    _bin_v2 = ROOT / "build" / "slipstream-v2"
+    _bin_v1 = ROOT / "build" / "slipstream"
+    _bin_splash = ROOT / "build" / "splash"
+    _default_bin = (
+        _bin_v2 if _bin_v2.exists()
+        else _bin_v1 if _bin_v1.exists()
+        else _bin_splash if _bin_splash.exists()
+        else _bin_v2
+    )
+    parser.add_argument(
+        "--binary",
+        default=str(_default_bin),
+    )
+    parser.add_argument(
+        "--clamp-output-budget",
+        action="store_true",
+        default=(
+            os.environ.get("SLIPSTREAM_CLAMP_OUTPUT_BUDGET", "").lower()
+            in ("1", "true", "yes")
+        ),
+        help="clamp output token budget to remaining context window instead of rejecting with 400",
+    )
     args = parser.parse_args(argv)
     if args.api_key is not None:
         try:
@@ -1614,6 +1652,7 @@ def main():
             allowed_hosts=args.allowed_host,
             api_key=args.api_key,
             webui=not args.no_webui,
+            clamp_output_budget=getattr(args, "clamp_output_budget", False),
         )
         server.server_bind()
         thinking_codec = ThinkingCodec(load_thinking_key())
