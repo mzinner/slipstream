@@ -367,6 +367,11 @@ Blocked on: nothing.
 Identified that `nitinpanj/qwen38-flash-next-v3` has 33,959 downloads and holds the byte-identical 3-shard GGUF weights (matching SHA256) as `Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF`. Updated `README.md`, Desktop pack, and Reddit post draft to point directly to `nitinpanj/qwen38-flash-next-v3` for base model downloads and `nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF` for the new Swift KV-sparse model. Pushed to `origin main`.
 Blocked on: nothing.
 
+## 2026-09-30 22:23 PDT — antigravity
+Restructured Reddit post narrative flow: leads with original V3 model (`nitinpanj/qwen38-flash-next-v3`), explains how anyone can run their existing downloaded model on Slipstream for a 1.76x speedup, presents context scaling benchmarks, and introduces Swift KV-sparsity later as an optional high-reasoning upgrade. Synced `docs/REDDIT_POST.md`, Desktop pack files, and conversation artifact. Pushed to `origin main`.
+Blocked on: nothing.
+
+
 
 
 
