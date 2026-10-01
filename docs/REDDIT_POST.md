@@ -1,18 +1,20 @@
-In my last post (https://www.reddit.com/r/Qwen_AI/comments/1wkd7pm/qwen38flashnext_955_gib_on_a_64gb_mac_at_27_toks/), I shared how I was running the 95.5 GiB Qwen3.8-Flash-Next model on a 64GB Mac at ~27 tok/s using a custom expert-streaming fork of llama.cpp.
+I've been working on getting the 95.5 GiB Qwen3.8-Flash-Next model to run fast on a single 64GB Mac. In my earlier posts, I shared a custom expert-streaming fork of llama.cpp and native 8-bit benchmarks on Splash. It worked, but decode capped out around ~23–27 tok/s and slowed down as context grew.
 
-It worked, but decode capped out around 23–27 tok/s and slowed down past 30k context. 
-
-Over the past few weeks, I built and open-sourced **Slipstream** (https://github.com/npanj/slipstream), a compiled C++ Metal inference engine based on Splash (by Incoai) with native SSD expert streaming and speculative drafting for Apple Silicon.
+Today I'm releasing **Slipstream**: a compiled C++ Metal inference engine with native SSD expert streaming and speculative drafting for Apple Silicon.
 
 **The main result:**
-If you already downloaded my original V3 model ([nitinpanj/qwen38-flash-next-v3](https://huggingface.co/nitinpanj/qwen38-flash-next-v3), 34k+ downloads), you don't need to re-download anything. You can run that exact same checkpoint on Slipstream for a **1.76x speedup: 41–52 tok/s** (up from 23–27 tok/s in llama.cpp) on the same 64GB Mac.
+If you already downloaded my original V3 model (34k+ downloads), you don't need to re-download anything. You can run that exact checkpoint on Slipstream for a **1.76x speedup: 41–52 tok/s** (up from 23.1 tok/s in llama.cpp) on the same 64GB Mac.
 
 Even better: decode speed doesn't collapse at long context. Across 3,086 live requests in real coding sessions, it stays flat at **33–44 tok/s all the way out to 130,000 tokens**.
 
-Everything is open source:
-- **Engine Repo:** https://github.com/npanj/slipstream
-- **Original V3 Model (34k+ downloads):** https://huggingface.co/nitinpanj/qwen38-flash-next-v3
-- **Optional Swift KV-Sparse Model:** https://huggingface.co/nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF
+Previous posts for context:
+- [Qwen3.8-Flash-Next in llama.cpp on r/Qwen_AI](https://www.reddit.com/r/Qwen_AI/comments/1wkd7pm/qwen38flashnext_955_gib_on_a_64gb_mac_at_27_toks/)
+- [Splash Engine native 8-bit on r/LocalLLaMA](https://www.reddit.com/r/LocalLLaMA/comments/1wmbbf9/splash_engine_qwen3827b_in_native_8bit_at_3755/)
+
+Open source resources:
+- [Slipstream Engine on GitHub](https://github.com/npanj/slipstream)
+- [Original V3 Model on Hugging Face (34k+ downloads)](https://huggingface.co/nitinpanj/qwen38-flash-next-v3)
+- [Optional Swift KV-Sparse Model on Hugging Face](https://huggingface.co/nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF)
 
 ---
 
@@ -51,7 +53,7 @@ The server exposes a standard OpenAI-compatible API (`http://127.0.0.1:8090/v1/c
 
 ## 2. Speed: llama.cpp Fork vs. Slipstream (Same V3 Checkpoint)
 
-Here is a direct head-to-head comparison running the exact same 95.5 GiB model files ([`qwen38-flash-next-v3`](https://huggingface.co/nitinpanj/qwen38-flash-next-v3)) across 6 reasoning and coding tasks on the same M5 Pro (64 GB unified memory, temperature 0.0):
+Here is a direct head-to-head comparison running the exact same 95.5 GiB model files across 6 reasoning and coding tasks on the same M5 Pro (64 GB unified memory, temperature 0.0):
 
 | Domain / Task | Prompt Task | llama.cpp Fork | Slipstream | Speedup | llama.cpp TTFT | Slipstream TTFT |
 |---|---|---:|---:|---:|---:|---:|
@@ -101,7 +103,7 @@ Here is actual telemetry collected across **3,086 live requests** during real ag
 
 ## 4. Optional: Swift KV-Sparse Model Variant
 
-If you want higher reasoning accuracy and lower KV cache memory, I also put together a **Swift variant** of this model: [`Swift-Qwen3.8-Flash-Next-V3`](https://huggingface.co/nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF).
+If you want higher reasoning accuracy and lower KV cache memory, I also put together an optional Swift variant of this model: [Swift-Qwen3.8-Flash-Next-V3](https://huggingface.co/nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF).
 
 ### What Swift changes:
 - **KV-Sparse Attention:** Replaces standard dense attention with KV-sparse layers distilled from Swift-1.5, cutting down RAM pressure at long contexts.
@@ -155,7 +157,7 @@ The core primitives in Slipstream:
 
 ## 7. Credits & Upstream
 
-- **Splash Team (Incoai)**: Full credit to the creators of Splash (https://github.com/incoai/splash). Their C++ Metal speculative decoding design and memory architecture provided the foundation for this work. I will prepare a clean PR proposing these Flash-Next and SSD streaming extensions to the Splash upstream repo in case they want to incorporate them.
+- **Splash Team (Incoai)**: Full credit to the creators of [Splash](https://github.com/incoai/splash). Their C++ Metal speculative decoding design and memory architecture provided the foundation for this work. I will prepare a clean PR proposing these Flash-Next and SSD streaming extensions to the Splash upstream repo in case they want to incorporate them.
 - **ds4 Team**: For their insights on Metal router numerical precision (Taylor polynomial softplus expansion) and streaming scheduling designs.
 - **Qwen Team**: For training Qwen3.8-Flash-Next and releasing the hybrid linear MTP architecture.
 - **ukisai**: For the Swift-1.5 distillation work enabling KV-sparse reasoning.

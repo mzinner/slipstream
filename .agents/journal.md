@@ -1,5 +1,14 @@
 # Journal — qwen4exp port
 
+## 2026-10-01 13:17 PDT — antigravity
+
+Refactored Reddit submission post to minimize links and eliminate automated spam-filter triggers:
+1. Removed all raw HTTP URLs from the body; converted all references to clean markdown hyperlinks.
+2. Opening paragraph begins with pure plain text with zero links.
+3. Hyperlinked prior posts naturally into context and consolidated resources into a concise 3-item list.
+4. Synced `SUBMISSION_BODY.md`, `SUBMISSION_BODY.txt`, and `docs/REDDIT_POST.md`.
+Blocked on: nothing.
+
 ## 2026-10-01 06:55 PDT — antigravity
 
 Polished Reddit launch post in Nitin's authentic human developer voice, directly matching the style, cadence, and structure of his previous posts (`1wmbbf9` and `1wkd7pm`).

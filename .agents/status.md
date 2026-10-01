@@ -1,11 +1,11 @@
 # Status — Slipstream (handoff)
 
-**Updated:** 2026-10-01 06:55 PDT by antigravity.
+**Updated:** 2026-10-01 13:17 PDT by antigravity.
 **Branch:** `main` (workspace `slipstream-v2` symlinked to `slipstream`).
 
 ## In one line
 
-Polished Reddit launch post in Nitin's authentic human developer voice (`docs/REDDIT_POST.md` and Desktop pack), clarified inline image strategy (Image 1, 2, 3 inline; discard composite Image 4), verified public GitHub repo and Hugging Face checkpoints. Server is stopped with 50+ GiB free RAM.
+Refactored Reddit submission (`docs/REDDIT_POST.md` and Desktop pack): zero links in opening paragraph, converted all references to clean markdown hyperlinks, removed raw URLs to avoid automated spam filters. Server is stopped with 50+ GiB free RAM.
 
 ---
 
