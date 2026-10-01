@@ -415,9 +415,16 @@ def prepare_gguf_model(
     tokenizer_dir.mkdir(parents=True, exist_ok=True)
 
     if sidecar_path is None:
-        default_sidecar = Path.home() / "models/qwen38-flash-next-mtp/mtp-shared-Q4_K_M.gguf"
-        if default_sidecar.exists():
-            sidecar_path = default_sidecar
+        candidates = [
+            model_dir / "MTP/mtp-shared-Q4_K_M.gguf",
+            model_dir / "mtp-shared-Q4_K_M.gguf",
+            Path.home() / "models/qwen38-flash-next-mtp/mtp-shared-Q4_K_M.gguf",
+            Path.home() / "models/qwen38-flash-next-v3/MTP/mtp-shared-Q4_K_M.gguf",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                sidecar_path = candidate
+                break
 
     if reference_dir is None:
         for candidate in [
@@ -485,6 +492,18 @@ def prepare_gguf_model(
             mtp_comb_file = str(target_dir / "mtp-combiner.bin")
             tasks.append(executor.submit(convert_mtp_layer, str(model_dir), str(sidecar_path), mtp_layer_file))
             tasks.append(executor.submit(convert_mtp_combiner, str(model_dir), str(sidecar_path), mtp_comb_file))
+        elif reference_dir:
+            ref_path = Path(reference_dir)
+            for mtp_name in ["mtp-layer.bin", "mtp-combiner.bin"]:
+                src = ref_path / f"target/{mtp_name}"
+                dst = target_dir / mtp_name
+                if src.exists() and not dst.exists():
+                    try:
+                        os.link(src, dst)
+                        print(f"Linked {mtp_name} from {src} (0 extra bytes)")
+                    except Exception:
+                        shutil.copyfile(src, dst)
+                        print(f"Copied {mtp_name} from {src}")
 
         # Head & Embedding
         head_file = str(target_dir / "head.bin")
