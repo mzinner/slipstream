@@ -1,11 +1,11 @@
 # Status — Slipstream (handoff)
 
-**Updated:** 2026-09-30 21:45 PDT by antigravity.
+**Updated:** 2026-10-01 06:55 PDT by antigravity.
 **Branch:** `main` (workspace `slipstream-v2` symlinked to `slipstream`).
 
 ## In one line
 
-Prepared public Reddit launch post (`docs/REDDIT_POST.md`), generated 130k context scaling and benchmark plot (`docs/context_scaling_and_benchmark.png`), renamed older workspace to `slipstream-orig`, and symlinked `slipstream -> slipstream-v2`. Server is stopped and idle with 50+ GiB free RAM.
+Polished Reddit launch post in Nitin's authentic human developer voice (`docs/REDDIT_POST.md` and Desktop pack), clarified inline image strategy (Image 1, 2, 3 inline; discard composite Image 4), verified public GitHub repo and Hugging Face checkpoints. Server is stopped with 50+ GiB free RAM.
 
 ---
 

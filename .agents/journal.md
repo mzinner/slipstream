@@ -1,6 +1,12 @@
 # Journal — qwen4exp port
 
-## 2026-09-30 20:25 PDT — antigravity
+## 2026-10-01 06:55 PDT — antigravity
+
+Polished Reddit launch post in Nitin's authentic human developer voice, directly matching the style, cadence, and structure of his previous posts (`1wmbbf9` and `1wkd7pm`).
+Clarified image strategy: discarded the redundant 3-in-1 composite image (`4_slipstream_combined_infographic.png`) in favor of inserting the 3 individual high-res charts inline next to their respective sections.
+Updated `SUBMISSION_BODY.md`, `SUBMISSION_BODY.txt`, `TITLE.txt`, and `docs/REDDIT_POST.md`. Verified all benchmarks, repo links, and Hugging Face paths. Port 8090 server remains stopped.
+Blocked on: nothing.
+
 
 Investigated and resolved context overflow (HTTP 400 `context_length_exceeded`) during long autonomous `omp` session.
 1. In `server/server.py` and `server/frontend.py`, added `--clamp-output-budget` CLI flag and request-level fallback for `/v1/chat/completions` and `/v1/responses`, dynamically truncating `max_new_tokens` to fit remaining context instead of throwing HTTP 400. Added flag to `~/models/bin/splash-flashnext-server.sh`.
