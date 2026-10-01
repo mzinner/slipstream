@@ -14,8 +14,8 @@ Everything is open source under Apache-2.0.
 
 | Model Variant | HF Checkpoint (GGUF) | Active / Total Weights | Reasoning (Scorecard) | Peak Speed | RAM Needed |
 |---|---|---:|---:|---:|---:|
-| **Swift-Flash-Next V3** *(Recommended)* | [nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF](https://huggingface.co/nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF) | 7.3B / 125.7B | **70.3%** (GPQA 54.3%, MATH 62.9%) | **41–52 tok/s** | 64 GB Mac |
-| **Plain Flash-Next V3** | [nitinpanj/Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF](https://huggingface.co/nitinpanj/Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF) | 7.3B / 125.7B | **67.6%** (GPQA 45.7%, MATH 60.0%) | **40–48 tok/s** | 64 GB Mac |
+| **Swift-Flash-Next V3** *(New KV-Sparse)* | [nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF](https://huggingface.co/nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF) | 7.3B / 125.7B | **70.3%** (GPQA 54.3%, MATH 62.9%) | **41–52 tok/s** | 64 GB Mac |
+| **Qwen3.8-Flash-Next V3** *(34k+ Downloads)* | [nitinpanj/qwen38-flash-next-v3](https://huggingface.co/nitinpanj/qwen38-flash-next-v3) | 7.3B / 125.7B | **67.6%** (GPQA 45.7%, MATH 60.0%) | **40–48 tok/s** | 64 GB Mac |
 
 - **Frontier Reasoning on a Laptop:** Outperforms standard 27B dense models on GPQA Diamond (54.3% vs 45.7%) and MATH-500 (62.9% vs 60.0%), with 92% on HumanEval and 96% on GSM8K.
 - **Fast Generation:** 41–52 tok/s sustained decode on an M5 Pro (64 GB).
@@ -60,7 +60,7 @@ HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download nitinpanj/Swift-Qwen3.8-Fla
 
 *(Alternative: If you prefer the plain dense base model without Swift KV-sparsity:)*
 ```zsh
-huggingface-cli download nitinpanj/Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF \
+huggingface-cli download nitinpanj/qwen38-flash-next-v3 \
     --local-dir ~/models/qwen38-flash-next-v3
 ```
 

@@ -13,8 +13,8 @@ The takeaway first:
 
 Everything is open source:
 - **Engine Repo:** [github.com/npanj/slipstream](https://github.com/npanj/slipstream)
-- **Base Model (GGUF):** [huggingface.co/nitinpanj/Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF](https://huggingface.co/nitinpanj/Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF)
-- **Swift KV-Sparse Model (GGUF):** [huggingface.co/nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF](https://huggingface.co/nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF)
+- **Swift KV-Sparse Model (GGUF, Recommended):** [huggingface.co/nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF](https://huggingface.co/nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF)
+- **Base Model (GGUF, 34k+ downloads):** [huggingface.co/nitinpanj/qwen38-flash-next-v3](https://huggingface.co/nitinpanj/qwen38-flash-next-v3)
 
 *(Note on naming: This is the codebase previously developed as slipstream-v2, now published cleanly as Slipstream. The earlier experimental tree has been archived locally as slipstream-orig).*
 
@@ -131,8 +131,8 @@ make -j4
 huggingface-cli download nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF \
     --local-dir ~/models/swift-qwen38-flash-next-v3
 
-# Option B: Plain base model
-huggingface-cli download nitinpanj/Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF \
+# Option B: Plain base model (34k+ downloads)
+huggingface-cli download nitinpanj/qwen38-flash-next-v3 \
     --local-dir ~/models/qwen38-flash-next-v3
 ```
 
