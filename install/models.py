@@ -15,6 +15,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -64,6 +66,28 @@ RETIRED_FORMATS = {
 
 class ModelError(RuntimeError):
     pass
+
+
+class GgufRepository(ModelError):
+    """The repository holds GGUF shards rather than a runtime package."""
+
+    def __init__(self, model_id: str, revision: str, files: dict[str, int]):
+        super().__init__(f"{model_id} is a GGUF repository")
+        self.model_id, self.revision, self.files = model_id, revision, files
+
+
+# A GGUF repository is installed as a real folder: its shards, the MTP head, and
+# the package the launcher prepares from them in prepared/. The marker pins the
+# Hub revision, so a resumed download never mixes two commits and a prepared
+# package never goes stale under an updated repository.
+GGUF_MARKER = ".slipstream-gguf.json"
+# Speculative drafting needs Qwen3.8-Flash-Next's MTP head, which most GGUF
+# repositories (the Swift variant's among them) leave out. This copy is
+# converted from the original model, so it drafts for every Flash-Next GGUF.
+MTP_SIDECAR = "MTP/mtp-shared-Q4_K_M.gguf"
+MTP_REPO = "nitinpanj/qwen38-flash-next-v3"
+MTP_REVISION = "e2982050848c67fe8aa9073e8c4205d272cc4f20"
+MTP_SIZE = 1907151936
 
 
 def is_hex_digest(value, length: int) -> bool:
@@ -305,7 +329,13 @@ def _download_snapshot(model_id: str, token):
             (item for item in info.siblings if item.rfilename == "manifest.json"), None
         )
         if manifest_file is None:
-            raise ModelError("repository has no Splash runtime package manifest.json")
+            files = {item.rfilename: item.size for item in info.siblings}
+            if any(_is_gguf_shard(name) for name in files):
+                raise GgufRepository(model_id, info.sha, files)
+            raise ModelError(
+                "repository has neither a Splash runtime package manifest.json "
+                "nor GGUF files"
+            )
         if (
             type(manifest_file.size) is not int
             or not 0 < manifest_file.size <= MAX_MANIFEST_BYTES
@@ -389,16 +419,36 @@ def _cached_snapshot(model_id):
     return snapshot.resolve()
 
 
-def resolve_snapshot(model_id: str):
-    validate_repo_id(model_id)
+def _hub_token():
     try:
         from huggingface_hub import get_token
-        from huggingface_hub.errors import HfHubHTTPError
     except ImportError as error:
         raise ModelError(
             "missing dependency huggingface_hub; reinstall Splash"
         ) from error
-    token = os.environ.get("HF_TOKEN") or get_token()
+    return os.environ.get("HF_TOKEN") or get_token()
+
+
+def _hub_error(error: Exception, token, what: str) -> ModelError:
+    from huggingface_hub.errors import HfHubHTTPError
+
+    message = str(error)
+    if token:
+        message = message.replace(token, "[redacted]")
+    if (
+        isinstance(error, HfHubHTTPError)
+        and error.response is not None
+        and error.response.status_code in (401, 403)
+    ):
+        message += (
+            "; set HF_TOKEN or run 'hf auth login' with access to this repository"
+        )
+    return ModelError(f"could not download {what}: {message}")
+
+
+def resolve_snapshot(model_id: str):
+    validate_repo_id(model_id)
+    token = _hub_token()
     import httpx
     from huggingface_hub.errors import OfflineModeIsEnabled
 
@@ -411,20 +461,122 @@ def resolve_snapshot(model_id: str):
                 return cached
         if isinstance(error, ModelError):
             raise
-        message = str(error)
-        if token:
-            message = message.replace(token, "[redacted]")
-        if (
-            isinstance(error, HfHubHTTPError)
-            and error.response is not None
-            and error.response.status_code in (401, 403)
-        ):
-            message += (
-                "; set HF_TOKEN or run 'hf auth login' with access to this repository"
-            )
-        raise ModelError(
-            f"could not download Splash runtime package {model_id}@main: {message}"
+        raise _hub_error(
+            error, token, f"Splash runtime package {model_id}@main"
         ) from error
+
+
+def _is_gguf_shard(name: str) -> bool:
+    # The converter reads the shards at the top of the folder; MTP/ holds the
+    # draft head, which it finds by name.
+    return "/" not in name and name.endswith(".gguf")
+
+
+def is_gguf_installation(root: Path) -> bool:
+    return not root.is_symlink() and (root / GGUF_MARKER).is_file()
+
+
+def gguf_prepared(root: Path) -> bool:
+    """Whether the launcher has already prepared a package from the shards."""
+    return (root / "prepared/manifest.json").is_file() and (
+        root / "prepared/target/layer-0.bin"
+    ).is_file()
+
+
+def _missing_bytes(root: Path, files: dict[str, int]) -> int:
+    missing = 0
+    for name, size in files.items():
+        path = root / name
+        if not (path.is_file() and path.stat().st_size == size):
+            missing += size or 0
+    return missing
+
+
+def install_gguf(found: GgufRepository, root: Path):
+    """Download a GGUF repository's shards, and the MTP head it lacks, into root."""
+    from huggingface_hub import hf_hub_download, snapshot_download
+
+    model_id = found.model_id
+    shards = {n: s for n, s in found.files.items() if _is_gguf_shard(n)}
+    wanted = dict(shards)
+    has_mtp = MTP_SIDECAR in found.files
+    if has_mtp:
+        wanted[MTP_SIDECAR] = found.files[MTP_SIDECAR]
+
+    marker = root / GGUF_MARKER
+    if is_gguf_installation(root):
+        recorded = read_json(marker)
+        revision = recorded.get("revision")
+        if recorded.get("model") != model_id or not is_hex_digest(revision, 40):
+            raise ModelError(f"{marker} does not describe {model_id}")
+    else:
+        revision = found.revision
+    if revision != found.revision:
+        # The listing describes main; the pinned commit's files may differ.
+        from huggingface_hub import HfApi
+
+        token = _hub_token()
+        info = HfApi(endpoint=HUB_ENDPOINT, token=token or False).model_info(
+            model_id, revision=revision, files_metadata=True
+        )
+        files = {item.rfilename: item.size for item in info.siblings}
+        return install_gguf(GgufRepository(model_id, revision, files), root)
+
+    needed = _missing_bytes(root, wanted)
+    if not has_mtp:
+        needed += _missing_bytes(root, {MTP_SIDECAR: MTP_SIZE})
+    if not gguf_prepared(root):
+        # The prepared package is about as large as the shards.
+        needed += sum(size or 0 for size in shards.values())
+    root.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(root).free
+    if needed > free:
+        raise ModelError(
+            f"{model_id} needs {needed / 2**30:.1f} GiB more disk space "
+            f"(shards plus the package prepared from them); {free / 2**30:.1f} GiB is free"
+        )
+    marker.write_text(json.dumps({"model": model_id, "revision": revision}) + "\n")
+
+    token = _hub_token()
+    common = {"repo_type": "model", "token": token or False, "endpoint": HUB_ENDPOINT}
+    total = sum(size or 0 for size in wanted.values())
+    print(
+        f"Downloading {model_id} ({len(shards)} GGUF files, {total / 2**30:.1f} GiB) "
+        f"into {root}",
+        flush=True,
+    )
+    try:
+        snapshot_download(
+            repo_id=model_id,
+            revision=revision,
+            local_dir=root,
+            allow_patterns=sorted(wanted),
+            **common,
+        )
+    except Exception as error:
+        raise _hub_error(error, token, f"{model_id}@{revision[:12]}") from error
+    if not has_mtp:
+        print(
+            f"{model_id} has no MTP draft head; fetching {MTP_SIDECAR} from {MTP_REPO} "
+            "for speculative drafting",
+            flush=True,
+        )
+        try:
+            hf_hub_download(
+                repo_id=MTP_REPO,
+                filename=MTP_SIDECAR,
+                revision=MTP_REVISION,
+                local_dir=root,
+                **common,
+            )
+        except Exception as error:
+            raise _hub_error(error, token, f"the MTP head from {MTP_REPO}") from error
+        wanted[MTP_SIDECAR] = MTP_SIZE
+    for name, size in wanted.items():
+        path = root / name
+        if not path.is_file() or (size is not None and path.stat().st_size != size):
+            raise ModelError(f"downloaded file has the wrong size: {path}")
+    print(f"Downloaded {model_id}", flush=True)
 
 
 @contextmanager
@@ -461,12 +613,43 @@ def install_snapshot(snapshot: Path, destination: Path):
         stage.rmdir()
 
 
+def _exclude_from_backups(models: Path):
+    # Every model can be downloaded again, and the store holds hundreds of
+    # gigabytes. The exclusion is sticky (an extended attribute) and needs no
+    # administrator rights; a failure only means Time Machine backs it up.
+    try:
+        subprocess.run(
+            ["tmutil", "addexclusion", str(models)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def prepare(args):
     validate_repo_id(args.model)
     models = args.models.resolve()
-    models.mkdir(parents=True, exist_ok=True)
+    if not models.is_dir():
+        models.mkdir(parents=True, exist_ok=True)
+        _exclude_from_backups(models)
     root = installed_root(models, args.model)
     with installation_lock(models):
+        if is_gguf_installation(root):
+            if gguf_prepared(root):
+                print(f"GGUF model {args.model} is already installed in {root}")
+                return
+            # An interrupted download resumes at the commit it started from.
+            print(f"Resuming the download of {args.model} into {root}", flush=True)
+            try:
+                resolve_snapshot(args.model)
+            except GgufRepository as found:
+                install_gguf(found, root)
+                return
+            raise ModelError(
+                f"{args.model} is no longer a GGUF repository; move {root} aside"
+            )
         try:
             _snapshot_revision(root.resolve(), args.model)
             manifest = validate_package_manifest(root / "manifest.json")
@@ -480,7 +663,13 @@ def prepare(args):
                 f"Installing {args.model}; missing artifacts will be downloaded.",
                 flush=True,
             )
-            snapshot = resolve_snapshot(args.model)
+            try:
+                snapshot = resolve_snapshot(args.model)
+            except GgufRepository as found:
+                if root.is_symlink():
+                    root.unlink()
+                install_gguf(found, root)
+                return
             ref = _retain_snapshot_ref(snapshot, args.model, root)
             install_snapshot(snapshot, root)
             manifest = validate_package_manifest(root / "manifest.json")

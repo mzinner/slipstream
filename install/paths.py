@@ -1,11 +1,17 @@
 """Immutable program files and writable per-user data, for source or release."""
 
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGED = (ROOT / "release.json").is_file()
 DATA = Path.home() / "Library/Application Support/Slipstream-v2" if PACKAGED else ROOT
-MODELS = DATA / "models" if PACKAGED else ROOT / "install/models"
+# One model store for every installation, source or release, and for the
+# menubar app, so a model is downloaded once. SLIPSTREAM_MODELS moves it, e.g.
+# to an external disk.
+MODELS = Path(
+    os.environ.get("SLIPSTREAM_MODELS") or Path.home() / ".slipstream/models"
+).expanduser()
 RUNTIME = DATA / "runtime" if PACKAGED else ROOT / "build/runtime"
 PYTHON = ROOT / ("python/bin/python3" if PACKAGED else ".venv/bin/python")
 _V2_BIN = ROOT / ("engine/slipstream-v2" if PACKAGED else "build/slipstream-v2")

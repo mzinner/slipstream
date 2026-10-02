@@ -16,7 +16,7 @@ BUILD_ID_PYTHON ?= python3
 SLIPSTREAM_MAKEFILE := $(abspath $(firstword $(MAKEFILE_LIST)))
 MODEL_INSTALL = $(PYTHON) install/models.py
 MODEL ?=
-MODEL_ROOT := install/models/$(MODEL)
+MODEL_ROOT := $(or $(SLIPSTREAM_MODELS),$(HOME)/.slipstream/models)/$(MODEL)
 
 BUILD := build
 TARGET := $(BUILD)/slipstream-v2

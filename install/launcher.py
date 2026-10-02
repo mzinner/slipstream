@@ -88,6 +88,23 @@ def _ensure_installed(model_id):
         raise LauncherError("model download or verification failed")
 
 
+def _prepare_gguf(model_path):
+    """Convert a folder of GGUF shards into model_path/prepared, once."""
+    prepared_dir = model_path / "prepared"
+    if not model_artifacts.gguf_prepared(model_path):
+        print(f"[Slipstream] Preparing GGUF model from {model_path}...", flush=True)
+        # A separate process: install/models.py, imported above as
+        # `models`, would shadow the repo's models/ package here.
+        converter = ROOT / "models/qwen4exp/tools/convert_qwen4exp_gguf.py"
+        prepared = subprocess.run(
+            [str(paths.PYTHON), "-u", str(converter),
+             "--model-dir", str(model_path), "--output", str(prepared_dir)]
+        )
+        if prepared.returncode != 0:
+            raise LauncherError(f"preparing {model_path} failed; see the output above")
+    return prepared_dir
+
+
 def _serve_lock_owner(lock):
     try:
         lock.seek(0)
@@ -148,21 +165,7 @@ def serve(args):
         if model_path.is_dir():
             gguf_files = list(model_path.glob("*.gguf"))
             if gguf_files:
-                prepared_dir = model_path / "prepared"
-                manifest_path = prepared_dir / "manifest.json"
-                layer0_path = prepared_dir / "target/layer-0.bin"
-                if not (manifest_path.exists() and layer0_path.exists()):
-                    print(f"[Slipstream] Preparing GGUF model from {model_path}...", flush=True)
-                    # A separate process: install/models.py, imported above as
-                    # `models`, would shadow the repo's models/ package here.
-                    converter = ROOT / "models/qwen4exp/tools/convert_qwen4exp_gguf.py"
-                    prepared = subprocess.run(
-                        [str(paths.PYTHON), "-u", str(converter),
-                         "--model-dir", str(model_path), "--output", str(prepared_dir)]
-                    )
-                    if prepared.returncode != 0:
-                        raise LauncherError(f"preparing {model_path} failed; see the output above")
-                root = prepared_dir
+                root = _prepare_gguf(model_path)
                 model_id = f"local/{model_path.name}"
             elif (model_path / "manifest.json").exists():
                 root = model_path
@@ -172,6 +175,8 @@ def serve(args):
         else:
             _ensure_installed(args.model)
             root = model_artifacts.installed_root(paths.MODELS, args.model)
+            if model_artifacts.is_gguf_installation(root):
+                root = _prepare_gguf(root)
             model_id = args.model
         command = [
             str(paths.PYTHON),

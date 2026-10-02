@@ -31,6 +31,8 @@ class ModelArtifactTest(unittest.TestCase):
         for patch in (
             mock.patch.dict(artifacts.os.environ, {}, clear=True),
             mock.patch("huggingface_hub.get_token", return_value=None),
+            # Nor touch Time Machine settings.
+            mock.patch.object(artifacts, "_exclude_from_backups"),
         ):
             patch.start()
             self.addCleanup(patch.stop)
@@ -719,6 +721,129 @@ class ModelArtifactTest(unittest.TestCase):
             artifacts.prepare(SimpleNamespace(models=models, model=self.MODEL_ID))
         self.download.assert_not_called()
         self.assertTrue(destination.is_dir())
+
+    SHARDS = {"Model-00001-of-00002.gguf": 7, "Model-00002-of-00002.gguf": 5}
+
+    def configure_gguf_hub(self, files, revision=None):
+        self.api.return_value.model_info.return_value = SimpleNamespace(
+            sha=revision or self.REVISION,
+            siblings=[
+                SimpleNamespace(rfilename=name, size=size)
+                for name, size in {"README.md": 3, **files}.items()
+            ],
+        )
+
+        def snapshot_download(*, local_dir, allow_patterns, **_):
+            for name in allow_patterns:
+                path = Path(local_dir) / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"\0" * files[name])
+            return str(local_dir)
+
+        def hf_hub_download(*, filename, local_dir, **_):
+            path = Path(local_dir) / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"\0" * 4)
+            return str(path)
+
+        self.download.side_effect = snapshot_download
+        self.manifest_download.side_effect = hf_hub_download
+
+    def prepare_gguf(self, models):
+        with (
+            mock.patch.object(artifacts, "MTP_SIZE", 4),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            artifacts.prepare(SimpleNamespace(models=models, model=self.MODEL_ID))
+
+    def test_gguf_repository_is_downloaded_with_the_mtp_head_it_lacks(self):
+        self.configure_gguf_hub(self.SHARDS)
+        models = self.root / "models"
+        self.prepare_gguf(models)
+        root = models.resolve() / self.MODEL_ID
+        self.assertTrue(artifacts.is_gguf_installation(root))
+        self.assertEqual(
+            json.loads((root / artifacts.GGUF_MARKER).read_text()),
+            {"model": self.MODEL_ID, "revision": self.REVISION},
+        )
+        self.download.assert_called_once_with(
+            repo_id=self.MODEL_ID,
+            revision=self.REVISION,
+            local_dir=root,
+            allow_patterns=sorted(self.SHARDS),
+            repo_type="model",
+            token=False,
+            endpoint=artifacts.HUB_ENDPOINT,
+        )
+        self.manifest_download.assert_called_once_with(
+            repo_id=artifacts.MTP_REPO,
+            filename=artifacts.MTP_SIDECAR,
+            revision=artifacts.MTP_REVISION,
+            local_dir=root,
+            repo_type="model",
+            token=False,
+            endpoint=artifacts.HUB_ENDPOINT,
+        )
+        self.assertTrue((root / artifacts.MTP_SIDECAR).is_file())
+        self.assertFalse(artifacts.gguf_prepared(root))
+
+    def test_gguf_repository_with_its_own_mtp_head_needs_no_other(self):
+        files = {**self.SHARDS, artifacts.MTP_SIDECAR: 4}
+        self.configure_gguf_hub(files)
+        models = self.root / "models"
+        self.prepare_gguf(models)
+        self.assertEqual(
+            self.download.call_args.kwargs["allow_patterns"], sorted(files)
+        )
+        self.manifest_download.assert_not_called()
+
+    def test_prepared_gguf_installation_is_reused_without_the_network(self):
+        self.configure_gguf_hub(self.SHARDS)
+        models = self.root / "models"
+        self.prepare_gguf(models)
+        root = models / self.MODEL_ID
+        for name in ("prepared/manifest.json", "prepared/target/layer-0.bin"):
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
+            (root / name).write_text("{}")
+        self.api.reset_mock()
+        self.download.reset_mock()
+        self.prepare_gguf(models)
+        self.api.assert_not_called()
+        self.download.assert_not_called()
+
+    def test_interrupted_gguf_download_resumes_at_its_own_commit(self):
+        self.configure_gguf_hub(self.SHARDS)
+        models = self.root / "models"
+        self.prepare_gguf(models)
+        root = models / self.MODEL_ID
+        (root / "Model-00002-of-00002.gguf").unlink()
+        self.configure_gguf_hub(self.SHARDS, revision="b" * 40)
+        self.download.reset_mock()
+        self.prepare_gguf(models)
+        self.assertEqual(self.download.call_args.kwargs["revision"], self.REVISION)
+        self.assertEqual(
+            self.api.return_value.model_info.call_args.kwargs["revision"],
+            self.REVISION,
+        )
+        self.assertTrue((root / "Model-00002-of-00002.gguf").is_file())
+
+    def test_gguf_download_needs_room_for_the_prepared_package(self):
+        self.configure_gguf_hub(self.SHARDS)
+        models = self.root / "models"
+        with (
+            mock.patch.object(
+                artifacts.shutil, "disk_usage", return_value=SimpleNamespace(free=20)
+            ),
+            self.assertRaisesRegex(artifacts.ModelError, "more disk space"),
+        ):
+            self.prepare_gguf(models)
+        self.download.assert_not_called()
+
+    def test_repository_without_package_or_gguf_names_both(self):
+        self.configure_gguf_hub({"model.safetensors": 9})
+        with self.assertRaisesRegex(artifacts.ModelError, "nor GGUF files"):
+            self.prepare_gguf(self.root / "models")
+        self.download.assert_not_called()
 
     def test_existing_canonical_snapshot_repairs_missing_ref_offline(self):
         snapshot, _ = self.package_fixture()
