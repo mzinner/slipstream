@@ -21,6 +21,9 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, default=CATALOG)
     args = parser.parse_args(argv)
 
+    if catalog.COLLECTION is None:
+        print("No model collection is configured; the catalog is left as it is.")
+        return
     if not catalog.refresh(destination=args.output):
         raise SystemExit(f"could not refresh the catalog from {catalog.COLLECTION}")
     model_ids = args.output.read_text(encoding="utf-8").splitlines()

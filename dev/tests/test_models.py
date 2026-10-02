@@ -52,7 +52,7 @@ class ModelArtifactTest(unittest.TestCase):
             file.seek(artifacts.ALIGNMENT - 1)
             file.write(b"\0")
 
-    def package_fixture(self, *, schema=3, model_id=None, revision=None):
+    def package_fixture(self, *, schema=5, model_id=None, revision=None):
         self.fixture_number += 1
         snapshot = (
             self.root
@@ -236,8 +236,8 @@ class ModelArtifactTest(unittest.TestCase):
         with self.assertRaisesRegex(artifacts.ModelError, "checksum changed"):
             artifacts.verify_installed(models, model_id=self.MODEL_ID, full=True)
 
-    def test_accepts_all_formats_with_arbitrary_display_name_and_metadata(self):
-        for schema in (3, 4, 5):
+    def test_accepts_the_qwen4exp_format_with_arbitrary_display_name_and_metadata(self):
+        for schema in (5,):
             with self.subTest(schema=schema):
                 snapshot, manifest = self.package_fixture(schema=schema)
                 # Aggregate digest algorithms and descriptive metadata are producer-owned.
@@ -272,8 +272,21 @@ class ModelArtifactTest(unittest.TestCase):
                     artifacts.resolve_snapshot(self.MODEL_ID)
                 self.download.assert_not_called()
 
-    def test_format_magic_and_moe_architecture_are_checked(self):
-        for schema, target_architecture in ((4, "qwen3_5_moe"), (5, "qwen4exp")):
+    def test_retired_splash_formats_are_refused_before_downloading_weights(self):
+        # Splash 1.0 packages: the launcher used to accept them, and the v2 engine
+        # then failed with "unsupported weight format" after the download.
+        for schema in (3, 4):
+            with self.subTest(schema=schema):
+                snapshot, _ = self.package_fixture(schema=schema)
+                with self.assertRaisesRegex(artifacts.ModelError, "Splash 1.0"):
+                    artifacts.validate_package_manifest(snapshot / "manifest.json")
+                self.configure_hub(snapshot)
+                with self.assertRaisesRegex(artifacts.ModelError, "Splash 1.0"):
+                    artifacts.resolve_snapshot(self.MODEL_ID)
+                self.download.assert_not_called()
+
+    def test_format_magic_and_architecture_are_checked(self):
+        for schema, target_architecture in ((5, "qwen4exp"),):
             snapshot, original = self.package_fixture(schema=schema)
             for section, key, value in (
                 ("format", "target_layer_magic", "WRONG"),
@@ -297,10 +310,9 @@ class ModelArtifactTest(unittest.TestCase):
             del manifest_ok
 
     def test_manifest_must_list_every_file_the_runtime_reads(self):
-        for schema in (3, 4, 5):
+        for schema in (5,):
             snapshot, original = self.package_fixture(schema=schema)
-            last_target = {3: 63, 4: 39, 5: 47}[schema]
-            last_draft = {3: 4, 4: 5, 5: 4}[schema]
+            last_target, last_draft = 47, 4
             names = [
                 "target/embedding.bin",
                 "target/head.bin",
@@ -636,10 +648,10 @@ class ModelArtifactTest(unittest.TestCase):
             artifacts.install_snapshot(snapshot, destination)
 
     def test_legacy_packages_are_preserved_and_never_given_an_official_id(self):
-        model_id = "incoai/Qwen3.6-35B-A3B-Splash"
+        model_id = "community/Qwen3.8-Flash-Next-Splash"
         for kind in ("directory", "absolute link", "relative link"):
             with self.subTest(kind=kind):
-                old, manifest = self.package_fixture(schema=4)
+                old, manifest = self.package_fixture()
                 manifest["draft"]["dummy"] = True
                 self.write_manifest(old, manifest)
                 models = self.root / f"models-{self.fixture_number}"
@@ -655,7 +667,7 @@ class ModelArtifactTest(unittest.TestCase):
                         target_is_directory=True,
                     )
                 expected = (legacy / "manifest.json").read_bytes()
-                official, _ = self.package_fixture(schema=4, model_id=model_id)
+                official, _ = self.package_fixture(model_id=model_id)
                 self.configure_hub(official)
                 args = SimpleNamespace(models=models, model=model_id)
                 output = io.StringIO()

@@ -33,8 +33,11 @@ else:  # Executed directly, e.g. `python install/catalog.py --refresh`.
 
     from models import ModelError, validate_repo_id
 
-# The collection is the source of truth for which packages are official.
-COLLECTION = "incoai/splash-6aac69afeba907af0511ec14"
+# The collection is the source of truth for which packages are official. None:
+# Slipstream v2 has published no packages yet. The Splash collection
+# (incoai/splash-6aac69afeba907af0511ec14) lists only Splash 1.0 packages, which
+# the v2 engine cannot load, so it is no longer read.
+COLLECTION = None
 HUB_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
 
 BUNDLED = paths.ROOT / "install/completions/official-models.txt"
@@ -83,6 +86,8 @@ def is_stale(now: float | None = None) -> bool:
 
 
 def _fetch(timeout: float) -> list[str]:
+    if COLLECTION is None:
+        return []
     # The Hub's JSON API is used directly rather than through huggingface_hub:
     # it gives a hard timeout, and keeps a background refresh independent of
     # the download stack.
@@ -166,7 +171,7 @@ def spawn_refresh() -> None:
     be a thread. It is deliberately fire-and-forget: the caller never learns
     the outcome, and a failure is indistinguishable from not having run.
     """
-    if not is_stale():
+    if COLLECTION is None or not is_stale():
         return
     try:
         subprocess.Popen(
@@ -191,7 +196,9 @@ def main(argv=None) -> int:
     parser.add_argument("--list", action="store_true", help="print known model IDs")
     args = parser.parse_args(argv)
 
-    if args.refresh or args.output:
+    if (args.refresh or args.output) and COLLECTION is None:
+        print("no model collection is configured; nothing to refresh", file=sys.stderr)
+    elif args.refresh or args.output:
         if not (args.force or args.output or is_stale()):
             return 0
         if not refresh(destination=args.output):

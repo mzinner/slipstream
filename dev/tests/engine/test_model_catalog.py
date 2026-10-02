@@ -19,7 +19,11 @@ class ModelCatalogTests(unittest.TestCase):
         self.output = self.root / "cache/models.txt"
         self.bundled = self.root / "bundled.txt"
         self.bundled.write_text("company/Bundled\n")
-        for name, value in (("CACHE", self.output), ("BUNDLED", self.bundled)):
+        for name, value in (
+            ("CACHE", self.output),
+            ("BUNDLED", self.bundled),
+            ("COLLECTION", "company/collection-0123"),
+        ):
             patch = mock.patch.object(catalog, name, value)
             patch.start()
             self.addCleanup(patch.stop)
@@ -98,6 +102,25 @@ class ModelCatalogTests(unittest.TestCase):
         self.response({"items": [{"type": "model", "id": "company/New"}]})
         self.assertTrue(catalog.refresh())
         self.assertEqual(catalog.official_ids(), ["company/Bundled", "company/New"])
+
+    def test_without_a_collection_nothing_is_fetched_or_spawned(self):
+        self.output.parent.mkdir()
+        self.output.write_text("company/Existing\n")
+        os.utime(self.output, (0, 0))
+        with mock.patch.object(catalog, "COLLECTION", None), mock.patch.object(
+            catalog.subprocess, "Popen"
+        ) as process:
+            self.assertFalse(catalog.refresh())
+            catalog.spawn_refresh()
+            with mock.patch("sys.stderr", io.StringIO()):
+                self.assertEqual(catalog.main(["--refresh"]), 0)
+            with mock.patch("sys.stdout", io.StringIO()) as output:
+                update_model_catalog.main(["--output", str(self.output)])
+            self.assertIn("No model collection", output.getvalue())
+        self.urlopen.assert_not_called()
+        process.assert_not_called()
+        self.assertEqual(self.output.read_text(), "company/Existing\n")
+        self.assertEqual(catalog.official_ids(), ["company/Bundled", "company/Existing"])
 
     def test_background_refresh_is_detached_and_fresh_cache_skips_spawn(self):
         with mock.patch.object(catalog.subprocess, "Popen") as process:

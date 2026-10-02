@@ -47,17 +47,18 @@ REPO_ID = re.compile(
     r"[A-Za-z0-9_](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9_])?"
 )
 PACKAGE_FORMATS = {
-    "splash-packed-q4": (3, "MDFL0006", {}),
-    "splash-packed-q4-moe": (
-        4,
-        "MDFM0001",
-        {"target": "qwen3_5_moe", "draft": "DFlash2DraftModel"},
-    ),
     "splash-packed-q4-qwen4exp": (
         5,
         "MDFN0031",
         {"target": "qwen4exp", "draft": "DFlash2DraftModel"},
     ),
+}
+# Splash 1.0 package formats. The Slipstream v2 engine loads only
+# splash-packed-q4-qwen4exp (runtime/model/ModelDescriptor.mm), so these are refused
+# here, from the manifest, instead of after downloading the weights.
+RETIRED_FORMATS = {
+    "splash-packed-q4": "incoai/Qwen3.8-27B-Splash",
+    "splash-packed-q4-moe": "incoai/Qwen3.6-35B-A3B-Splash",
 }
 
 
@@ -116,6 +117,12 @@ def validate_package_manifest(path: Path):
     manifest = read_json(path)
     format_ = manifest.get("format")
     format_name = format_.get("name") if isinstance(format_, dict) else None
+    if format_name in RETIRED_FORMATS:
+        raise ModelError(
+            f"{format_name} is a Splash 1.0 package format, which the Slipstream v2 "
+            "engine does not load; it serves Qwen3.8-Flash-Next "
+            "(splash-packed-q4-qwen4exp packages, or a folder of its GGUF files)"
+        )
     layout = PACKAGE_FORMATS.get(format_name) if isinstance(format_name, str) else None
     if (
         layout is None
@@ -189,30 +196,18 @@ def validate_package_manifest(path: Path):
         for parent in PurePosixPath(name).parents
     ):
         raise ModelError("runtime package artifact paths overlap")
-    if layout[0] == 5:
-        required_files = {
-            "target/embedding.bin",
-            "target/head.bin",
-            "target/ngram.bin",
-            "target/draft-vocab.bin",
-            "target/mtp-layer.bin",
-            "target/mtp-combiner.bin",
-            "draft/model.bin",
-            *(f"target/layer-{index}.bin" for index in range(48)),
-            *(f"draft/layer-{index}.bin" for index in range(5)),
-            *(f"tokenizer/{name}" for name in QWEN4EXP_TOKENIZER_FILES),
-        }
-    else:
-        target_layers, draft_layers = (64, 5) if layout[0] == 3 else (40, 6)
-        required_files = {
-            "target/embedding.bin",
-            "target/head.bin",
-            "draft/model.bin",
-            "vision/model.bin",
-            *(f"target/layer-{index}.bin" for index in range(target_layers)),
-            *(f"draft/layer-{index}.bin" for index in range(draft_layers)),
-            *(f"tokenizer/{name}" for name in TOKENIZER_FILES),
-        }
+    required_files = {
+        "target/embedding.bin",
+        "target/head.bin",
+        "target/ngram.bin",
+        "target/draft-vocab.bin",
+        "target/mtp-layer.bin",
+        "target/mtp-combiner.bin",
+        "draft/model.bin",
+        *(f"target/layer-{index}.bin" for index in range(48)),
+        *(f"draft/layer-{index}.bin" for index in range(5)),
+        *(f"tokenizer/{name}" for name in QWEN4EXP_TOKENIZER_FILES),
+    }
     missing = required_files - artifact_paths
     if missing:
         raise ModelError(
