@@ -500,28 +500,28 @@ def prepare_gguf_model(
     draft_dir.mkdir(parents=True, exist_ok=True)
     tokenizer_dir.mkdir(parents=True, exist_ok=True)
 
+    # The MTP draft head ships as a separate file (nitinpanj/qwen38-flash-next-v3 has
+    # MTP/mtp-shared-Q4_K_M.gguf; the Swift variant's repository has none). It is only
+    # looked for next to the model: other models' folders are never searched, so a
+    # package is built from what its own folder holds.
     if sidecar_path is None:
-        candidates = [
-            model_dir / "MTP/mtp-shared-Q4_K_M.gguf",
-            model_dir / "mtp-shared-Q4_K_M.gguf",
-            Path.home() / "models/qwen38-flash-next-mtp/mtp-shared-Q4_K_M.gguf",
-            Path.home() / "models/qwen38-flash-next-v3/MTP/mtp-shared-Q4_K_M.gguf",
-        ]
-        for candidate in candidates:
+        for candidate in [model_dir / "MTP/mtp-shared-Q4_K_M.gguf", model_dir / "mtp-shared-Q4_K_M.gguf"]:
             if candidate.exists():
                 sidecar_path = candidate
                 break
+    if sidecar_path is None:
+        print(
+            "Warning: no MTP draft head (MTP/mtp-shared-Q4_K_M.gguf) next to the model; the server "
+            "runs without speculative drafting, one token per step, which is much slower. Get it with:\n"
+            "  hf download nitinpanj/qwen38-flash-next-v3 MTP/mtp-shared-Q4_K_M.gguf "
+            f"--local-dir {model_dir}",
+            flush=True,
+        )
 
-    # A previously prepared package saves converting the n-gram table; without
+    # A reference package (--reference) saves converting the n-gram table; without
     # one everything is built from the GGUF. The output itself never counts.
-    if reference_dir is None:
-        for candidate in [
-            Path.home() / "models/qwen38-flash-next-v3/prepared",
-            Path.home() / "models/qwen38-flash-next-splash",
-        ]:
-            if candidate.resolve() != output_dir and (candidate / "target/ngram.bin").exists():
-                reference_dir = candidate
-                break
+    if reference_dir is not None and Path(reference_dir).resolve() == output_dir:
+        reference_dir = None
 
     start_time = time.perf_counter()
     print(f"=== Fast GGUF Ingestion for Qwen3.8-Flash-Next ===")
