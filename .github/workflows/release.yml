@@ -116,14 +116,19 @@ jobs:
             your macOS version and verifies its checksum before unpacking. Only the two newest
             versions are kept: installing a new one removes anything older than the pair.
 
-            Then serve a model:
+            Then serve a model, by its Hugging Face id or a local folder:
 
             ```sh
-            slipstream serve --model <owner/repo or a local model folder>
+            slipstream serve --model nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF
             ```
 
+            A Hugging Face id is downloaded on the first start (`slipstream pull <owner/repo>`
+            downloads without serving), with the MTP draft head a GGUF repository lacks.
+            Models go to `~/.slipstream/models` (`SLIPSTREAM_MODELS` moves them); a GGUF model is
+            prepared there on its first start, which needs about as much disk again.
+
             Requires macOS 26.4 or later on Apple Silicon; a 64 GB Mac for the Qwen3.8-Flash-Next
-            models. Model data and caches go to `~/Library/Application Support/Slipstream-v2`.
+            models. Other data and caches go to `~/Library/Application Support/Slipstream-v2`.
 
             ## Manual download
 
