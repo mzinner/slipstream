@@ -85,10 +85,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Self-hosted release machines keep the manifest-pinned packed
-          # models in the ignored install/models/ directory. A clean checkout runs
-          # git clean -ffdx and destroys that multi-gigabyte prepared input;
-          # release-check still rejects tracked/untracked source changes and
-          # verify-models performs a full content hash before inference.
+          # models in the model store, ~/.slipstream/models (or
+          # SLIPSTREAM_MODELS), outside the checkout, where git clean -ffdx
+          # cannot reach them. They used to sit in the ignored install/models/
+          # directory, which a clean checkout destroyed; a machine that still
+          # has them there downloads them once into the store. clean: false
+          # now only keeps the build directory between runs; release-check
+          # still rejects tracked/untracked source changes and verify-models
+          # performs a full content hash before inference.
           clean: false
       - name: Prepare the selected model
         run: make install PYTHON_CANDIDATES=python3
