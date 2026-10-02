@@ -1,0 +1,141 @@
+name: Release
+
+# Pushing a tag like v26.10.0 builds the full runtime package (engine, Metal
+# library, server, its own Python, and the GGUF converter) and publishes it as
+# slipstream-<version>-macos26-arm-64bit.zip with SHA256SUMS and install.sh.
+# Run it by hand with an existing tag to rebuild that release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build, e.g. v26.10.0
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  release:
+    runs-on: macos-26  # Xcode 26 with the Metal toolchain and the macOS 26.4+ SDK
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun -sdk macosx metal --version
+
+      - name: Build the runtime package
+        run: |
+          VERSION="${TAG#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          make package RELEASE_VERSION="$VERSION" PYTHON_CANDIDATES=python3
+
+      - name: Build the GGUF dequantization library
+        # Compiled here so that converting a GGUF model needs no Xcode on the user's Mac.
+        run: .venv/bin/python -c "import sys; sys.path.insert(0, '.'); import dev.tools.sharded_gguf_reader"
+
+      - name: Repackage as a zip with a command and the GGUF converter
+        run: |
+          NAME="slipstream-$VERSION-macos26-arm-64bit"
+          mkdir -p stage
+          tar -xzf "dist/splash-$VERSION-arm64-macos26.tar.gz" -C stage
+          mv "stage/splash-$VERSION-arm64-macos26" "stage/$NAME"
+          PKG="stage/$NAME"
+
+          mkdir -p "$PKG/bin"
+          cat > "$PKG/bin/slipstream" <<'SH'
+          #!/bin/sh
+          # Resolves the ~/.local/bin link back to the versioned install it points into.
+          ROOT=$(cd "$(dirname "$(realpath "$0")")/.." && pwd -P)
+          export PYTHONDONTWRITEBYTECODE=1
+          exec "$ROOT/python/bin/python3" -u "$ROOT/install/launcher.py" "$@"
+          SH
+          chmod 755 "$PKG/bin/slipstream"
+
+          mkdir -p "$PKG/models/qwen4exp/tools" "$PKG/dev/tools" "$PKG/build"
+          cp models/qwen4exp/tools/convert_qwen4exp_gguf.py models/qwen4exp/tools/convert_qwen4exp.py \
+            "$PKG/models/qwen4exp/tools/"
+          cp dev/__init__.py "$PKG/dev/"
+          cp dev/tools/__init__.py dev/tools/quantize.py dev/tools/package_format.py \
+            dev/tools/sharded_gguf_reader.py dev/tools/fast_dequant.c "$PKG/dev/tools/"
+          cp build/libslipstream-dequant.dylib "$PKG/build/"
+          touch "$PKG/build/libslipstream-dequant.dylib"  # newer than its source, so it is reused
+
+          (cd stage && ditto -c -k --sequesterRsrc --keepParent "$NAME" "../$NAME.zip")
+          shasum -a 256 "$NAME.zip" | tee SHA256SUMS
+          echo "PACKAGE=$NAME" >> "$GITHUB_ENV"
+
+      - name: Smoke-test the unpacked package
+        run: |
+          mkdir smoke
+          ditto -x -k "$PACKAGE.zip" smoke
+          ln -s "$PWD/smoke/$PACKAGE/bin/slipstream" smoke/slipstream  # as ~/.local/bin links it
+          smoke/slipstream --version
+          smoke/slipstream --help >/dev/null
+          "smoke/$PACKAGE/python/bin/python3" -c "import sys; sys.path.insert(0, 'smoke/$PACKAGE'); \
+            import dev.tools.sharded_gguf_reader as r; print('dequantizers:', ', '.join(r.DEQUANT))"
+          "smoke/$PACKAGE/python/bin/python3" "smoke/$PACKAGE/models/qwen4exp/tools/convert_qwen4exp_gguf.py" --help >/dev/null
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Slipstream ${{ env.VERSION }}
+          files: |
+            ${{ env.PACKAGE }}.zip
+            SHA256SUMS
+            install.sh
+          body: |
+            Slipstream ${{ env.VERSION }}, built from `${{ github.sha }}` (build run ${{ github.run_id }}).
+
+            ## Install
+
+            ### macOS (Apple Silicon)
+
+            ```sh
+            curl -fsSL https://github.com/${{ github.repository }}/raw/main/install.sh | SLIPSTREAM_TAG=${{ env.TAG }} sh
+            ```
+
+            Installs into `~/.local/share/slipstream/<version>` and links `slipstream` into
+            `~/.local/bin`. The installer checks for an Apple Silicon Mac, picks the package for
+            your macOS version and verifies its checksum before unpacking. Only the two newest
+            versions are kept: installing a new one removes anything older than the pair.
+
+            Then serve a model:
+
+            ```sh
+            slipstream serve --model <owner/repo or a local model folder>
+            ```
+
+            Requires macOS 26.4 or later on Apple Silicon; a 64 GB Mac for the Qwen3.8-Flash-Next
+            models. Model data and caches go to `~/Library/Application Support/Slipstream-v2`.
+
+            ## Manual download
+
+            Download `${{ env.PACKAGE }}.zip` and `SHA256SUMS`, then check one against the other:
+
+            ```sh
+            shasum -a 256 -c SHA256SUMS --ignore-missing
+            ```
+
+            Unzip it anywhere and run `bin/slipstream`. A browser marks the download as
+            quarantined, and macOS then refuses the unsigned engine; clear the mark first:
+
+            ```sh
+            xattr -dr com.apple.quarantine ${{ env.PACKAGE }}
+            ```
