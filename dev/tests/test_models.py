@@ -764,7 +764,7 @@ class ModelArtifactTest(unittest.TestCase):
         self.assertTrue(artifacts.is_gguf_installation(root))
         self.assertEqual(
             json.loads((root / artifacts.GGUF_MARKER).read_text()),
-            {"model": self.MODEL_ID, "revision": self.REVISION},
+            {"model": self.MODEL_ID, "revision": self.REVISION, "downloaded": True},
         )
         self.download.assert_called_once_with(
             repo_id=self.MODEL_ID,
@@ -797,26 +797,45 @@ class ModelArtifactTest(unittest.TestCase):
         )
         self.manifest_download.assert_not_called()
 
-    def test_prepared_gguf_installation_is_reused_without_the_network(self):
+    def test_finished_gguf_download_is_reused_without_the_network(self):
         self.configure_gguf_hub(self.SHARDS)
         models = self.root / "models"
         self.prepare_gguf(models)
         root = models / self.MODEL_ID
-        for name in ("prepared/manifest.json", "prepared/target/layer-0.bin"):
-            (root / name).parent.mkdir(parents=True, exist_ok=True)
-            (root / name).write_text("{}")
+        self.assertTrue(artifacts.gguf_downloaded(root))
         self.api.reset_mock()
         self.download.reset_mock()
         self.prepare_gguf(models)
         self.api.assert_not_called()
         self.download.assert_not_called()
 
+    def test_prepared_gguf_installation_counts_as_downloaded(self):
+        root = self.root / "models" / self.MODEL_ID
+        root.mkdir(parents=True)
+        (root / artifacts.GGUF_MARKER).write_text(
+            json.dumps({"model": self.MODEL_ID, "revision": self.REVISION})
+        )
+        self.assertFalse(artifacts.gguf_downloaded(root))
+        for name in ("prepared/manifest.json", "prepared/target/layer-0.bin"):
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
+            (root / name).write_text("{}")
+        self.assertTrue(artifacts.gguf_downloaded(root))
+
     def test_interrupted_gguf_download_resumes_at_its_own_commit(self):
         self.configure_gguf_hub(self.SHARDS)
+        finish = self.download.side_effect
+
+        def interrupted(**options):
+            finish(**{**options, "allow_patterns": options["allow_patterns"][:1]})
+            raise KeyboardInterrupt
+
+        self.download.side_effect = interrupted
         models = self.root / "models"
-        self.prepare_gguf(models)
+        with self.assertRaises(KeyboardInterrupt):
+            self.prepare_gguf(models)
         root = models / self.MODEL_ID
-        (root / "Model-00002-of-00002.gguf").unlink()
+        self.assertFalse(artifacts.gguf_downloaded(root))
+        self.assertFalse((root / "Model-00002-of-00002.gguf").exists())
         self.configure_gguf_hub(self.SHARDS, revision="b" * 40)
         self.download.reset_mock()
         self.prepare_gguf(models)

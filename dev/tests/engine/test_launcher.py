@@ -72,6 +72,32 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(args.max_memory, 28 * 1024**3)
         self.assertEqual(args.max_context, 102400)
 
+    def test_pull_takes_a_repository_id_only(self):
+        self.assertEqual(launcher.parse_args(["pull", MODEL_ID]).model, MODEL_ID)
+        for arguments in (["pull"], ["pull", "./folder"], ["pull", MODEL_ID, "--", "x"]):
+            with (
+                self.subTest(arguments=arguments),
+                mock.patch("sys.stderr", io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                launcher.parse_args(arguments)
+
+    def test_pull_replaces_itself_with_the_download_into_the_store(self):
+        args = launcher.parse_args(["pull", MODEL_ID])
+        with (
+            mock.patch.object(launcher.paths, "PACKAGED", True),
+            mock.patch.object(launcher.subprocess, "run") as run,
+            mock.patch.object(launcher.os, "execv") as execute,
+        ):
+            launcher.pull(args)
+        run.assert_not_called()
+        path, command = execute.call_args.args
+        self.assertEqual(path, str(launcher.paths.PYTHON))
+        self.assertEqual(
+            command[-5:],
+            ["--models", str(launcher.paths.MODELS), "--model", MODEL_ID, "prepare"],
+        )
+
     def test_size_validation(self):
         for value in ("1G", "1GB", "1GiB", "1073741824"):
             self.assertEqual(launcher._parse_max_memory(value), 1024**3)

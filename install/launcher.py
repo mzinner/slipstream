@@ -88,6 +88,28 @@ def _ensure_installed(model_id):
         raise LauncherError("model download or verification failed")
 
 
+def pull(args):
+    """Download a model into the model store without serving it."""
+    if not paths.PACKAGED:
+        command = ["make", "platform-check", "install-environment"]
+        if subprocess.run(command, cwd=ROOT).returncode:
+            raise LauncherError("source environment setup failed; see the output above")
+    command = [
+        str(paths.PYTHON),
+        "-u",
+        str(ROOT / "install/models.py"),
+        "--models",
+        str(paths.MODELS),
+        "--model",
+        args.model,
+        "prepare",
+    ]
+    # Replaced rather than waited for, so an interrupt (Ctrl+C, or a frontend
+    # stopping the download) reaches the download itself, which keeps its
+    # partial files for the next pull to resume.
+    os.execv(command[0], command)
+
+
 def _prepare_gguf(model_path):
     """Convert a folder of GGUF shards into model_path/prepared, once."""
     prepared_dir = model_path / "prepared"
@@ -379,13 +401,22 @@ def parse_args(argv=None):
         help=f"HTTP serving port (default: {PORT})",
     )
     server.add_argument("--no-webui", action="store_true", help="disable the chat page")
+    puller = commands.add_parser(
+        "pull", help="download a model from Hugging Face without serving it"
+    )
+    puller.add_argument(
+        "model",
+        type=model_artifacts.parse_repo_id,
+        metavar="OWNER/REPO",
+        help="Hugging Face repository: a model package, or Qwen3.8-Flash-Next GGUF files",
+    )
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")
     args = parser.parse_args(argv)
     if args.command == "serve" and args.api_key is not None:
         if not args.api_key or any(ord(c) <= 32 or ord(c) >= 127 for c in args.api_key):
             parser.error("API key must contain only visible ASCII characters")
-    if client_args and args.command == "serve":
+    if client_args and args.command in ("serve", "pull"):
         parser.error("arguments after -- are only supported for coding clients")
     args.client_args = client_args
     return args
@@ -394,7 +425,11 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     try:
-        return serve(args) if args.command == "serve" else coding_client(args)
+        if args.command == "serve":
+            return serve(args)
+        if args.command == "pull":
+            return pull(args)
+        return coding_client(args)
     except (LauncherError, clients.ClientError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

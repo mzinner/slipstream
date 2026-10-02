@@ -476,6 +476,15 @@ def is_gguf_installation(root: Path) -> bool:
     return not root.is_symlink() and (root / GGUF_MARKER).is_file()
 
 
+def gguf_downloaded(root: Path) -> bool:
+    """Whether a GGUF installation's download finished."""
+    try:
+        downloaded = read_json(root / GGUF_MARKER).get("downloaded") is True
+    except ModelError:
+        downloaded = False
+    return downloaded or gguf_prepared(root)
+
+
 def gguf_prepared(root: Path) -> bool:
     """Whether the launcher has already prepared a package from the shards."""
     return (root / "prepared/manifest.json").is_file() and (
@@ -576,7 +585,10 @@ def install_gguf(found: GgufRepository, root: Path):
         path = root / name
         if not path.is_file() or (size is not None and path.stat().st_size != size):
             raise ModelError(f"downloaded file has the wrong size: {path}")
-    print(f"Downloaded {model_id}", flush=True)
+    marker.write_text(
+        json.dumps({"model": model_id, "revision": revision, "downloaded": True}) + "\n"
+    )
+    print(f"Downloaded {model_id} into {root}", flush=True)
 
 
 @contextmanager
@@ -637,8 +649,8 @@ def prepare(args):
     root = installed_root(models, args.model)
     with installation_lock(models):
         if is_gguf_installation(root):
-            if gguf_prepared(root):
-                print(f"GGUF model {args.model} is already installed in {root}")
+            if gguf_downloaded(root):
+                print(f"GGUF model {args.model} is already downloaded in {root}")
                 return
             # An interrupted download resumes at the commit it started from.
             print(f"Resuming the download of {args.model} into {root}", flush=True)
@@ -737,6 +749,10 @@ def main(argv=None):
     except (ModelError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        # Partial files stay; the next prepare resumes from them.
+        print("Download stopped; run it again to continue.", file=sys.stderr)
+        return 130
     return 0
 
 
