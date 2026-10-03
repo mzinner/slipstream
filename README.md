@@ -28,7 +28,9 @@ Everything is open source under Apache-2.0.
 
 ### Prerequisites
 - **Hardware:** Apple Silicon Mac with **64 GB Unified Memory** (M2/M3/M4/M5 Pro/Max).
-- **Disk:** ~100 GB for the multi-shard GGUF weights + ~95 GB working disk space.
+- **Disk:** ~100 GB for a model served by its Hugging Face id: its GGUF files are converted in
+  place on the first start, so preparing needs only a few GB more. A model in a folder of your own
+  (or with `--keep-gguf`) keeps its GGUF files, and preparing it needs ~100 GB more.
 - **macOS:** macOS 15.0+ (macOS 26.4+ SDK).
 
 ---
@@ -105,7 +107,9 @@ slipstream serve --model nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF -
 slipstream serve --model ~/models/swift-qwen38-flash-next-v3 --host 0.0.0.0 --port 8090 --api-key YOUR_KEY
 ```
 
-> **First Run Note:** On first launch, Slipstream detects multi-shard GGUF files and prepares optimized streaming package files into `<model-dir>/prepared/` (~5–7 minutes). Subsequent launches load in **~10–15 seconds**.
+> **First Run Note:** On first launch, Slipstream detects multi-shard GGUF files and prepares optimized streaming package files into `<model-dir>/prepared/` (~4–7 minutes). Subsequent launches load in **~10–15 seconds**.
+>
+> For a model served by its Hugging Face id, preparing uses the downloaded GGUF files up as it converts them, and deletes them once the package is complete: the package replaces them, and the model needs about its own size on disk instead of twice that. Add `--keep-gguf` to keep them (e.g. to use them with llama.cpp as well). A folder of your own is never changed. An interrupted preparation resumes where it stopped; if the GGUF data it still needs was already freed, it says which files to download again.
 
 ---
 
