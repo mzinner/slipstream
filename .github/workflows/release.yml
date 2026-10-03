@@ -123,9 +123,11 @@ jobs:
             ```
 
             A Hugging Face id is downloaded on the first start (`slipstream pull <owner/repo>`
-            downloads without serving), with the MTP draft head a GGUF repository lacks.
-            Models go to `~/.slipstream/models` (`SLIPSTREAM_MODELS` moves them); a GGUF model is
-            prepared there on its first start, which needs about as much disk again.
+            downloads without serving; `--check` only says whether it can be served, and its
+            size), with the MTP draft head a GGUF repository lacks. Models go to
+            `~/.slipstream/models` (`SLIPSTREAM_MODELS` moves them). A GGUF model is converted
+            there on its first start, using its downloaded files up as it goes, so it needs little
+            more disk than the model (`serve --keep-gguf` keeps them, and needs as much again).
 
             Requires macOS 26.4 or later on Apple Silicon; a 64 GB Mac for the Qwen3.8-Flash-Next
             models. Other data and caches go to `~/Library/Application Support/Slipstream-v2`.
