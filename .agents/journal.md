@@ -1,5 +1,13 @@
 # Journal — qwen4exp port
 
+## 2026-10-02 21:22 PDT — antigravity
+
+1. Diagnosed and resolved the `runtime_unavailable` (503) error: large prompts (>28k tokens, ~115 KB frame) filled the 64 KiB macOS pipe buffer and timed out under the rigid 5.0s `_io_timeout` in `_write_bytes` when the engine was busy, raising `EngineUnhealthy` and triggering engine restart (`resident layers: 0 / 48`). Fixed by dynamically resetting `io_deadline` on active forward progress in `server/runtime.py` and configuring 60s timeout in `server/server.py`.
+2. Consolidated directory layout to a single clean canonical directory `model-serving/slipstream` (deleted `slipstream-orig` and `slipstream-gguf`; symlinked `slipstream-v2 -> slipstream`).
+3. Merged and credited PRs #3, #4, #5 from Reddit user Mike Zinner (@mzinner / @mariadb-MikeZinner); closed Issues #1 and #2. Built standalone prebuilt binary package `slipstream-26.10.4-macos26-arm-64bit.zip` and published release `v26.10.4` on GitHub (`npanj/slipstream`).
+4. Updated `install.sh` and `README.md` with one-line curl install and direct Hugging Face Hub ID serving. Validated live server on port 8090 delivering 46.3 tok/s decode; server stopped cleanly with 50+ GiB free RAM. Updated Work Hub (`INDEX.html`).
+Blocked on: nothing.
+
 ## 2026-10-01 13:17 PDT — antigravity
 
 Refactored Reddit submission post to minimize links and eliminate automated spam-filter triggers:

@@ -1,5 +1,19 @@
 # Decisions — qwen4exp port
 
+## Dynamic Pipe Write Deadline Refresh for Deep Context Prompts (2026-10-02)
+
+High-context prompts (>28,000 tokens) produce RequestFrames >115 KB. Because macOS OS pipe capacity is 64 KiB (65,536 bytes), the initial `stream.write` fills the buffer, forcing subsequent chunks to wait for the native engine to drain the pipe. Previously, `MultiplexedRuntime._write_bytes` set a single static 5.0-second deadline across the entire multi-chunk frame. If the engine was busy executing a prefill chunk or SSD expert read, the timer expired, raising `EngineUnhealthy("native frame write timed out after 65536 bytes")` and triggering an unrecoverable process restart (`resident layers: 0 / 48`) with HTTP 503 `runtime_unavailable`.
+- Increased default `io_timeout` to 30.0s (and 60.0s in `server.py`), overrideable via `SLIPSTREAM_IO_TIMEOUT`.
+- In `_write_bytes`, refreshed `io_deadline = time.monotonic() + self._io_timeout` on each successful partial chunk write (`written > 0`). As long as the engine process actively consumes bytes, the write stream is healthy and permitted to complete without timing out.
+
+## Standalone GGUF Ingestion & Prebuilt Binary Packaging (2026-10-02)
+
+Integrated contributions from Mike Zinner (@mariadb-MikeZinner):
+- Converted `ngram.bin` directly from multi-shard GGUF by streaming `per_layer_token_embd.weight` 512k rows at a time, eliminating the need for reference packages or external files.
+- Automatically fetched tokenizer metadata from Hugging Face if missing.
+- Implemented standalone prebuilt packaging (`make package` + `.zip` repackaging) including bundled `libslipstream-dequant.dylib` compiled from `fast_dequant.c`.
+- Published Release `v26.10.4` on GitHub (`npanj/slipstream`) with one-line installer (`curl -fsSL .../install.sh | sh`).
+
 ## Graceful Output Budget Clamping for Context Ceilings (2026-09-30)
 
 When prompt tokens approach the context window ceiling (e.g. during lengthy agent tool loops), OpenAI `/v1/chat/completions` previously raised an unrecoverable HTTP 400 `context_length_exceeded` if `prompt_tokens + max_completion_tokens > max_context`. We added `--clamp-output-budget` (and `FrontendServer.clamp_output_budget`) to gracefully clamp the output budget to `max_context - prompt_tokens` and return `finish_reason: "length"`, aligning `/v1/chat/completions` with the graceful behavior of Anthropic `/v1/messages`.

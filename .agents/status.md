@@ -1,22 +1,25 @@
 # Status — Slipstream (handoff)
 
-**Updated:** 2026-10-01 13:17 PDT by antigravity.
-**Branch:** `main` (workspace `slipstream-v2` symlinked to `slipstream`).
+**Updated:** 2026-10-02 21:22 PDT by antigravity.
+**Branch:** `main` (canonical workspace `model-serving/slipstream`, release `v26.10.4`).
 
 ## In one line
 
-Refactored Reddit submission (`docs/REDDIT_POST.md` and Desktop pack): zero links in opening paragraph, converted all references to clean markdown hyperlinks, removed raw URLs to avoid automated spam filters. Server is stopped with 50+ GiB free RAM.
+Published Release `v26.10.4` on GitHub (`npanj/slipstream/releases/tag/v26.10.4`) with standalone prebuilt macOS binary (`slipstream-26.10.4-macos26-arm-64bit.zip`), one-line installer, standalone GGUF conversion, and high-context pipe timeout fix. Directory consolidated to canonical `model-serving/slipstream` (old copies deleted). Server stopped with 50+ GiB free RAM.
 
 ---
 
 ## How to use it
 
 ```zsh
-# Serve Swift V3 directly pointing at GGUF directory:
+# One-line install of prebuilt binary (no compilation needed):
+curl -fsSL https://raw.githubusercontent.com/npanj/slipstream/main/install.sh | sh
+
+# Serve Swift V3 directly pointing at local directory:
 ./slipstream serve --model ~/models/swift-qwen38-flash-next-v3 --port 8090
 
-# Or serve Nitin's daily V3 model:
-./slipstream serve --model ~/models/qwen38-flash-next-v3 --port 8090
+# Or serve directly by Hugging Face repo ID:
+./slipstream serve --model nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF --port 8090
 
 # Backward compatibility forwarders also work:
 ./slipstream-v2 serve --model ~/models/swift-qwen38-flash-next-v3 --port 8090
@@ -24,10 +27,6 @@ Refactored Reddit submission (`docs/REDDIT_POST.md` and Desktop pack): zero link
 
 # Run guarded A/B benchmark comparing Slipstream vs llama.cpp:
 python3 dev/tools/compare_slipstream_vs_llamacpp.py --model-dir ~/models/swift-qwen38-flash-next-v3
-
-# View publication materials:
-cat docs/REDDIT_POST.md
-open docs/context_scaling_and_benchmark.png
 ```
 
 ---

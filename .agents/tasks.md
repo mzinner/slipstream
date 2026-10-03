@@ -163,6 +163,34 @@
   - [x] Compiled head-to-head comparison tables against llama.cpp fork (1.76x speedup) and Swift KV-sparsity gains (+8.6% GPQA Diamond, 70.3% overall)
   - [x] Authored complete, focused Reddit release post draft in `docs/REDDIT_POST.md` and conversation artifact
 
+## Release v26.10.4 & Community PR Integration
+
+- [x] Integrated PRs #3, #4, #5 from Reddit contributor Mike Zinner (@mariadb-MikeZinner):
+  - [x] Bundled `fast_dequant.c` compilation into `build/libslipstream-dequant.dylib` (eliminates hardcoded `libggml-base` path)
+  - [x] Fixed FP16->FP32 dequantization bit-offsets in `fast_dequant.c`
+  - [x] Standalone GGUF conversion (`convert_qwen4exp_gguf.py`) without requiring reference `ngram.bin`
+  - [x] Network serving with `--host` parameter (`0.0.0.0`) and `serve.lock` tracking
+  - [x] Direct Hub ID serving (`slipstream serve --model <hub_id>`) and pre-download (`slipstream pull`)
+- [x] Diagnosed and fixed `runtime_unavailable` (503) error on deep contexts:
+  - [x] Identified 64 KiB macOS pipe buffer limit causing `_write_bytes` to time out on >28k token prompts
+  - [x] Dynamically refreshed `io_deadline` on active forward progress (`written > 0`) in `server/runtime.py`
+  - [x] Configured 60s timeout in `server/server.py` (`NATIVE_IO_TIMEOUT`)
+  - [x] Verified full server suite (171/171 tests pass) and runtime tests (36/36 pass)
+- [x] Standalone Release Packaging & GitHub Publication:
+  - [x] Packaged full distribution `slipstream-26.10.4-macos26-arm-64bit.zip` with bundled python, engine, dequantizer dylib, and converters
+  - [x] Generated `SHA256SUMS` and verified smoke test cleanly
+  - [x] Published Release `v26.10.4` on GitHub (`https://github.com/npanj/slipstream/releases/tag/v26.10.4`)
+  - [x] Closed Issues #1 and #2, and merged PRs #3, #4, #5 with full attribution
+- [x] Updated documentation and installer:
+  - [x] Updated `install.sh` default repository to `npanj/slipstream`
+  - [x] Updated `README.md` with one-line curl install and direct model serving
+  - [x] Synced rich tutorial documentation in `docs/tutorial.html`
+- [x] Clean directory restructuring & Work Hub:
+  - [x] Deleted duplicate checkouts `slipstream-orig` and `slipstream-gguf`
+  - [x] Consolidated to canonical `model-serving/slipstream` (symlinked `slipstream-v2 -> slipstream`)
+  - [x] Updated Work Hub (`INDEX.html`) quick links and project cards
+  - [x] Verified local serve on port 8090 with curl completion (46.3 tok/s decode); server stopped cleanly with 50+ GiB free RAM
+
 
 
 
