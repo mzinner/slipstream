@@ -277,7 +277,9 @@ def replay(path: Path) -> int:
                 suffix = "" if returncode is None else f" (exit status {returncode})"
                 raise RuntimeError(eof_message + suffix)
 
-        reader = threading.Thread(target=drain, name="slipstream-v2-trace-replay", daemon=True)
+        reader = threading.Thread(
+            target=drain, name="slipstream-v2-trace-replay", daemon=True
+        )
         reader.start()
         with changed:
             if not changed.wait_for(
@@ -357,7 +359,9 @@ def replay(path: Path) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Replay a Slipstream v2 native crash trace")
+    parser = argparse.ArgumentParser(
+        description="Replay a Slipstream v2 native crash trace"
+    )
     parser.add_argument("trace", type=Path)
     args = parser.parse_args()
     return replay(args.trace)

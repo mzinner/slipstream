@@ -174,9 +174,7 @@ def validate_package_manifest(path: Path):
             not isinstance(declaration, dict)
             or declaration.get("architecture") != architecture
         ):
-            raise ModelError(
-                f"runtime package has an unsupported {key} architecture"
-            )
+            raise ModelError(f"runtime package has an unsupported {key} architecture")
 
     records = manifest.get("artifacts")
     if not isinstance(records, list) or not records:

@@ -875,7 +875,11 @@ class MultiplexedRuntime:
     ) -> None:
         caller_deadline = deadline
         io_deadline = time.monotonic() + self._io_timeout
-        deadline = min(caller_deadline, io_deadline) if caller_deadline is not None else io_deadline
+        deadline = (
+            min(caller_deadline, io_deadline)
+            if caller_deadline is not None
+            else io_deadline
+        )
         if not self._write_lock.acquire(timeout=_remaining(deadline)):
             raise TimeoutError("native write lock timed out")
         failure: BaseException | None = None
@@ -918,7 +922,11 @@ class MultiplexedRuntime:
                     # frames or high-context prompts are not killed when the engine is actively
                     # draining the OS pipe buffer.
                     io_deadline = time.monotonic() + self._io_timeout
-                    deadline = min(caller_deadline, io_deadline) if caller_deadline is not None else io_deadline
+                    deadline = (
+                        min(caller_deadline, io_deadline)
+                        if caller_deadline is not None
+                        else io_deadline
+                    )
                 self._crash_trace.record_bytes(generation, "client_to_engine", encoded)
             except TimeoutError:
                 if offset == 0:

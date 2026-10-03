@@ -1,9 +1,10 @@
+import ctypes
 import os
 import struct
-import ctypes
 import subprocess
 import tempfile
 from pathlib import Path
+
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -26,7 +27,10 @@ GGML_BLOCKS = {
 
 def _build_dequant_lib():
     """Compile fast_dequant.c into build/ when missing or older than the source."""
-    if DEQUANT_LIB.exists() and DEQUANT_LIB.stat().st_mtime >= DEQUANT_SOURCE.stat().st_mtime:
+    if (
+        DEQUANT_LIB.exists()
+        and DEQUANT_LIB.stat().st_mtime >= DEQUANT_SOURCE.stat().st_mtime
+    ):
         return DEQUANT_LIB
     DEQUANT_LIB.parent.mkdir(parents=True, exist_ok=True)
     # Build beside the target and rename, so concurrent workers never load a partial file.
@@ -34,8 +38,18 @@ def _build_dequant_lib():
     os.close(fd)
     try:
         subprocess.run(
-            ["xcrun", "-sdk", "macosx", "clang", "-O3", "-shared", "-fPIC",
-             "-o", tmp, str(DEQUANT_SOURCE)],
+            [
+                "xcrun",
+                "-sdk",
+                "macosx",
+                "clang",
+                "-O3",
+                "-shared",
+                "-fPIC",
+                "-o",
+                tmp,
+                str(DEQUANT_SOURCE),
+            ],
             check=True,
         )
         os.replace(tmp, DEQUANT_LIB)
@@ -54,7 +68,9 @@ def _load_dequantizers():
     argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64]
     if ggml_path := os.environ.get("SLIPSTREAM_GGML_LIB"):
         if not os.path.exists(ggml_path):
-            raise RuntimeError(f"SLIPSTREAM_GGML_LIB points to a missing file: {ggml_path}")
+            raise RuntimeError(
+                f"SLIPSTREAM_GGML_LIB points to a missing file: {ggml_path}"
+            )
         lib = ctypes.CDLL(ggml_path)
         names = {t: f"dequantize_row_{t}" for t in DEQUANT_TYPES}
     else:
@@ -70,6 +86,7 @@ def _load_dequantizers():
 
 
 DEQUANT = _load_dequantizers()
+
 
 class MultiShardGgufReader:
     def __init__(self, model_dir_or_files, sidecars=None):
@@ -120,7 +137,15 @@ class MultiShardGgufReader:
                     val = fd.read(slen).decode("latin1", errors="replace")
                 elif vtype == 9:
                     etype, count = struct.unpack("<IQ", fd.read(12))
-                    sz = 1 if etype in (0,1,7) else 2 if etype in (2,3) else 4 if etype in (4,5,6) else 8
+                    sz = (
+                        1
+                        if etype in (0, 1, 7)
+                        else 2
+                        if etype in (2, 3)
+                        else 4
+                        if etype in (4, 5, 6)
+                        else 8
+                    )
                     if etype == 8:
                         val = []
                         for _ in range(count):
@@ -141,7 +166,7 @@ class MultiShardGgufReader:
                     "shard_idx": shard_idx,
                     "dims": dims,
                     "type": ttype,
-                    "offset": toffset
+                    "offset": toffset,
                 }
 
             pos = fd.tell()
@@ -149,11 +174,9 @@ class MultiShardGgufReader:
             pad = (align - pos % align) % align
             data_offset = pos + pad
 
-            self.shards.append({
-                "path": shard_path,
-                "fd": fd,
-                "data_offset": data_offset
-            })
+            self.shards.append(
+                {"path": shard_path, "fd": fd, "data_offset": data_offset}
+            )
 
     def has(self, name):
         return name in self.tensors
@@ -172,10 +195,14 @@ class MultiShardGgufReader:
         meta = self._meta(name)
         width, rows = meta["dims"][0], int(np.prod(meta["dims"][1:]))
         if start < 0 or start + count > rows:
-            raise IndexError(f"rows {start}..{start + count} outside {name} ({rows} rows)")
+            raise IndexError(
+                f"rows {start}..{start + count} outside {name} ({rows} rows)"
+            )
         block, size = GGML_BLOCKS[meta["type"]]
         if width % block:
-            raise ValueError(f"{name} rows do not split into whole {block}-element blocks")
+            raise ValueError(
+                f"{name} rows do not split into whole {block}-element blocks"
+            )
         return self._decode(name, start * (width // block) * size, (count, width))
 
     def read_expert(self, name, expert):
@@ -197,33 +224,37 @@ class MultiShardGgufReader:
         count = int(np.prod(shape))
 
         fd.seek(shard["data_offset"] + meta["offset"] + skip)
-        if ttype == 0: # F32
+        if ttype == 0:  # F32
             return np.frombuffer(fd.read(count * 4), dtype="<f4").reshape(shape)
-        elif ttype == 1: # F16
-            return np.frombuffer(fd.read(count * 2), dtype="<f2").astype(np.float32).reshape(shape)
-        elif ttype == 30: # BF16
+        elif ttype == 1:  # F16
+            return (
+                np.frombuffer(fd.read(count * 2), dtype="<f2")
+                .astype(np.float32)
+                .reshape(shape)
+            )
+        elif ttype == 30:  # BF16
             u16 = np.frombuffer(fd.read(count * 2), dtype="<u2")
             return ((u16.astype(np.uint32) << 16).view(np.float32)).reshape(shape)
 
         out = np.empty(shape, dtype=np.float32)
         ptr = out.ctypes.data_as(ctypes.c_void_p)
 
-        if ttype == 2: # Q4_0
+        if ttype == 2:  # Q4_0
             raw = fd.read(count // 32 * 18)
             DEQUANT["q4_0"](raw, ptr, count)
-        elif ttype == 3: # Q4_1
+        elif ttype == 3:  # Q4_1
             raw = fd.read(count // 32 * 20)
             DEQUANT["q4_1"](raw, ptr, count)
-        elif ttype == 6: # Q5_0
+        elif ttype == 6:  # Q5_0
             raw = fd.read(count // 32 * 22)
             DEQUANT["q5_0"](raw, ptr, count)
-        elif ttype == 8: # Q8_0
+        elif ttype == 8:  # Q8_0
             raw = fd.read(count // 32 * 34)
             DEQUANT["q8_0"](raw, ptr, count)
-        elif ttype == 12: # Q4_K
+        elif ttype == 12:  # Q4_K
             raw = fd.read(count // 256 * 144)
             DEQUANT["q4_K"](raw, ptr, count)
-        elif ttype == 14: # Q6_K
+        elif ttype == 14:  # Q6_K
             raw = fd.read(count // 256 * 210)
             DEQUANT["q6_K"](raw, ptr, count)
         else:

@@ -301,12 +301,8 @@ class ModelArtifactTest(unittest.TestCase):
                     manifest[section][key] = value
                     self.write_manifest(snapshot, manifest)
                     with self.assertRaises(artifacts.ModelError):
-                        artifacts.validate_package_manifest(
-                            snapshot / "manifest.json"
-                        )
-            self.assertEqual(
-                original["target"]["architecture"], target_architecture
-            )
+                        artifacts.validate_package_manifest(snapshot / "manifest.json")
+            self.assertEqual(original["target"]["architecture"], target_architecture)
             snapshot_ok, manifest_ok = self.package_fixture(schema=schema)
             artifacts.validate_package_manifest(snapshot_ok / "manifest.json")
             del manifest_ok

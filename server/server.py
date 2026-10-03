@@ -1581,9 +1581,12 @@ def parse_args(argv=None):
     _bin_v1 = ROOT / "build" / "slipstream"
     _bin_splash = ROOT / "build" / "splash"
     _default_bin = (
-        _bin_v2 if _bin_v2.exists()
-        else _bin_v1 if _bin_v1.exists()
-        else _bin_splash if _bin_splash.exists()
+        _bin_v2
+        if _bin_v2.exists()
+        else _bin_v1
+        if _bin_v1.exists()
+        else _bin_splash
+        if _bin_splash.exists()
         else _bin_v2
     )
     parser.add_argument(

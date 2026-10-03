@@ -18,8 +18,11 @@ _V2_BIN = ROOT / ("engine/slipstream-v2" if PACKAGED else "build/slipstream-v2")
 _V1_BIN = ROOT / ("engine/slipstream" if PACKAGED else "build/slipstream")
 _SPLASH_BIN = ROOT / ("engine/splash" if PACKAGED else "build/splash")
 BINARY = (
-    _V2_BIN if _V2_BIN.exists()
-    else _V1_BIN if _V1_BIN.exists()
-    else _SPLASH_BIN if _SPLASH_BIN.exists()
+    _V2_BIN
+    if _V2_BIN.exists()
+    else _V1_BIN
+    if _V1_BIN.exists()
+    else _SPLASH_BIN
+    if _SPLASH_BIN.exists()
     else _V2_BIN
 )

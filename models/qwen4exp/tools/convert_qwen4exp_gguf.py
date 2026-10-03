@@ -12,7 +12,6 @@ import argparse
 import concurrent.futures
 import os
 import shutil
-import struct
 import sys
 import time
 from pathlib import Path
@@ -24,16 +23,32 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "dev"))
 
-from dev.tools.quantize import to_bf16, from_bf16, quantize_affine, pack_nibbles
-from dev.tools.package_format import (
-    ALIGNMENT, BF16, GROUP, FINE_GROUP, STORAGE_N, EXPERT_STORAGE_N,
-    StreamingWeightFile, WeightFile, pad_rows, tile_q4, q4_bytes
+from dev.tools.package_format import (  # noqa: E402
+    BF16,
+    EXPERT_STORAGE_N,
+    FINE_GROUP,
+    GROUP,
+    STORAGE_N,
+    StreamingWeightFile,
+    WeightFile,
 )
-from dev.tools.sharded_gguf_reader import MultiShardGgufReader
-from models.qwen4exp.tools.convert_qwen4exp import (
-    quantized_q8, quantized_q8_tile, quantized_tile, q8_bytes,
-    LAYER_MAGIC, NGRAM_MAGIC, HEAD_MAGIC, EMBEDDING_MAGIC, DRAFT_MAGIC,
-    write_manifest, write_placeholder_draft
+from dev.tools.quantize import (  # noqa: E402
+    from_bf16,
+    pack_nibbles,
+    quantize_affine,
+    to_bf16,
+)
+from dev.tools.sharded_gguf_reader import MultiShardGgufReader  # noqa: E402
+from models.qwen4exp.tools.convert_qwen4exp import (  # noqa: E402
+    EMBEDDING_MAGIC,
+    HEAD_MAGIC,
+    LAYER_MAGIC,
+    NGRAM_MAGIC,
+    quantized_q8,
+    quantized_q8_tile,
+    quantized_tile,
+    write_manifest,
+    write_placeholder_draft,
 )
 
 MTP_COMBINER_MAGIC = b"MDFN0035"
@@ -65,10 +80,14 @@ LAYOUT = {
     "head_dimension": 128,
 }
 
+
 def is_full_attention(layer: int) -> bool:
     return (layer + 1) % 4 == 0
 
-def convert_single_layer(model_dir: str, sidecar_path: str | None, layer_idx: int, out_file: str) -> str:
+
+def convert_single_layer(
+    model_dir: str, sidecar_path: str | None, layer_idx: int, out_file: str
+) -> str:
     reader = MultiShardGgufReader(model_dir, sidecars=sidecar_path)
     out_path = Path(out_file)
     if out_path.exists():
@@ -122,7 +141,12 @@ def convert_single_layer(model_dir: str, sidecar_path: str | None, layer_idx: in
     else:
         # GDN value heads in GGUF are permuted (3, 16) instead of canonical (16, 3)
         qkv = reader.read_tensor(f"{prefix}.attn_qkv.weight")
-        qkv_v = qkv[4096:].reshape(3, 16, 128, 2560).transpose(1, 0, 2, 3).reshape(6144, 2560)
+        qkv_v = (
+            qkv[4096:]
+            .reshape(3, 16, 128, 2560)
+            .transpose(1, 0, 2, 3)
+            .reshape(6144, 2560)
+        )
         qkv = np.vstack([qkv[:4096], qkv_v])
 
         gate = reader.read_tensor(f"{prefix}.attn_gate.weight")
@@ -138,7 +162,9 @@ def convert_single_layer(model_dir: str, sidecar_path: str | None, layer_idx: in
         packed.section(quantized_q8_tile(stacked, pad_to=LAYOUT["packed_gdn"]))
 
         conv1d = reader.read_tensor(f"{prefix}.ssm_conv1d.weight")
-        conv_v = conv1d[4096:].reshape(3, 16, 128, 4).transpose(1, 0, 2, 3).reshape(6144, 4)
+        conv_v = (
+            conv1d[4096:].reshape(3, 16, 128, 4).transpose(1, 0, 2, 3).reshape(6144, 4)
+        )
         conv1d = np.vstack([conv1d[:4096], conv_v])
         packed.section(to_bf16(conv1d.flatten()).tobytes())
 
@@ -154,7 +180,9 @@ def convert_single_layer(model_dir: str, sidecar_path: str | None, layer_idx: in
         packed.section(to_bf16(ssm_norm).tobytes())
 
         out_proj = reader.read_tensor(f"{prefix}.ssm_out.weight")
-        out_proj = out_proj.reshape(2560, 3, 16, 128).transpose(0, 2, 1, 3).reshape(2560, 6144)
+        out_proj = (
+            out_proj.reshape(2560, 3, 16, 128).transpose(0, 2, 1, 3).reshape(2560, 6144)
+        )
         packed.section(quantized_q8_tile(out_proj))
 
     # 3. MLP Hyper-connection (norm stored as 1.0 + weight in GGUF)
@@ -175,23 +203,38 @@ def convert_single_layer(model_dir: str, sidecar_path: str | None, layer_idx: in
     packed.section(quantized_q8(router))
 
     # 512 experts gate, up, down, one expert at a time: whole, each tensor is 3.4 GB as float32
-    packed.section(b"".join(
-        quantized_tile(reader.read_expert(f"{prefix}.ffn_gate_exps.weight", i),
-                       storage_n=EXPERT_STORAGE_N, group=GROUP)
-        for i in range(512)
-    ))
+    packed.section(
+        b"".join(
+            quantized_tile(
+                reader.read_expert(f"{prefix}.ffn_gate_exps.weight", i),
+                storage_n=EXPERT_STORAGE_N,
+                group=GROUP,
+            )
+            for i in range(512)
+        )
+    )
 
-    packed.section(b"".join(
-        quantized_tile(reader.read_expert(f"{prefix}.ffn_up_exps.weight", i),
-                       storage_n=EXPERT_STORAGE_N, group=GROUP)
-        for i in range(512)
-    ))
+    packed.section(
+        b"".join(
+            quantized_tile(
+                reader.read_expert(f"{prefix}.ffn_up_exps.weight", i),
+                storage_n=EXPERT_STORAGE_N,
+                group=GROUP,
+            )
+            for i in range(512)
+        )
+    )
 
-    packed.section(b"".join(
-        quantized_tile(reader.read_expert(f"{prefix}.ffn_down_exps.weight", i),
-                       storage_n=EXPERT_STORAGE_N, group=GROUP)
-        for i in range(512)
-    ))
+    packed.section(
+        b"".join(
+            quantized_tile(
+                reader.read_expert(f"{prefix}.ffn_down_exps.weight", i),
+                storage_n=EXPERT_STORAGE_N,
+                group=GROUP,
+            )
+            for i in range(512)
+        )
+    )
 
     # Shared expert
     shexp_gate = reader.read_tensor(f"{prefix}.ffn_gate_shexp.weight")
@@ -210,7 +253,8 @@ def convert_single_layer(model_dir: str, sidecar_path: str | None, layer_idx: in
 
     total_bytes = packed.finish()
     reader.close()
-    return f"Layer {layer_idx:2d} finished ({total_bytes / (1024*1024):.1f} MB)"
+    return f"Layer {layer_idx:2d} finished ({total_bytes / (1024 * 1024):.1f} MB)"
+
 
 def convert_mtp_layer(model_dir: str, sidecar_path: str, out_file: str) -> str:
     reader = MultiShardGgufReader(model_dir, sidecars=sidecar_path)
@@ -279,23 +323,38 @@ def convert_mtp_layer(model_dir: str, sidecar_path: str, out_file: str) -> str:
     packed.section(quantized_q8(router))
 
     # 512 experts gate, up, down
-    packed.section(b"".join(
-        quantized_tile(reader.read_expert(f"{prefix}.ffn_gate_exps.weight", i),
-                       storage_n=EXPERT_STORAGE_N, group=GROUP)
-        for i in range(512)
-    ))
+    packed.section(
+        b"".join(
+            quantized_tile(
+                reader.read_expert(f"{prefix}.ffn_gate_exps.weight", i),
+                storage_n=EXPERT_STORAGE_N,
+                group=GROUP,
+            )
+            for i in range(512)
+        )
+    )
 
-    packed.section(b"".join(
-        quantized_tile(reader.read_expert(f"{prefix}.ffn_up_exps.weight", i),
-                       storage_n=EXPERT_STORAGE_N, group=GROUP)
-        for i in range(512)
-    ))
+    packed.section(
+        b"".join(
+            quantized_tile(
+                reader.read_expert(f"{prefix}.ffn_up_exps.weight", i),
+                storage_n=EXPERT_STORAGE_N,
+                group=GROUP,
+            )
+            for i in range(512)
+        )
+    )
 
-    packed.section(b"".join(
-        quantized_tile(reader.read_expert(f"{prefix}.ffn_down_exps.weight", i),
-                       storage_n=EXPERT_STORAGE_N, group=GROUP)
-        for i in range(512)
-    ))
+    packed.section(
+        b"".join(
+            quantized_tile(
+                reader.read_expert(f"{prefix}.ffn_down_exps.weight", i),
+                storage_n=EXPERT_STORAGE_N,
+                group=GROUP,
+            )
+            for i in range(512)
+        )
+    )
 
     # Shared expert
     shexp_gate = reader.read_tensor(f"{prefix}.ffn_gate_shexp.weight")
@@ -314,7 +373,8 @@ def convert_mtp_layer(model_dir: str, sidecar_path: str, out_file: str) -> str:
 
     total_bytes = packed.finish()
     reader.close()
-    return f"MTP Layer (48) finished ({total_bytes / (1024*1024):.1f} MB)"
+    return f"MTP Layer (48) finished ({total_bytes / (1024 * 1024):.1f} MB)"
+
 
 def convert_mtp_combiner(model_dir: str, sidecar_path: str, out_file: str) -> str:
     reader = MultiShardGgufReader(model_dir, sidecars=sidecar_path)
@@ -347,7 +407,8 @@ def convert_mtp_combiner(model_dir: str, sidecar_path: str, out_file: str) -> st
 
     total = combiner.finish()
     reader.close()
-    return f"MTP Combiner finished ({total / (1024*1024):.1f} MB)"
+    return f"MTP Combiner finished ({total / (1024 * 1024):.1f} MB)"
+
 
 def convert_head(model_dir: str, out_file: str) -> str:
     reader = MultiShardGgufReader(model_dir)
@@ -378,7 +439,8 @@ def convert_head(model_dir: str, out_file: str) -> str:
 
     total = packed.finish()
     reader.close()
-    return f"Head finished ({total / (1024*1024):.1f} MB)"
+    return f"Head finished ({total / (1024 * 1024):.1f} MB)"
+
 
 def convert_embedding(model_dir: str, out_file: str) -> str:
     reader = MultiShardGgufReader(model_dir)
@@ -386,7 +448,9 @@ def convert_embedding(model_dir: str, out_file: str) -> str:
     if out_path.exists():
         out_path.unlink()
 
-    packed = WeightFile(out_path, EMBEDDING_MAGIC, LAYOUT["vocabulary"], LAYOUT["hidden"])
+    packed = WeightFile(
+        out_path, EMBEDDING_MAGIC, LAYOUT["vocabulary"], LAYOUT["hidden"]
+    )
     embed = reader.read_tensor("token_embd.weight")
     rows, width = embed.shape
     groups = embed.reshape(rows, width // GROUP, GROUP)
@@ -408,7 +472,8 @@ def convert_embedding(model_dir: str, out_file: str) -> str:
 
     total = packed.finish()
     reader.close()
-    return f"Embedding finished ({total / (1024*1024):.1f} MB)"
+    return f"Embedding finished ({total / (1024 * 1024):.1f} MB)"
+
 
 def convert_ngram(model_dir: str, out_file: str) -> str:
     """The per-layer n-gram table and its PLE projections, in write_per_layer_embedding's order.
@@ -426,15 +491,22 @@ def convert_ngram(model_dir: str, out_file: str) -> str:
     table = "per_layer_token_embd.weight"
     width, rows = reader.tensors[table]["dims"]
     if (width, rows) != (NGRAM_HEAD_DIMENSION, NGRAM_VOCABULARY):
-        raise ValueError(f"{table} is {rows}x{width}, expected {NGRAM_VOCABULARY}x{NGRAM_HEAD_DIMENSION}")
+        raise ValueError(
+            f"{table} is {rows}x{width}, expected {NGRAM_VOCABULARY}x{NGRAM_HEAD_DIMENSION}"
+        )
 
     packed = StreamingWeightFile(out_path, NGRAM_MAGIC, NGRAM_SHARDS, width)
-    scratch = [out_path.with_name(out_path.name + f".{part}.tmp") for part in ("scales", "biases")]
+    scratch = [
+        out_path.with_name(out_path.name + f".{part}.tmp")
+        for part in ("scales", "biases")
+    ]
     try:
         with open(scratch[0], "wb") as scales, open(scratch[1], "wb") as biases:
             packed.begin()
             for start in range(0, rows, NGRAM_CHUNK_ROWS):
-                values = reader.read_rows(table, start, min(NGRAM_CHUNK_ROWS, rows - start))
+                values = reader.read_rows(
+                    table, start, min(NGRAM_CHUNK_ROWS, rows - start)
+                )
                 codes, scale_bits, bias_bits = quantize_affine(values, group=FINE_GROUP)
                 packed.write(pack_nibbles(codes).tobytes())
                 scales.write(scale_bits.tobytes())
@@ -463,7 +535,8 @@ def convert_ngram(model_dir: str, out_file: str) -> str:
 
     total = packed.finish()
     reader.close()
-    return f"N-gram table finished ({total / (1024*1024):.1f} MB)"
+    return f"N-gram table finished ({total / (1024 * 1024):.1f} MB)"
+
 
 def fetch_tokenizer(tokenizer_dir: Path) -> None:
     """Download the base model's tokenizer; its vocabulary and chat template match the GGUF's."""
@@ -477,17 +550,19 @@ def fetch_tokenizer(tokenizer_dir: Path) -> None:
             )
     print(f"Fetched tokenizer from {TOKENIZER_REPO}")
 
+
 def default_workers() -> int:
     """Workers that fit in memory: a layer peaks near 4 GiB, the head near 13 GiB."""
     memory = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     return max(1, min(8, memory // WORKER_MEMORY_BYTES))
+
 
 def prepare_gguf_model(
     model_dir: str | Path,
     output_dir: str | Path,
     sidecar_path: str | Path | None = None,
     reference_dir: str | Path | None = None,
-    workers: int | None = None
+    workers: int | None = None,
 ) -> None:
     if workers is None:
         workers = default_workers()
@@ -505,7 +580,10 @@ def prepare_gguf_model(
     # looked for next to the model: other models' folders are never searched, so a
     # package is built from what its own folder holds.
     if sidecar_path is None:
-        for candidate in [model_dir / "MTP/mtp-shared-Q4_K_M.gguf", model_dir / "mtp-shared-Q4_K_M.gguf"]:
+        for candidate in [
+            model_dir / "MTP/mtp-shared-Q4_K_M.gguf",
+            model_dir / "mtp-shared-Q4_K_M.gguf",
+        ]:
             if candidate.exists():
                 sidecar_path = candidate
                 break
@@ -524,7 +602,7 @@ def prepare_gguf_model(
         reference_dir = None
 
     start_time = time.perf_counter()
-    print(f"=== Fast GGUF Ingestion for Qwen3.8-Flash-Next ===")
+    print("=== Fast GGUF Ingestion for Qwen3.8-Flash-Next ===")
     print(f"Source: {model_dir}")
     print(f"Output: {output_dir}")
     print(f"Sidecar: {sidecar_path}")
@@ -577,14 +655,29 @@ def prepare_gguf_model(
         # Layers 0..47
         for i in range(48):
             out_file = str(target_dir / f"layer-{i}.bin")
-            tasks.append(executor.submit(convert_single_layer, str(model_dir), str(sidecar_path), i, out_file))
+            tasks.append(
+                executor.submit(
+                    convert_single_layer, str(model_dir), str(sidecar_path), i, out_file
+                )
+            )
 
         # MTP layer & combiner
         if sidecar_path and Path(sidecar_path).exists():
             mtp_layer_file = str(target_dir / "mtp-layer.bin")
             mtp_comb_file = str(target_dir / "mtp-combiner.bin")
-            tasks.append(executor.submit(convert_mtp_layer, str(model_dir), str(sidecar_path), mtp_layer_file))
-            tasks.append(executor.submit(convert_mtp_combiner, str(model_dir), str(sidecar_path), mtp_comb_file))
+            tasks.append(
+                executor.submit(
+                    convert_mtp_layer, str(model_dir), str(sidecar_path), mtp_layer_file
+                )
+            )
+            tasks.append(
+                executor.submit(
+                    convert_mtp_combiner,
+                    str(model_dir),
+                    str(sidecar_path),
+                    mtp_comb_file,
+                )
+            )
         elif reference_dir:
             ref_path = Path(reference_dir)
             for mtp_name in ["mtp-layer.bin", "mtp-combiner.bin"]:
@@ -622,16 +715,35 @@ def prepare_gguf_model(
     elapsed = time.perf_counter() - start_time
     print(f"=== Successfully prepared Slipstream model in {elapsed:.1f}s ===")
 
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-dir", required=True, help="Directory containing GGUF shards")
-    parser.add_argument("--output", required=True, help="Destination directory for prepared package")
-    parser.add_argument("--sidecar", default=None, help="Path to MTP draft sidecar GGUF")
-    parser.add_argument("--reference", default=None, help="Previously prepared package to reuse ngram.bin, tokenizer and draft from")
-    parser.add_argument("--workers", type=int, default=None, help="Number of worker processes (default: by installed memory, at most 8)")
+    parser.add_argument(
+        "--model-dir", required=True, help="Directory containing GGUF shards"
+    )
+    parser.add_argument(
+        "--output", required=True, help="Destination directory for prepared package"
+    )
+    parser.add_argument(
+        "--sidecar", default=None, help="Path to MTP draft sidecar GGUF"
+    )
+    parser.add_argument(
+        "--reference",
+        default=None,
+        help="Previously prepared package to reuse ngram.bin, tokenizer and draft from",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Number of worker processes (default: by installed memory, at most 8)",
+    )
     args = parser.parse_args()
 
-    prepare_gguf_model(args.model_dir, args.output, args.sidecar, args.reference, workers=args.workers)
+    prepare_gguf_model(
+        args.model_dir, args.output, args.sidecar, args.reference, workers=args.workers
+    )
+
 
 if __name__ == "__main__":
     main()

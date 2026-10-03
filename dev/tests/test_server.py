@@ -3486,7 +3486,9 @@ class ServerTest(unittest.TestCase):
         self.assertFalse(generation_constraints.LLMatcher.validate_grammar(grammar))
         for reference in references:
             self.assertIn(json.dumps(reference, separators=(",", ":")), grammar)
-        self.assertIn('"items":{"$ref":"#/$defs/__slipstream_v2_root/$defs/x"}', grammar)
+        self.assertIn(
+            '"items":{"$ref":"#/$defs/__slipstream_v2_root/$defs/x"}', grammar
+        )
         self.assertNotIn("__slipstream_v2_root/x", grammar)
         arguments = {
             "pattern": "literal",

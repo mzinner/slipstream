@@ -74,7 +74,11 @@ class LauncherTests(unittest.TestCase):
 
     def test_pull_takes_a_repository_id_only(self):
         self.assertEqual(launcher.parse_args(["pull", MODEL_ID]).model, MODEL_ID)
-        for arguments in (["pull"], ["pull", "./folder"], ["pull", MODEL_ID, "--", "x"]):
+        for arguments in (
+            ["pull"],
+            ["pull", "./folder"],
+            ["pull", MODEL_ID, "--", "x"],
+        ):
             with (
                 self.subTest(arguments=arguments),
                 mock.patch("sys.stderr", io.StringIO()),
@@ -271,7 +275,15 @@ class LauncherTests(unittest.TestCase):
                 mock.patch("sys.stdout", io.StringIO()),
             ):
                 launcher.main(
-                    ["serve", "--model", MODEL_ID, "--host", "0.0.0.0", "--port", "8123"]
+                    [
+                        "serve",
+                        "--model",
+                        MODEL_ID,
+                        "--host",
+                        "0.0.0.0",
+                        "--port",
+                        "8123",
+                    ]
                 )
             probe = factory.return_value.__enter__.return_value
             probe.bind.assert_called_once_with(("0.0.0.0", 8123))

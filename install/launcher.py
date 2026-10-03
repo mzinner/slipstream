@@ -119,8 +119,15 @@ def _prepare_gguf(model_path):
         # `models`, would shadow the repo's models/ package here.
         converter = ROOT / "models/qwen4exp/tools/convert_qwen4exp_gguf.py"
         prepared = subprocess.run(
-            [str(paths.PYTHON), "-u", str(converter),
-             "--model-dir", str(model_path), "--output", str(prepared_dir)]
+            [
+                str(paths.PYTHON),
+                "-u",
+                str(converter),
+                "--model-dir",
+                str(model_path),
+                "--output",
+                str(prepared_dir),
+            ]
         )
         if prepared.returncode != 0:
             raise LauncherError(f"preparing {model_path} failed; see the output above")
@@ -196,7 +203,9 @@ def serve(args):
                 root = model_path / "prepared"
                 model_id = f"local/{model_path.name}"
             else:
-                raise LauncherError(f"Directory {model_path} does not contain GGUF files or a manifest.json")
+                raise LauncherError(
+                    f"Directory {model_path} does not contain GGUF files or a manifest.json"
+                )
         else:
             _ensure_installed(args.model)
             root = model_artifacts.installed_root(paths.MODELS, args.model)
