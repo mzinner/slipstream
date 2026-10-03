@@ -98,6 +98,22 @@ class LauncherTests(unittest.TestCase):
             ["--models", str(launcher.paths.MODELS), "--model", MODEL_ID, "prepare"],
         )
 
+    def test_pull_check_asks_without_downloading(self):
+        for options, tail in (
+            (["--check"], ["--model", MODEL_ID, "check"]),
+            (["--check", "--json"], ["--model", MODEL_ID, "check", "--json"]),
+        ):
+            args = launcher.parse_args(["pull", MODEL_ID, *options])
+            with (
+                self.subTest(options=options),
+                mock.patch.object(launcher.paths, "PACKAGED", True),
+                mock.patch.object(launcher.os, "execv") as execute,
+            ):
+                launcher.pull(args)
+            self.assertEqual(execute.call_args.args[1][-len(tail):], tail)
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            launcher.parse_args(["pull", MODEL_ID, "--json"])
+
     def test_size_validation(self):
         for value in ("1G", "1GB", "1GiB", "1073741824"):
             self.assertEqual(launcher._parse_max_memory(value), 1024**3)

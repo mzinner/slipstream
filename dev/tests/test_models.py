@@ -39,6 +39,28 @@ class ModelArtifactTest(unittest.TestCase):
         self.api = self.start_patch("huggingface_hub.HfApi")
         self.manifest_download = self.start_patch("huggingface_hub.hf_hub_download")
         self.download = self.start_patch("huggingface_hub.snapshot_download")
+        # The first GGUF file's header, read with a ranged request.
+        self.session = self.start_patch("huggingface_hub.get_session")
+        self.serve_gguf_header("qwen4exp")
+
+    @staticmethod
+    def gguf_header(architecture):
+        def string(text):
+            data = text.encode()
+            return struct.pack("<Q", len(data)) + data
+
+        return (
+            b"GGUF"
+            + struct.pack("<IQQ", 3, 0, 3)
+            + string("general.alignment") + struct.pack("<II", 4, 32)
+            + string("general.tags") + struct.pack("<IIQ", 9, 8, 2) + string("a") + string("bc")
+            + string("general.architecture") + struct.pack("<I", 8) + string(architecture)
+        )
+
+    def serve_gguf_header(self, architecture):
+        self.session.return_value.get.return_value = SimpleNamespace(
+            content=self.gguf_header(architecture), raise_for_status=lambda: None
+        )
 
     def start_patch(self, name):
         patch = mock.patch(name)
@@ -898,6 +920,89 @@ class ModelArtifactTest(unittest.TestCase):
         ):
             self.prepare_gguf(models)
         self.download.assert_called_once()
+
+    def test_gguf_header_names_its_architecture(self):
+        header = self.gguf_header("qwen4exp")
+        self.assertEqual(artifacts.gguf_architecture(header), "qwen4exp")
+        self.assertIsNone(artifacts.gguf_architecture(header[:40]), "cut short")
+        self.assertIsNone(artifacts.gguf_architecture(b"GGML" + header[4:]))
+
+    def test_gguf_files_must_be_one_model(self):
+        self.assertEqual(artifacts.gguf_model_files({"m.gguf": 1, "README.md": 1}), ["m.gguf"])
+        self.assertEqual(
+            artifacts.gguf_model_files({**self.SHARDS, artifacts.MTP_SIDECAR: 4}), sorted(self.SHARDS)
+        )
+        for files, reason in [
+            ({"A-Q4_0.gguf": 1, "A-Q8_0.gguf": 1}, "not one model"),
+            ({"A-00001-of-00002.gguf": 1, "B-00001-of-00001.gguf": 1}, "not one model"),
+            ({"A-00001-of-00003.gguf": 1, "A-00003-of-00003.gguf": 1}, "missing some"),
+            ({"Q4_0/A.gguf": 1, "Q8_0/A.gguf": 1}, "sub-folders"),
+            ({"model.safetensors": 1}, "nor GGUF files"),
+        ]:
+            with self.subTest(files=files), self.assertRaisesRegex(artifacts.ModelError, reason):
+                artifacts.gguf_model_files(files)
+
+    def test_gguf_of_another_architecture_is_refused_before_downloading(self):
+        self.configure_gguf_hub(self.SHARDS)
+        self.serve_gguf_header("qwen35moe")
+        models = self.root / "models"
+        with self.assertRaisesRegex(artifacts.ModelError, "qwen35moe model; Slipstream converts qwen4exp"):
+            self.prepare_gguf(models)
+        self.download.assert_not_called()
+        self.assertFalse((models / self.MODEL_ID / artifacts.GGUF_MARKER).exists())
+        url = self.session.return_value.get.call_args.args[0]
+        self.assertTrue(url.endswith(f"/{self.MODEL_ID}/resolve/{self.REVISION}/Model-00001-of-00002.gguf"))
+        self.assertEqual(
+            self.session.return_value.get.call_args.kwargs["headers"]["Range"],
+            f"bytes=0-{artifacts.GGUF_HEADER_BYTES - 1}",
+        )
+
+    def check(self, *options):
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            code = artifacts.main(["--models", str(self.root / "models"), "--model", self.MODEL_ID,
+                                   "check", *options])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_check_describes_a_gguf_repository_without_downloading(self):
+        self.configure_gguf_hub(self.SHARDS)
+        code, out, _ = self.check("--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out), {
+            "supported": True, "model": self.MODEL_ID, "revision": self.REVISION, "kind": "gguf",
+            "files": 2, "bytes": 12 + artifacts.MTP_SIZE, "mtp": artifacts.MTP_REPO,
+        })
+        self.download.assert_not_called()
+        self.manifest_download.assert_not_called()
+        self.assertFalse((self.root / "models").exists(), "nothing is written")
+        code, out, _ = self.check()
+        self.assertIn("can be pulled: Qwen3.8-Flash-Next GGUF (2 files", out)
+
+    def test_check_says_why_not(self):
+        self.configure_gguf_hub(self.SHARDS)
+        self.serve_gguf_header("llama")
+        code, out, _ = self.check("--json")
+        self.assertEqual(code, 1)
+        result = json.loads(out)
+        self.assertFalse(result["supported"])
+        self.assertIn("llama model", result["reason"])
+        code, _, err = self.check()
+        self.assertEqual(code, 1)
+        self.assertIn("cannot be served: Model-00001-of-00002.gguf is a llama model", err)
+
+    def test_check_validates_a_package_manifest(self):
+        snapshot, _ = self.package_fixture()
+        self.configure_hub(snapshot)
+        code, out, _ = self.check("--json")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(out)["kind"], "package")
+        self.download.assert_not_called()
+        other, manifest = self.package_fixture()
+        manifest["format"]["name"] = "some-other-format"
+        self.write_manifest(other, manifest)
+        self.configure_hub(other)
+        code, out, _ = self.check("--json")
+        self.assertEqual(code, 1)
+        self.assertIn("not a supported Splash runtime package", json.loads(out)["reason"])
 
     def test_repository_without_package_or_gguf_names_both(self):
         self.configure_gguf_hub({"model.safetensors": 9})

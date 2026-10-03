@@ -102,8 +102,11 @@ def pull(args):
         str(paths.MODELS),
         "--model",
         args.model,
-        "prepare",
     ]
+    if args.check:
+        command += ["check", "--json"] if args.json else ["check"]
+    else:
+        command.append("prepare")
     # Replaced rather than waited for, so an interrupt (Ctrl+C, or a frontend
     # stopping the download) reaches the download itself, which keeps its
     # partial files for the next pull to resume.
@@ -426,12 +429,22 @@ def parse_args(argv=None):
         metavar="OWNER/REPO",
         help="Hugging Face repository: a model package, or Qwen3.8-Flash-Next GGUF files",
     )
+    puller.add_argument(
+        "--check",
+        action="store_true",
+        help="only say whether the model can be pulled and served, and its size; download nothing",
+    )
+    puller.add_argument(
+        "--json", action="store_true", help="with --check: print one JSON object"
+    )
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")
     args = parser.parse_args(argv)
     if args.command == "serve" and args.api_key is not None:
         if not args.api_key or any(ord(c) <= 32 or ord(c) >= 127 for c in args.api_key):
             parser.error("API key must contain only visible ASCII characters")
+    if args.command == "pull" and args.json and not args.check:
+        parser.error("--json is only supported with --check")
     if client_args and args.command in ("serve", "pull"):
         parser.error("arguments after -- are only supported for coding clients")
     args.client_args = client_args
