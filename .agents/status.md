@@ -1,11 +1,11 @@
 # Status — Slipstream (handoff)
 
-**Updated:** 2026-10-02 21:22 PDT by antigravity.
+**Updated:** 2026-10-02 21:33 PDT by antigravity.
 **Branch:** `main` (canonical workspace `model-serving/slipstream`, release `v26.10.4`).
 
 ## In one line
 
-Published Release `v26.10.4` on GitHub (`npanj/slipstream/releases/tag/v26.10.4`) with standalone prebuilt macOS binary (`slipstream-26.10.4-macos26-arm-64bit.zip`), one-line installer, standalone GGUF conversion, and high-context pipe timeout fix. Directory consolidated to canonical `model-serving/slipstream` (old copies deleted). Server stopped with 50+ GiB free RAM.
+Consolidated Work Hub (`INDEX.html`) with single premier Slipstream card at the very top (Swift V3 default, Original Base V3 options, 0 drift on `hub-sync.sh`). Published Release `v26.10.4` on GitHub (`npanj/slipstream/releases/tag/v26.10.4`) with standalone prebuilt macOS binary (`slipstream-26.10.4-macos26-arm-64bit.zip`), one-line installer, standalone GGUF conversion, and high-context pipe timeout fix. Directory consolidated to canonical `model-serving/slipstream` (old copies deleted). Server stopped with 50+ GiB free RAM.
 
 ---
 

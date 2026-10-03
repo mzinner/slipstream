@@ -188,7 +188,9 @@
 - [x] Clean directory restructuring & Work Hub:
   - [x] Deleted duplicate checkouts `slipstream-orig` and `slipstream-gguf`
   - [x] Consolidated to canonical `model-serving/slipstream` (symlinked `slipstream-v2 -> slipstream`)
-  - [x] Updated Work Hub (`INDEX.html`) quick links and project cards
+  - [x] Consolidated Work Hub (`INDEX.html`): removed duplicate cards (173, 196, 214) and moved Slipstream to position #0 (`bucket: "🟢 live"`)
+  - [x] Provided Swift V3 default with full options for Original Base V3 serving
+  - [x] Synced `MAIN.md` and `PROJECT_INDEX.json`; confirmed zero drift on `hub-sync.sh`
   - [x] Verified local serve on port 8090 with curl completion (46.3 tok/s decode); server stopped cleanly with 50+ GiB free RAM
 
 
