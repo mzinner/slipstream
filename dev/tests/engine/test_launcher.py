@@ -401,6 +401,74 @@ class LauncherTests(unittest.TestCase):
         install.assert_not_called()
         execute.assert_not_called()
 
+    def serve_gguf(self, model_root, *options, model=MODEL_ID):
+        """Serve a GGUF model; returns the converter's command, or None if it did not run."""
+        with (
+            tempfile.TemporaryDirectory() as runtime,
+            mock.patch.object(launcher, "RUNTIME_DIR", Path(runtime)),
+            mock.patch.object(launcher.socket, "socket"),
+            mock.patch.object(launcher.catalog, "spawn_refresh"),
+            mock.patch.object(launcher, "_ensure_installed"),
+            mock.patch.object(
+                launcher.model_artifacts, "installed_root", return_value=model_root
+            ),
+            mock.patch.object(
+                launcher.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0),
+            ) as run,
+            mock.patch.object(launcher.os, "execve"),
+            mock.patch("sys.stdout", io.StringIO()),
+        ):
+            launcher.main(["serve", "--model", model, *options])
+        return run.call_args.args[0] if run.called else None
+
+    def gguf_folder(self, root, prepared=False):
+        (root / "MTP").mkdir(parents=True)
+        (root / "Model-00001-of-00001.gguf").write_bytes(b"GGUF")
+        (root / "MTP/mtp-shared-Q4_K_M.gguf").write_bytes(b"GGUF")
+        (root / launcher.model_artifacts.GGUF_MARKER).write_text(
+            json.dumps({"model": MODEL_ID, "revision": "a" * 40, "downloaded": True})
+        )
+        if prepared:
+            (root / "prepared/target").mkdir(parents=True)
+            (root / "prepared/manifest.json").write_text("{}")
+            (root / "prepared/target/layer-0.bin").write_bytes(b"")
+        return root
+
+    def test_store_gguf_model_is_used_up_while_preparing_unless_kept(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.gguf_folder(Path(temporary) / "model")
+            command = self.serve_gguf(root)
+            self.assertIn("--consume-source", command)
+            self.assertEqual(
+                command[command.index("--output") + 1], str(root / "prepared")
+            )
+            self.assertNotIn("--consume-source", self.serve_gguf(root, "--keep-gguf"))
+
+    def test_prepared_store_gguf_model_drops_the_files_left_behind(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.gguf_folder(Path(temporary) / "model", prepared=True)
+            self.assertIsNone(self.serve_gguf(root, "--keep-gguf"))
+            self.assertTrue((root / "Model-00001-of-00001.gguf").exists())
+            self.assertIsNone(self.serve_gguf(root))
+            self.assertEqual(list(root.rglob("*.gguf")), [])
+            self.assertTrue((root / "prepared/manifest.json").exists())
+
+    def test_a_folder_of_the_users_own_is_never_used_up(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = self.gguf_folder(Path(temporary) / "mine")
+            command = self.serve_gguf(folder, model=str(folder))
+            self.assertNotIn("--consume-source", command)
+            self.assertTrue((folder / "Model-00001-of-00001.gguf").exists())
+
+    def test_a_prepared_folder_without_its_gguf_files_still_serves(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = self.gguf_folder(Path(temporary) / "mine", prepared=True)
+            for shard in folder.rglob("*.gguf"):
+                shard.unlink()
+            self.assertIsNone(self.serve_gguf(folder, model=str(folder)))
+
 
 if __name__ == "__main__":
     unittest.main()

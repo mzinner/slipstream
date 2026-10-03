@@ -817,6 +817,33 @@ class ModelArtifactTest(unittest.TestCase):
             (root / name).write_text("{}")
         self.assertTrue(artifacts.gguf_downloaded(root))
 
+    def test_used_up_gguf_installation_downloads_again_once_its_package_is_gone(self):
+        self.configure_gguf_hub(self.SHARDS)
+        models = self.root / "models"
+        self.prepare_gguf(models)
+        root = models / self.MODEL_ID
+        for name in ("prepared/manifest.json", "prepared/target/layer-0.bin"):
+            (root / name).parent.mkdir(parents=True, exist_ok=True)
+            (root / name).write_text("{}")
+        with contextlib.redirect_stdout(io.StringIO()):
+            artifacts.remove_gguf_source(root)
+        self.assertEqual(list(root.rglob("*.gguf")), [])
+        self.assertTrue(artifacts.gguf_downloaded(root))
+        shutil.rmtree(root / "prepared")
+        self.assertFalse(artifacts.gguf_downloaded(root))
+        self.download.reset_mock()
+        self.prepare_gguf(models)
+        self.download.assert_called_once()
+        self.assertTrue((root / "Model-00002-of-00002.gguf").is_file())
+
+    def test_gguf_source_is_only_removed_once_prepared(self):
+        self.configure_gguf_hub(self.SHARDS)
+        models = self.root / "models"
+        self.prepare_gguf(models)
+        root = models / self.MODEL_ID
+        artifacts.remove_gguf_source(root)
+        self.assertEqual(len(list(root.rglob("*.gguf"))), 3)
+
     def test_interrupted_gguf_download_resumes_at_its_own_commit(self):
         self.configure_gguf_hub(self.SHARDS)
         finish = self.download.side_effect
@@ -853,6 +880,20 @@ class ModelArtifactTest(unittest.TestCase):
         ):
             self.prepare_gguf(models)
         self.download.assert_not_called()
+
+    def test_gguf_download_needs_no_room_for_a_second_copy(self):
+        # The shards are used up while preparing, so the download plus a
+        # twentieth fits; it used to need room for the shards twice.
+        self.configure_gguf_hub(self.SHARDS)
+        models = self.root / "models"
+        with (
+            mock.patch.object(artifacts, "PREPARE_IN_FLIGHT_BYTES", 0),
+            mock.patch.object(
+                artifacts.shutil, "disk_usage", return_value=SimpleNamespace(free=16)
+            ),
+        ):
+            self.prepare_gguf(models)
+        self.download.assert_called_once()
 
     def test_repository_without_package_or_gguf_names_both(self):
         self.configure_gguf_hub({"model.safetensors": 9})
