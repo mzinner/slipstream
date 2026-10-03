@@ -149,7 +149,7 @@ class PackageTests(unittest.TestCase):
                     namespace = {"__file__": str(prefix / "install/paths.py")}
                     exec(compile(source, "paths.py", "exec"), namespace)
                     self.assertTrue(namespace["PACKAGED"])
-                    self.assertEqual(namespace["BINARY"], prefix / "engine/splash")
+                    self.assertEqual(namespace["BINARY"], prefix / "engine/slipstream-v2")
                     self.assertEqual(namespace["PYTHON"], prefix / "python/bin/python3")
                     results.append((namespace["MODELS"], namespace["RUNTIME"]))
                 self.assertEqual(results[0], results[1])
