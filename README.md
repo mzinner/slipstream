@@ -66,7 +66,15 @@ You can serve directly by Hugging Face repo ID (Slipstream will download and set
 ```zsh
 # Download without serving:
 slipstream pull nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF
+
+# Only check whether a repository can be served, and its size (downloads nothing):
+slipstream pull nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF --check
 ```
+
+`--check` (add `--json` for scripts and frontends) accepts a ready-to-run Slipstream package, or one
+Qwen3.8-Flash-Next (`qwen4exp`) model's GGUF files: a single file or one complete set of split files
+at the top of the repository. It reads the first file's header from the Hub to check the
+architecture. `pull` and `serve` refuse anything else before downloading.
 
 Or download manually using the Hugging Face CLI:
 
