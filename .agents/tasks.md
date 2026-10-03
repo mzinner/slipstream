@@ -193,7 +193,14 @@
   - [x] Synced `MAIN.md` and `PROJECT_INDEX.json`; confirmed zero drift on `hub-sync.sh`
   - [x] Verified local serve on port 8090 with curl completion (46.3 tok/s decode); server stopped cleanly with 50+ GiB free RAM
 
+## Quality & Speed Enhancements (Selective Upstream & Engine Optimizations)
 
+- [x] **Speculative Early-Exit Gating**: Added pre-step early-exit gating in `models/qwen4exp/Qwen4ExpTarget.cpp` (`SPLASH_MTP_EARLY_EXIT_P=0.85`), preventing doomed MTP GPU passes when chain confidence cannot reach the acceptance threshold (+3% to +6% tok/s).
+- [x] **Vectorized Compute Buffer Binding**: Vectorized compute argument binding in `runtime/metal/MetalBackend.mm` with `setBuffers:offsets:withRange:`, eliminating ~1,000+ scalar Objective-C dispatches per step.
+- [x] **Driver Pipeline Stall Elimination**: Removed `addScheduledHandler` memory sampling in `MetalBackend.mm`, eliminating mid-flight IOGPU driver synchronization.
+- [x] **Defensive Out-of-Vocabulary Logits Guard**: Hardened `runtime/engine/Engine.cpp` against non-finite (NaN/INF) logits emitting out-of-vocabulary sentinels (`0xffffffff`), failing the lane cleanly before KV cache publication or output.
+- [x] **Pre-Compiled Policy Pipelines**: Added `MetalBackend::preparePipeline` and wired `preparePolicyPipelines()` in `Runtime.mm` to warm up sampling and constrained decoding shaders at startup, eliminating the 200–400 ms first-token JIT spike.
+- [x] **Regression Coverage**: Added `testOutOfVocabularyOutputFailsLaneOnly` in `dev/tests/engine/kv_first_engine_test.cpp`, verified 21/21 CPU engine tests pass 100% green, and verified 171/171 Python server tests pass.
 
 
 

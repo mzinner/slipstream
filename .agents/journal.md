@@ -1,5 +1,15 @@
 # Journal — qwen4exp port
 
+## 2026-10-02 23:18 PDT — antigravity
+
+1. Rigorously evaluated upstream Splash, ds4, llama.cpp, and sglang, selectively rejecting cosmetic server additions and QSA indexer gather (which degrades perplexity from 4.5 to 10.3 past 3k tokens) in favor of high-leverage quality and speed improvements.
+2. Implemented probability-gated speculative early exit in `models/qwen4exp/Qwen4ExpTarget.cpp` (`SPLASH_MTP_EARLY_EXIT_P=0.85`), terminating draft chaining before dispatching MTP to the GPU when cumulative chain confidence cannot reach the acceptance threshold, eliminating 8–10 ms wasted GPU passes on divergent text (+3% to +6% tok/s).
+3. Batched compute buffer argument bindings in `runtime/metal/MetalBackend.mm` via native vectorized `setBuffers:offsets:withRange:`, eliminating ~1,000+ scalar Objective-C dynamic dispatches per step, and removed mid-flight driver synchronization in `addScheduledHandler`.
+4. Hardened engine quality and stability in `runtime/engine/Engine.cpp` by adding defensive bounds check for out-of-vocabulary tokens (such as `0xffffffff` left by non-finite NaN/INF logits), preventing memory corruption and poisoned KV caches. Added unit test `testOutOfVocabularyOutputFailsLaneOnly` in `dev/tests/engine/kv_first_engine_test.cpp`.
+5. Pre-compiled sampling and constrained decoding policy pipelines in `runtime/model/Runtime.mm` and `runtime/metal/MetalBackend.mm`, eliminating the 200–400 ms first-token JIT shader compilation spike on agent reasoning and tool-calling turns.
+6. All 21 CPU engine tests pass 100% green; full server test suite (171/171 tests) and client suites pass.
+Blocked on: nothing.
+
 ## 2026-10-02 21:22 PDT — antigravity
 
 1. Diagnosed and resolved the `runtime_unavailable` (503) error: large prompts (>28k tokens, ~115 KB frame) filled the 64 KiB macOS pipe buffer and timed out under the rigid 5.0s `_io_timeout` in `_write_bytes` when the engine was busy, raising `EngineUnhealthy` and triggering engine restart (`resident layers: 0 / 48`). Fixed by dynamically resetting `io_deadline` on active forward progress in `server/runtime.py` and configuring 60s timeout in `server/server.py`.

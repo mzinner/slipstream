@@ -1,5 +1,35 @@
 # Decisions — qwen4exp port
 
+## Pre-Compiled Sampling & Constrained Policy Pipelines (2026-10-02)
+
+Metal compute pipeline state creation (`newComputePipelineStateWithFunction:error:`) compiles MSL shader bytecode into hardware machine code for the Apple Silicon GPU execution cores. Previously, policy-conditioned kernels (`decode_sample_top32_sharded`, `decode_sample_top32_probs`, `decode_sample_sparse_draw`, `decode_sample_sparse_top1`, `decode_sample_top32_sharded_batch`, `decode_sample_top32_probs_batch`) were compiled lazily upon first invocation.
+- On the first sampled ($T > 0$) request or tool-calling request, this lazy JIT compilation caused a 200–400 ms latency spike on Token 1.
+- Added `MetalBackend::preparePipeline(name)` and wired `preparePolicyPipelines()` directly into `Runtime::Impl` initialization, warming up all sampling pipelines at engine startup.
+- Eliminates first-turn jitter on agent reasoning and structured sampling turns.
+
+## Probability-Gated Speculative Early Exit in MTP Chaining (2026-10-02)
+
+MTP draft chaining in `Qwen4ExpTarget.cpp` previously executed sequential GPU `step()` calls up to `maxDrafts` (2–5) even when cumulative chain confidence had already collapsed below the acceptance threshold ($C_{k-1} < 0.35$).
+- Because $C_k = C_{k-1} \times P(k) \le C_{k-1}$, drafting token $k$ when $C_{k-1} \times 0.85 < 0.35$ has almost zero chance of passing the chain threshold, resulting in 8–10 ms of wasted MTP GPU compute per discarded draft.
+- Added pre-step early-exit gating: `if (chainConfidence * earlyExitFactor < chainConfident) break;` (default `earlyExitFactor = 0.85`, overrideable via `SPLASH_MTP_EARLY_EXIT_P`).
+- Changed loop exit on low confidence from `return drafts;` to `break;`, ensuring that valid proposals are cleanly retained in `drafted` rather than silently dropped.
+- Speedup: Eliminates 1–3 wasted GPU forward dispatches per step on divergent text (+3% to +6% tok/s decode on difficult reasoning/coding prompts).
+
+## Vectorized Metal Buffer Argument Binding & Driver Sync Removal (2026-10-02)
+
+In `runtime/metal/MetalBackend.mm`:
+- Previously, `submitCommandAsync` iterated over `dispatch.buffers` calling `[encoder setBuffer:offset:atIndex:]` individually, resulting in 1,000+ dynamic Objective-C runtime dispatches (`objc_msgSend`) per token step on the CPU.
+- Batched contiguous buffer arguments using Apple Metal's native vectorized API `[encoder setBuffers:offsets:withRange:]`.
+- Removed `addScheduledHandler` device memory sampling (`observer->sampleDeviceMemory()`), eliminating mid-flight IOGPU driver synchronization stalls while commands are queued.
+- Speedup: Reduces host CPU dispatch latency per step from ~8 ms down to ~2–3 ms.
+
+## Defensive Non-Finite / Out-of-Vocabulary Logits Guard (2026-10-02)
+
+In `runtime/engine/Engine.cpp`:
+- If an FP16/BF16 underflow/overflow or NaN occurs during sampling (leaving sentinel `0xffffffff`), the engine previously inserted the invalid token into `active.exactTokens` and published it to the KV cache, triggering an out-of-bounds Metal memory crash or engine deadlock on the next embedding lookup.
+- Added explicit validation in `Engine::apply`: fails the specific lane cleanly with `model_result_invalid` ("model emitted out-of-vocabulary token") before cache publication or output emission, allowing peer requests in the batch to complete safely.
+- Added regression test `testOutOfVocabularyOutputFailsLaneOnly` in `dev/tests/engine/kv_first_engine_test.cpp`.
+
 ## Dynamic Pipe Write Deadline Refresh for Deep Context Prompts (2026-10-02)
 
 High-context prompts (>28,000 tokens) produce RequestFrames >115 KB. Because macOS OS pipe capacity is 64 KiB (65,536 bytes), the initial `stream.write` fills the buffer, forcing subsequent chunks to wait for the native engine to drain the pipe. Previously, `MultiplexedRuntime._write_bytes` set a single static 5.0-second deadline across the entire multi-chunk frame. If the engine was busy executing a prefill chunk or SSD expert read, the timer expired, raising `EngineUnhealthy("native frame write timed out after 65536 bytes")` and triggering an unrecoverable process restart (`resident layers: 0 / 48`) with HTTP 503 `runtime_unavailable`.

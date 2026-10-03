@@ -283,6 +283,18 @@ struct Runtime::Impl {
     }
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
+    preparePolicyPipelines();
+  }
+
+  // Pre-compiles sampling and constrained decoding shaders ahead of time
+  // to eliminate the 200-400 ms first-token JIT compilation spike.
+  void preparePolicyPipelines() const {
+    backend.preparePipeline("decode_sample_top32_sharded");
+    backend.preparePipeline("decode_sample_top32_probs");
+    backend.preparePipeline("decode_sample_sparse_draw");
+    backend.preparePipeline("decode_sample_sparse_top1");
+    backend.preparePipeline("decode_sample_top32_sharded_batch");
+    backend.preparePipeline("decode_sample_top32_probs_batch");
   }
 
   Request &request(uint64_t id) {

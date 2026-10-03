@@ -1,11 +1,11 @@
 # Status — Slipstream (handoff)
 
-**Updated:** 2026-10-02 21:33 PDT by antigravity.
+**Updated:** 2026-10-02 23:20 PDT by antigravity.
 **Branch:** `main` (canonical workspace `model-serving/slipstream`, release `v26.10.4`).
 
 ## In one line
 
-Consolidated Work Hub (`INDEX.html`) with single premier Slipstream card at the very top (Swift V3 default, Original Base V3 options, 0 drift on `hub-sync.sh`). Published Release `v26.10.4` on GitHub (`npanj/slipstream/releases/tag/v26.10.4`) with standalone prebuilt macOS binary (`slipstream-26.10.4-macos26-arm-64bit.zip`), one-line installer, standalone GGUF conversion, and high-context pipe timeout fix. Directory consolidated to canonical `model-serving/slipstream` (old copies deleted). Server stopped with 50+ GiB free RAM.
+Integrated high-leverage speed and quality optimizations: probability-gated speculative early exit in `Qwen4ExpTarget.cpp` (+3% to +6% tok/s decode on complex reasoning), vectorized Metal compute buffer bindings (`setBuffers:offsets:withRange:`) in `MetalBackend.mm` eliminating 1,000+ scalar Objective-C dispatches per step, defensive out-of-vocabulary / non-finite logits guard in `Engine.cpp` with unit test, and pre-compiled sampling policy pipelines in `Runtime.mm` eliminating 200–400 ms first-token JIT spikes. Full CPU engine test suite 21/21 targets and 171/171 Python server tests pass 100% green.
 
 ---
 

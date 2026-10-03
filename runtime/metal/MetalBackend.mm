@@ -1218,6 +1218,11 @@ CommandTiming MetalBackend::submitCommand(
     return submitCommandAsync(dispatches).wait();
 }
 
+void MetalBackend::preparePipeline(std::string_view name) {
+    impl_->ensureHealthy();
+    static_cast<void>(impl_->pipeline(name));
+}
+
 CommandTicket MetalBackend::submitAsync(
     const ComputeDispatch &dispatch, CommandCompletion completion) {
     return submitCommandAsync(
@@ -1552,12 +1557,29 @@ CommandTicket MetalBackend::submitCommandAsync(
                         }))
                         continue;
                     [encoder setComputePipelineState:item.pipeline];
+                    constexpr uint32_t kMaxBufferEntries = 31;
+                    __unsafe_unretained id<MTLBuffer> mtlBuffers[kMaxBufferEntries];
+                    NSUInteger mtlOffsets[kMaxBufferEntries];
+                    uint32_t bufferIndices = 0;
                     for (const BufferBinding &binding : dispatch.buffers) {
                         const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
-                        [encoder setBuffer:buffer.allocation->buffer
-                                    offset:checkedNSUInteger(buffer.offsetBytes,
-                                                             "buffer offset")
-                                   atIndex:binding.index];
+                        if (binding.index < kMaxBufferEntries) {
+                            mtlBuffers[binding.index] = buffer.allocation->buffer;
+                            mtlOffsets[binding.index] = static_cast<NSUInteger>(buffer.offsetBytes);
+                            bufferIndices |= (1U << binding.index);
+                        } else {
+                            [encoder setBuffer:buffer.allocation->buffer
+                                        offset:static_cast<NSUInteger>(buffer.offsetBytes)
+                                       atIndex:binding.index];
+                        }
+                    }
+                    while (bufferIndices) {
+                        const uint32_t first = __builtin_ctz(bufferIndices);
+                        const uint32_t count = __builtin_ctz(~(bufferIndices >> first));
+                        [encoder setBuffers:mtlBuffers + first
+                                    offsets:mtlOffsets + first
+                                  withRange:NSMakeRange(first, count)];
+                        bufferIndices &= ~(((1U << count) - 1U) << first);
                     }
                     for (const BytesBinding &binding : dispatch.bytes) {
                         [encoder setBytes:binding.data
@@ -1598,9 +1620,6 @@ CommandTicket MetalBackend::submitCommandAsync(
     std::shared_ptr<BackendAsyncState> observer = impl_->asyncState;
     for (size_t c = 0; c < commands.size(); ++c) {
         id<MTLCommandBuffer> command = commands[c];
-        [command addScheduledHandler:^(id<MTLCommandBuffer>) {
-          observer->sampleDeviceMemory();
-        }];
         [command addCompletedHandler:^(id<MTLCommandBuffer> completedCommand) {
           observer->sampleDeviceMemory();
           auto wallEnd = std::chrono::steady_clock::now();

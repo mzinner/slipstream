@@ -2782,6 +2782,13 @@ void Qwen4ExpTarget::addVerify(
       const char *value = std::getenv("SPLASH_MTP_CHAIN_MIN");
       return value ? static_cast<float>(std::atof(value)) : 0.35f;
     }();
+    // Early-exit factor: token k only pays off if chainConfidence * P(k) >= chainConfident.
+    // If chainConfidence * earlyExitFactor < chainConfident, drafting token k is almost
+    // guaranteed to fail the chain check, so stop before dispatching MTP to the GPU.
+    static const float earlyExitFactor = [] {
+      const char *value = std::getenv("SPLASH_MTP_EARLY_EXIT_P");
+      return value ? static_cast<float>(std::atof(value)) : 0.85f;
+    }();
     static const bool treeDrafting = [] {
       const char *value = std::getenv("SPLASH_TREE_DRAFT");
       return value != nullptr && std::atoi(value) != 0;
@@ -2897,6 +2904,8 @@ void Qwen4ExpTarget::addVerify(
     // positions with the accepted tokens' real rows.
     static const bool rerun = std::getenv("SPLASH_MTP_RERUN") != nullptr;
     for (uint32_t k = 1; k < maxDrafts; ++k) {
+      if (chainConfidence * earlyExitFactor < chainConfident)
+        break;
       // One new row writes an 8-row window from its own position; when that
       // runs past the pages the request holds (a decode step reserves its
       // verify window only), re-run from the anchor, which stays inside it.
@@ -2917,7 +2926,7 @@ void Qwen4ExpTarget::addVerify(
       draftProbabilities[k] = lastProbabilities;
       chainConfidence *= lastConfidence;
       if (lastConfidence < confident || chainConfidence < chainConfident)
-        return drafts;
+        break;
       drafted = k + 1;
       std::memcpy(chain.data() + uint64_t{k} * width,
                   y + uint64_t{rerunThis ? k - 1 : 0} * width, width * 2);
