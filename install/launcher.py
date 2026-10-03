@@ -110,20 +110,28 @@ def pull(args):
     os.execv(command[0], command)
 
 
-def _prepare_gguf(model_path):
-    """Convert a folder of GGUF shards into model_path/prepared, once."""
+def _prepare_gguf(model_path, consume_source=False):
+    """Convert a folder of GGUF shards into model_path/prepared, once.
+
+    consume_source uses the shards up while converting them, so preparing needs
+    little more disk than the model instead of twice it, and removes shards an
+    earlier preparation left behind.
+    """
     prepared_dir = model_path / "prepared"
     if not model_artifacts.gguf_prepared(model_path):
         print(f"[Slipstream] Preparing GGUF model from {model_path}...", flush=True)
         # A separate process: install/models.py, imported above as
         # `models`, would shadow the repo's models/ package here.
         converter = ROOT / "models/qwen4exp/tools/convert_qwen4exp_gguf.py"
-        prepared = subprocess.run(
-            [str(paths.PYTHON), "-u", str(converter),
-             "--model-dir", str(model_path), "--output", str(prepared_dir)]
-        )
+        command = [str(paths.PYTHON), "-u", str(converter),
+                   "--model-dir", str(model_path), "--output", str(prepared_dir)]
+        if consume_source:
+            command.append("--consume-source")
+        prepared = subprocess.run(command)
         if prepared.returncode != 0:
             raise LauncherError(f"preparing {model_path} failed; see the output above")
+    elif consume_source:
+        model_artifacts.remove_gguf_source(model_path)
     return prepared_dir
 
 
@@ -185,8 +193,10 @@ def serve(args):
         model_str = args.model
         model_path = Path(model_str).expanduser()
         if model_path.is_dir():
+            # A folder of the user's own is never used up; only the model store's
+            # downloads, which can be fetched again, are.
             gguf_files = list(model_path.glob("*.gguf"))
-            if gguf_files:
+            if gguf_files or model_artifacts.gguf_prepared(model_path):
                 root = _prepare_gguf(model_path)
                 model_id = f"local/{model_path.name}"
             elif (model_path / "manifest.json").exists():
@@ -198,7 +208,7 @@ def serve(args):
             _ensure_installed(args.model)
             root = model_artifacts.installed_root(paths.MODELS, args.model)
             if model_artifacts.is_gguf_installation(root):
-                root = _prepare_gguf(root)
+                root = _prepare_gguf(root, consume_source=not args.keep_gguf)
             model_id = args.model
         command = [
             str(paths.PYTHON),
@@ -401,6 +411,12 @@ def parse_args(argv=None):
         help=f"HTTP serving port (default: {PORT})",
     )
     server.add_argument("--no-webui", action="store_true", help="disable the chat page")
+    server.add_argument(
+        "--keep-gguf",
+        action="store_true",
+        help="keep a downloaded GGUF model's files after preparing it (needs about twice "
+        "the model's size on disk); by default they are used up while preparing",
+    )
     puller = commands.add_parser(
         "pull", help="download a model from Hugging Face without serving it"
     )

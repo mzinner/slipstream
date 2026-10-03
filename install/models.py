@@ -88,6 +88,9 @@ MTP_SIDECAR = "MTP/mtp-shared-Q4_K_M.gguf"
 MTP_REPO = "nitinpanj/qwen38-flash-next-v3"
 MTP_REVISION = "e2982050848c67fe8aa9073e8c4205d272cc4f20"
 MTP_SIZE = 1907151936
+# What preparing writes before it frees the source: up to 8 converter workers'
+# layers of 1.5 GiB.
+PREPARE_IN_FLIGHT_BYTES = 12 << 30
 
 
 def is_hex_digest(value, length: int) -> bool:
@@ -477,12 +480,33 @@ def is_gguf_installation(root: Path) -> bool:
 
 
 def gguf_downloaded(root: Path) -> bool:
-    """Whether a GGUF installation's download finished."""
+    """Whether a GGUF installation's download finished, or is no longer needed.
+
+    Preparing uses the shards up by default, so a prepared installation has
+    none, and one whose package was removed must download them again.
+    """
+    if gguf_prepared(root):
+        return True
     try:
         downloaded = read_json(root / GGUF_MARKER).get("downloaded") is True
     except ModelError:
         downloaded = False
-    return downloaded or gguf_prepared(root)
+    return downloaded and any(_is_gguf_shard(path.name) for path in root.glob("*.gguf"))
+
+
+def remove_gguf_source(root: Path) -> None:
+    """Delete the shards and MTP head of a prepared installation: its package replaces them."""
+    if not gguf_prepared(root):
+        return
+    for path in [*sorted(root.glob("*.gguf")), root / MTP_SIDECAR]:
+        if path.is_file():
+            size = path.stat().st_size
+            path.unlink()
+            print(
+                f"Deleted {path.relative_to(root)} ({size / 2**30:.1f} GiB); "
+                "the prepared package replaces it",
+                flush=True,
+            )
 
 
 def gguf_prepared(root: Path) -> bool:
@@ -535,14 +559,16 @@ def install_gguf(found: GgufRepository, root: Path):
     if not has_mtp:
         needed += _missing_bytes(root, {MTP_SIDECAR: MTP_SIZE})
     if not gguf_prepared(root):
-        # The prepared package is about as large as the shards.
-        needed += sum(size or 0 for size in shards.values())
+        # Preparing uses the shards up as it converts them (unless the server
+        # keeps them, when the converter checks for room itself), so it needs
+        # room only for the package's growth over them and the parts in flight.
+        needed += sum(size or 0 for size in shards.values()) // 20 + PREPARE_IN_FLIGHT_BYTES
     root.mkdir(parents=True, exist_ok=True)
     free = shutil.disk_usage(root).free
     if needed > free:
         raise ModelError(
             f"{model_id} needs {needed / 2**30:.1f} GiB more disk space "
-            f"(shards plus the package prepared from them); {free / 2**30:.1f} GiB is free"
+            f"(the download, and room to prepare it); {free / 2**30:.1f} GiB is free"
         )
     marker.write_text(json.dumps({"model": model_id, "revision": revision}) + "\n")
 
