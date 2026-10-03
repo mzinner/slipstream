@@ -2,7 +2,7 @@
 #
 # Slipstream installer for Apple Silicon Macs.
 #
-#   curl -fsSL https://github.com/mzinner/slipstream/raw/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/npanj/slipstream/main/install.sh | sh
 #
 # Picks the package for this Mac from a GitHub release, verifies it against the
 # release's SHA256SUMS, unpacks it into ~/.local/share/slipstream/<version> and
@@ -12,14 +12,14 @@
 #   SLIPSTREAM_TAG     install this release tag instead of the newest, e.g. v26.10.0
 #   SLIPSTREAM_PREFIX  where versions are unpacked  (default ~/.local/share/slipstream)
 #   SLIPSTREAM_BINDIR  where the command is linked  (default ~/.local/bin)
-#   SLIPSTREAM_REPO    owner/repo to install from   (default mzinner/slipstream)
+#   SLIPSTREAM_REPO    owner/repo to install from   (default npanj/slipstream)
 #   SLIPSTREAM_TOKEN   GitHub token for a private repository (GH_TOKEN, GITHUB_TOKEN
 #                      and `gh auth token` are tried too)
 #
 # POSIX sh, so it runs from a pipe into whatever /bin/sh is.
 set -eu
 
-REPO="${SLIPSTREAM_REPO:-mzinner/slipstream}"
+REPO="${SLIPSTREAM_REPO:-npanj/slipstream}"
 PREFIX="${SLIPSTREAM_PREFIX:-$HOME/.local/share/slipstream}"
 BINDIR="${SLIPSTREAM_BINDIR:-$HOME/.local/bin}"
 TOKEN="${SLIPSTREAM_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"

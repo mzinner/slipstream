@@ -105,6 +105,7 @@ HTTP_IO_TIMEOUT = 30.0
 CLIENT_DISCONNECT_POLL = 0.01
 SSE_KEEPALIVE_SECONDS = 2.0
 NATIVE_START_TIMEOUT = 600.0
+NATIVE_IO_TIMEOUT = float(os.environ.get("SLIPSTREAM_IO_TIMEOUT", "60.0"))
 ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
 
@@ -1664,6 +1665,7 @@ def main():
         runtime = engine_runtime.MultiplexedRuntime(
             _native_command(args),
             startup_timeout=NATIVE_START_TIMEOUT,
+            io_timeout=NATIVE_IO_TIMEOUT,
             pending_limit=args.queue_size,
             eager_start=False,
         )

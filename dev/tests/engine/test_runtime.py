@@ -677,8 +677,11 @@ class RuntimeTests(unittest.TestCase):
 
         process.send(wire.MaskRequestEvent(call.request_id, 987, 2, (5, 6, 7)))
         response = process.stdin.wait_for(wire.MaskResponseFrame)[0]
-        self.assertTrue(provider_called.is_set())
-        self.assertTrue(provider_thread[0].startswith("splash-mask"))
+        self.assertTrue(
+            provider_thread[0].startswith(
+                ("splash-mask", "slipstream-mask", "slipstream-v2-mask")
+            )
+        )
         self.assertEqual(response.request_id, call.request_id)
         self.assertEqual(response.mask_request_id, 987)
         self.assertEqual(response.mask_words, (1, 2, 3, 4, 5, 6, 7, 8))

@@ -408,6 +408,9 @@ class _StartupAttempt:
     error: EngineRuntimeError | None = None
 
 
+DEFAULT_IO_TIMEOUT = float(os.environ.get("SLIPSTREAM_IO_TIMEOUT", "30.0"))
+
+
 class MultiplexedRuntime:
     """One-reader, direct-admission client for the native protocol."""
 
@@ -421,7 +424,7 @@ class MultiplexedRuntime:
         *,
         process_factory: Callable[[], ProcessLike] | None = None,
         startup_timeout: float = 30.0,
-        io_timeout: float = 5.0,
+        io_timeout: float = DEFAULT_IO_TIMEOUT,
         pending_limit: int = 64,
         mask_workers: int | None = None,
         eager_start: bool = True,
@@ -870,8 +873,9 @@ class MultiplexedRuntime:
         call: RuntimeCall | None = None,
         deadline: float | None = None,
     ) -> None:
+        caller_deadline = deadline
         io_deadline = time.monotonic() + self._io_timeout
-        deadline = min(deadline, io_deadline) if deadline is not None else io_deadline
+        deadline = min(caller_deadline, io_deadline) if caller_deadline is not None else io_deadline
         if not self._write_lock.acquire(timeout=_remaining(deadline)):
             raise TimeoutError("native write lock timed out")
         failure: BaseException | None = None
@@ -910,6 +914,11 @@ class MultiplexedRuntime:
                     if written <= 0:
                         raise BrokenPipeError("native stdin accepted zero bytes")
                     offset += written
+                    # Active forward progress: extend the io deadline so that multi-chunk
+                    # frames or high-context prompts are not killed when the engine is actively
+                    # draining the OS pipe buffer.
+                    io_deadline = time.monotonic() + self._io_timeout
+                    deadline = min(caller_deadline, io_deadline) if caller_deadline is not None else io_deadline
                 self._crash_trace.record_bytes(generation, "client_to_engine", encoded)
             except TimeoutError:
                 if offset == 0:

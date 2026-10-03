@@ -29,37 +29,51 @@ Everything is open source under Apache-2.0.
 ### Prerequisites
 - **Hardware:** Apple Silicon Mac with **64 GB Unified Memory** (M2/M3/M4/M5 Pro/Max).
 - **Disk:** ~100 GB for the multi-shard GGUF weights + ~95 GB working disk space.
-- **macOS:** macOS 15.0+ with Command Line Tools or Xcode installed (`xcode-select --install`).
+- **macOS:** macOS 15.0+ (macOS 26.4+ SDK).
 
 ---
 
-### Step 1: Clone & Build Slipstream
+### Step 1: Install Slipstream
+
+You can install Slipstream directly without compiling, or build from source:
+
+#### Option A: One-line install (Recommended — No compilation required)
+
+```zsh
+curl -fsSL https://raw.githubusercontent.com/npanj/slipstream/main/install.sh | sh
+```
+
+*This automatically detects your Apple Silicon Mac, downloads the latest prebuilt release binary, verifies its SHA256 checksum, unpacks into `~/.local/share/slipstream/`, and links `slipstream` into `~/.local/bin`.*
+
+You can also download `slipstream-<version>-macos26-arm-64bit.zip` directly from [GitHub Releases](https://github.com/npanj/slipstream/releases/latest).
+
+#### Option B: Build from source
 
 ```zsh
 git clone https://github.com/npanj/slipstream.git
 cd slipstream
 make -j4
 ```
-*Note: `make` compiles the native C++ runtime and Metal compute kernels into `build/slipstream` and `build/slipstream.metallib` in under a minute.*
 
 ---
 
-### Step 2: Download the Model
+### Step 2: Download or Pull the Model
 
-We recommend the **Swift KV-sparse variant** for optimal reasoning accuracy and lower KV memory footprint:
+You can serve directly by Hugging Face repo ID (Slipstream will download and set up weights and MTP sidecars automatically):
 
 ```zsh
-# Recommended: Swift-Qwen3.8-Flash-Next V3 (95.5 GiB)
+# Download without serving:
+slipstream pull nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF
+```
+
+Or download manually using the Hugging Face CLI:
+
+```zsh
+# Recommended: Swift-Qwen3.8-Flash-Next V3 (95.5 GiB, KV-sparse)
 huggingface-cli download nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF \
     --local-dir ~/models/swift-qwen38-flash-next-v3
 
-# Or download with fast parallel transfer if hf_transfer is installed:
-HF_HUB_ENABLE_HF_TRANSFER=1 huggingface-cli download nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF \
-    --local-dir ~/models/swift-qwen38-flash-next-v3
-```
-
-*(Alternative: If you prefer the plain dense base model without Swift KV-sparsity:)*
-```zsh
+# Or download the plain base model:
 huggingface-cli download nitinpanj/qwen38-flash-next-v3 \
     --local-dir ~/models/qwen38-flash-next-v3
 ```
@@ -78,13 +92,20 @@ sudo sysctl iogpu.wired_limit_mb=59392
 
 ### Step 4: Serve the Model
 
-Point `./slipstream serve` directly at the downloaded model directory:
+Run `slipstream serve` pointing at a local folder or directly at a Hugging Face repo ID:
 
 ```zsh
-./slipstream serve --model ~/models/swift-qwen38-flash-next-v3 --port 8090
+# Serve local model directory:
+slipstream serve --model ~/models/swift-qwen38-flash-next-v3 --port 8090
+
+# Or serve directly by Hugging Face repo ID (downloads & sets up automatically):
+slipstream serve --model nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF --port 8090
+
+# Or serve on your local network (e.g. for other devices or web UIs):
+slipstream serve --model ~/models/swift-qwen38-flash-next-v3 --host 0.0.0.0 --port 8090 --api-key YOUR_KEY
 ```
 
-> **First Run Note:** On first launch, Slipstream detects the multi-shard GGUF files and prepares optimized streaming package files into `<model-dir>/prepared/` (~5–7 minutes). Subsequent launches load in **~10–15 seconds**.
+> **First Run Note:** On first launch, Slipstream detects multi-shard GGUF files and prepares optimized streaming package files into `<model-dir>/prepared/` (~5–7 minutes). Subsequent launches load in **~10–15 seconds**.
 
 ---
 

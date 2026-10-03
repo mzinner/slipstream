@@ -192,6 +192,9 @@ def serve(args):
             elif (model_path / "manifest.json").exists():
                 root = model_path
                 model_id = f"local/{model_path.name}"
+            elif (model_path / "prepared/manifest.json").exists():
+                root = model_path / "prepared"
+                model_id = f"local/{model_path.name}"
             else:
                 raise LauncherError(f"Directory {model_path} does not contain GGUF files or a manifest.json")
         else:

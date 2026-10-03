@@ -71,8 +71,12 @@
 
 <h1>Slipstream — a visual tutorial</h1>
 <p class="lead">
-How one big model runs fast on one Mac: the architecture, the request path, the decode step,
-and — in detail — <strong>how the GPU kernels are written</strong>. Every claim below points at
+How one big model runs fast on one Mac. The tutorial has three parts: first the
+<strong>model</strong> (Qwen3.8-Flash-Next and why it is built the way it is), then
+<strong>Swift</strong> (the quantized builds that made it small enough) and the engine line
+(llama.cpp fork → Splash → Slipstream), and finally the <strong>Slipstream framework</strong>:
+the architecture, the request path, the decode step, and — in detail —
+<strong>how the GPU kernels are written</strong>. Every claim below points at
 real code in this repository.
 </p>
 
@@ -85,8 +89,25 @@ real code in this repository.
 
 <div class="toc">
   <strong>Contents</strong>
+  <p class="muted" style="margin:4px 0 2px"><strong>Part I · The model</strong></p>
   <ol>
     <li><a href="#s0">How to read this tutorial</a></li>
+    <li><a href="#sA">The model: Qwen3.8-Flash-Next</a> — integrated from
+      <em>Why Flash-Next Fits in 64&nbsp;GB</em>, worked end to end:
+      <span class="muted" style="font-size:12.5px">
+      <a href="#sA1">the one inequality</a> · <a href="#sA2">MoE by hand</a> ·
+      <a href="#sA3">weights on disk</a> · <a href="#sA4">the indexer</a> ·
+      <a href="#sA5">GDN layers</a> · <a href="#sA6">hyper-connections</a> ·
+      <a href="#sA7">MTP</a> · <a href="#sA8">n-gram embedding</a> ·
+      <a href="#sA9">spec sheet + precision map</a> · <a href="#sA10">what each choice costs</a></span>
+    </li>
+  </ol>
+  <p class="muted" style="margin:4px 0 2px"><strong>Part II · Getting small: Swift and the engine line</strong></p>
+  <ol start="3">
+    <li><a href="#sB">Swift quantization, and how the engines evolved</a></li>
+  </ol>
+  <p class="muted" style="margin:4px 0 2px"><strong>Part III · The Slipstream framework</strong></p>
+  <ol start="4">
     <li><a href="#s1">The big picture: seven layers</a></li>
     <li><a href="#s2">A request's journey</a></li>
     <li><a href="#s3">One decode step</a> — incl. the pipelined step</li>
@@ -99,7 +120,418 @@ real code in this repository.
 </div>
 
 <!-- ================================================================ -->
-<h2 id="s0">0 · How to read this tutorial</h2>
+<h2 id="part1" style="margin-top:36px">Part I · The model</h2>
+<h2 id="sA">1 · The model: Qwen3.8-Flash-Next</h2>
+<p>
+Before the engine, the machine it runs on: a Mixture-of-Experts hybrid-attention model whose
+upstream architecture name is <code>qwen4exp</code>. Every number in this section is from the
+published <code>config.json</code>, mirrored as compile-time constants in
+<code>models/qwen4exp/Qwen4Exp.hpp</code> and checked against the package by the loader.
+</p>
+
+<div class="nums">
+  <div class="num"><b>48</b><span>layers: 36 GDN + 12 sparse attention (1 in 4)</span></div>
+  <div class="num"><b>512 → 10</b><span>experts per layer; only 10 fire per token</span></div>
+  <div class="num"><b>~100 GB</b><span>weights — too big for this 64 GB Mac</span></div>
+  <div class="num"><b>+1</b><span>MTP draft head: the model ships its own guesser</span></div>
+</div>
+
+<h3>1.1 The blocks in one layer</h3>
+<table>
+  <tr><th>Block</th><th>What it is</th><th>Where it runs in this repo</th></tr>
+  <tr>
+    <td><strong>GDN mixer</strong> (36 of 48 layers)</td>
+    <td>Gated DeltaNet <em>linear attention</em>: a recurrent state per request, constant cost per token, no KV growth</td>
+    <td><code>runtime/ops/GDN.cpp</code> · state in <code>runtime/model/QwenState.*</code></td>
+  </tr>
+  <tr>
+    <td><strong>Sparse attention</strong> (every 4th layer)</td>
+    <td>Full attention with a learned <em>indexer</em> (4 heads, 1 KV head, head dim 128) that picks which KV pages to read</td>
+    <td>sparse picker kernel in <code>models/qwen4exp/kernels/</code></td>
+  </tr>
+  <tr>
+    <td><strong>MoE MLP</strong></td>
+    <td>512 tiny experts (intermediate 640) + 1 shared expert; a router scores all 512 and the top 10 run</td>
+    <td><code>runtime/ops/MoE.cpp</code> + expert streaming in <code>models/qwen4exp/Qwen4Exp.cpp</code></td>
+  </tr>
+  <tr>
+    <td><strong>Hyper-connections</strong></td>
+    <td>4 residual streams mixed by low-rank (rank 320) learned weights, instead of one plain residual add</td>
+    <td><code>hyper_connection*.metal</code> (model-specific)</td>
+  </tr>
+  <tr>
+    <td><strong>N-gram embedding</strong> (layer 1)</td>
+    <td>Hashes of the last 3 tokens look up embeddings in a huge table (320,001,536 × 2560) — cheap learned n-gram features</td>
+    <td>per-layer n-gram embedding kernels</td>
+  </tr>
+  <tr>
+    <td><strong>MTP draft head</strong></td>
+    <td>One extra layer shipped with the model: reads the target's state from layer 43 and guesses the next tokens</td>
+    <td><code>Qwen4ExpTarget.cpp</code> (addHead) · <code>mtp_pick.metal</code></td>
+  </tr>
+</table>
+
+<div class="callout">
+<p><strong>Why the architecture looks exotic:</strong> every unusual block is a bet on the same
+problem — decode is <em>memory-bandwidth</em> bound. GDN shrinks the state, the indexer shrinks the
+KV reads, MoE shrinks the compute per token, and the MTP head turns one weight read into several
+accepted tokens. The one place the bet is extreme is the MoE: see below.</p>
+</div>
+
+<p class="muted" style="font-size:13px">
+Sections 1.1–1.8 below are integrated from the standalone first-principles tutorial
+<em>“Why Flash-Next Fits in 64&nbsp;GB”</em>
+(<code>~/Documents/shared-with-google-drive/ml-study/flashnext-tutorial/</code>), whose numeric
+self-checks live in its <code>spec.json</code>; every figure here was re-verified against it and
+against the engine's layout constants in <code>models/qwen4exp/Qwen4Exp.hpp</code>. The original
+keeps its figures (SVG); this version carries the derivations in text.
+</p>
+
+<h3 id="sA1">1.1 The one inequality: speed is bytes, not math</h3>
+<p>
+Two ideas are all you need. A transformer layer is a pile of matrix multiplications; and at batch
+size 1 a token's speed is set by <em>how many bytes must be read to produce it</em>, not by how many
+multiplications are done — each weight is used for one multiply-accumulate and then discarded.
+So for a dense model that must read all of its <code>B</code> bytes per token, on a machine that
+moves <code>R</code> bytes/s:
+</p>
+<pre><code>(1.1)   tokens/s  ≤  R / B
+(1.2)   sparse ÷ dense  =  B_dense / B_sparse          (R cancels — count bytes, not FLOPs)</code></pre>
+<p>
+The puzzle: Qwen3.8-Flash-Next holds <strong>176.94 billion parameters, 93.82 GiB on disk</strong>,
+yet decodes 26.5 tok/s on a 64 GB machine (llama.cpp baseline; 41 tok/s in Slipstream). It is not
+compression. The model reads only a slice of itself per token:
+</p>
+<pre><code>(1.3)   always-on trunk (attention, norms, routers, head)  =  3.4 GiB
+        experts this token uses (§1.3)                     =  1.2359 GiB
+        bytes read per token                               =  4.6359 GiB
+(1.4)   93.82 / 4.6359 = 20.24×   → dense ceiling 1.31 tok/s × 20.24 = 26.5 tok/s measured</code></pre>
+<p>
+One twentieth of the file crosses the memory bus per token; the measured 26.5 tok/s implies
+≈131.9 GB/s of weight traffic — derived from the model, not assumed. Every design choice in the
+rest of this section is an answer to equation (1.1): make the bytes-read-per-token small, and keep
+them small as the model grows and as the context grows.
+</p>
+
+<h3 id="sA2">1.2 The MoE block, end to end, by hand</h3>
+<p>
+The running example is <strong>Tiny-Next</strong>: 4 dimensions, 4 experts, top-2, input
+<code>x = (1, 0, 2, −1)</code> — Flash-Next shrunk ~100×, behaving identically.
+</p>
+<p><strong>Route.</strong> A router matrix has one row per expert; each row scores its expert's
+relevance to this token by dot product:</p>
+<pre><code>r0·x = 1    r1·x = 4    r2·x = 1    r3·x = 3        → keep the top 2: experts 1 and 3</code></pre>
+<p>
+Experts 0 and 2 are not multiplied by zero — <em>their weights are never fetched</em>. That
+sentence is the whole tutorial in five words. Softmax is taken over the <em>winners only</em>
+(over all four, the losers would steal probability mass from a blend that never uses them):
+</p>
+<pre><code>(2.3)   g1 = e⁴/(e⁴+e³) = 0.7311        g3 = e³/(e⁴+e³) = 0.2689</code></pre>
+<p><strong>Run the winners.</strong> Each expert is a SwiGLU MLP — up-projection U, gate G,
+down-projection D — computing <code>D(SiLU(Gx) ⊙ Ux)</code>, SiLU(z) = z/(1+e⁻ᶻ):
+</p>
+<pre><code>expert 1:  U₁x = (3,−1)   G₁x = (2,0)   →  h₁ = (SiLU(2)·3, SiLU(0)·(−1)) = (5.2848, 0)
+         gate SiLU(0)=0 switched that hidden unit off entirely — that is what a gate <em>is</em>
+expert 3:  U₃x = (−1,1)   G₃x = (1,2)   →  h₃ = (−0.7311, 1.7616)
+blend:     y = 0.7311·D₁h₁ + 0.2689·D₃h₃ = (4.1408, 0.4737, 3.8637, −0.1966)   ✓ spec.json</code></pre>
+<p>
+Nothing in the derivation cared about the number 4. With E = 512 experts per layer and k = 10
+active (plus 1 shared expert that always runs — the DeepSeek-MoE refinement):
+</p>
+<pre><code>(2.10)  k/E = 10/512 = 1.9531%   →  a token visits 10×48 = 480 of the 512×48 = 24,576 experts.
+        the model has the capacity of 24,576 experts and the running cost of 480.</code></pre>
+
+<h3 id="sA3">1.3 The arithmetic that lets weights live on disk</h3>
+<pre><code>(3.1)  one expert  = 3 matrices × (2560×640) × 0.5625 B (4.5-bit avg) = 2.6367 MiB
+(3.2)  per token   = 10 experts × 48 layers × 2.6367 MiB             = 1.2359 GiB
+(3.3)  demand      = 1.2359 GiB × 26.5 tok/s                         = 35.16 GB/s   ← from SSD?
+(3.4)  misses only = 35.16 × (1 − 0.9931)                            = 0.2426 GB/s
+(3.5)  headroom    = 9.87 / 0.2426                                   = 40.7×</code></pre>
+<p>
+The SSD here does 9.87 GB/s (measured, page cache bypassed), so the answer to (3.3) must be
+<em>no</em> — and it is, because <strong>routing follows the text and the text changes slowly</strong>:
+a cache of recently used experts hits 99.31% of lookups once warm. ~32 GiB of experts sit in RAM
+(257 of 512 slots per layer as measured; Slipstream today caches 272 per layer in 34 GiB with a
+per-layer fitted profile, §5.1), the remaining ~32 GiB sit on the SSD, and the model cannot tell.
+The same locality argument covers the 26.8 GiB n-gram table (§1.8): its rows are 90 bytes, so a
+token touches a handful of kilobytes of it.
+</p>
+<div class="callout warn">
+<p><strong>What breaks this:</strong> if routing were uniform-random, the hit rate would collapse
+toward 257/512 = 50%, the disk would be asked for 17.6 GB/s, and the design dies. Streaming
+depends on routing predictability — an empirical property of the trained model, not a runtime
+guarantee. The engine's read-ahead (§5.1) bets on it too: it fetches 6 predicted experts per row
+while the GPU computes, right ~2/3 of the time.</p>
+</div>
+
+<h3 id="sA4">1.4 Sparse attention: paying 2% to avoid 98%</h3>
+<p>
+Sparsity fixed the weights; context is the other thing that grows. Attention compares each new
+token against all n predecessors: with H = 24 heads of d_h = 256 (12 attention layers), at
+n = 131,072:
+</p>
+<pre><code>(4.2)  full:        131,072 × 24 × 256            = 805,306,368 MACs / layer / token
+(4.3)  indexer:     (131,072/4) × 4 × 128         =  16,777,216   = 2.0833% of full
+(4.4)  on selected:     2,048 × 24 × 256          =  12,582,912
+(4.5)  805,306,368 / (16,777,216 + 12,582,912)    =        27.43× cheaper</code></pre>
+<p>
+The <strong>indexer</strong> is a miniature attention — 4 heads of 128 against 24 of 256 — whose
+only job is to score the context so the real attention runs on the top slice. Two refinements make
+it cheap: it scores the context <em>compressed 4:1</em> (blocks of 4 tokens), and it selects
+<em>whole blocks</em> (the budget is 2,048 tokens in blocks anyway). The indexer can pick badly —
+then the layer is confidently blind to a relevant passage — but the asymmetry favors it: a miss
+costs accuracy on one token, full attention costs 27× on every token, and the model is
+<em>trained with the indexer in place</em> to make its picks survivable. Break-even is ~2,091
+tokens, which is why the engine runs plain attention below the budget; the reference-check prompt
+in <code>~/models/qwen38-flash-next-reference/</code> deliberately crosses 2,048 to catch indexer
+bugs (<code>models/qwen4exp/tools/checks/check_indexer.py</code>).
+</p>
+<p>
+Only these 12 layers store KV at all: 12 layers × 2 KV heads × (256+256) × 2 B =
+<strong>24 KiB/token = 3.0 GiB at 131k</strong> (eq. 4.6) — small enough to keep resident, which is
+why no cache streaming is needed here, only the paged 8-bit KV cache (§6).
+</p>
+
+<h3 id="sA5">1.5 Three cheap layers for every expensive one (GDN)</h3>
+<p>
+Does every layer need to be attention? A fixed-size summary <code>S</code> carried forward, updated
+per token, costs the same at token 1,000,000 as at token 10 — but compresses, so old detail decays.
+Attention has unbounded cost and perfect recall; the recurrent summary has bounded cost and lossy
+recall. Flash-Next hedges 3:1 — 36 <strong>gated DeltaNet</strong> layers per 12 attention layers —
+and the delta rule is what makes the cheap one usable:
+</p>
+<pre><code>(5.1)   S_t = f(S_{t−1}, x_t)                        cost independent of t
+(5.2)   S_t = α_t ⊙ S_{t−1} + β_t ⊙ Δ_t              α decides what to KEEP,
+                                                      Δ is a delta — nudge, not replace</code></pre>
+<p>
+Both α and β are computed from the current token: the layer <em>learns when to remember</em>. The
+state is 48 value heads × 128 dimensions (16 key heads, 16:3 is the GQA of linear attention),
+plus a short convolution (dim 10,240) — all in the engine's per-request recurrent state
+(<code>runtime/model/QwenState.*</code>, <code>runtime/ops/GDN.cpp</code>). Measured effect: decode
+falls only 21.0 → 17.7 tok/s from context 0 to 65k on the llama.cpp baseline (−16%); a
+pure-attention model of this size falls far steeper. The interleave also explains a quantization
+choice: <strong>GDN state stays F32</strong> while experts sit at 4.5 bits — by (5.2), an error in a
+recurrent state compounds across the whole sequence, while an error in a feed-forward weight
+affects one token.
+</p>
+
+<h3 id="sA6">1.6 Four rivers instead of one (hyper-connections)</h3>
+<p>
+The residual stream <code>z ← z + sublayer(z)</code> has one structural weakness: all 96 sublayers
+read and write the <em>same</em> 2,560-wide channel, and distant sublayers interfere. The narrowest
+fix is more channels: Flash-Next carries <strong>m = 4 streams</strong> (working state 4×2560 =
+10,240 wide). A sublayer expects 2,560 inputs, so naively you'd read one stream (four
+non-communicating stacks) or concatenate (4× cost — exactly the cost this whole model exists to
+avoid). The answer is a learned low-rank mixture:</p>
+<pre><code>(6.2)   u  = mix(z₁..z₄)            rank-320 gate collapses 4 streams → 2,560, pre-sublayer
+        zᵢ ← zᵢ + wᵢ · sublayer(u)   learned inject writes the result back across all 4</code></pre>
+<p>
+This wraps every mixer and every MLP: twice per block, 96 times. The sublayer never knows there
+are four streams, so the cost is the mixing only — ~30% of decode, kept affordable <em>because</em>
+the mix is rank 320, not full rank (checkpoint tensors <code>hc_attn_*</code>, <code>hc_ffn_*</code>;
+engine kernels <code>hyper_connection*.metal</code>, mix weights deliberately 8-bit). Whether four
+streams are worth 30% is an empirical training-time choice; what the derivation establishes is the
+shape of the trade.</p>
+
+<h3 id="sA7">1.7 Getting tokens for free (the MTP head)</h3>
+<p>
+One more attack on equation (1.1): produce more than one token per weight-read. Suppose a cheap
+oracle knew the next two tokens — you'd feed all three positions through and <em>verify</em>, and
+verification is nearly free because the expensive part (fetching the weights) is shared. The model
+ships the oracle: a small draft layer (trunk attention shape, fed the trunk's state captured from
+layer 43, ~2.4 GiB against 93.82) guesses ahead; the trunk checks in one pass. With acceptance
+probability a and draft depth 2:
+</p>
+<pre><code>(7.1)   E[tokens per pass] = 1 + a + a²     (the 1 is the trunk's own token, always kept;
+                                            a guess after a rejected guess is discarded)
+(7.2)   measured a = 0.647  →  1 + 0.647 + 0.647² = 2.0645 tokens/pass
+        measured speedup 26.5/18.04 = 1.469×  (the head is extra work; 7.1 is a ceiling)</code></pre>
+<p>
+Deeper drafts are <em>not</em> better: acceptance falls with depth (measured a = 0.647 / 0.525 /
+0.429 at depths 2/3/4) while drafting cost rises linearly — speed peaked at 26.85 / 25.63 /
+23.06 tok/s, optimum depth 2 on this checkpoint (another checkpoint peaked at 3: the optimum
+follows the acceptance curve, not the architecture). Slipstream rides the same curve with a
+confidence stop (§5). <strong>The trap that caught its builders:</strong> the draft head must be fed
+the model's <em>4-stream</em> state from §1.6, not the collapsed 2,560 vector. Nothing errors —
+acceptance silently falls to ~1%, and the tell is an acceptance rate that doesn't move when the
+draft weights change.
+</p>
+
+<h3 id="sA8">1.8 The block no derivation predicted: the n-gram embedding</h3>
+<p>
+Layer 1 adds a per-layer embedding the derivations above don't need: hashes of the last 3 tokens
+(order 3, 8 heads per order, each head its own prime-sized vocabulary from base 20,000,000) look
+up rows in a table of <strong>320,001,536 × 2560 at Q4 ≈ 26.8 GiB</strong>, fed through a dilated
+convolution (4 taps). It buys learned token-identity features at lookup cost — cheap exactly
+because a token touches a handful of 90-byte rows (locality again, §1.3). On disk it is the third
+biggest object in the package; in compute it is a rounding error. Engine:
+<code>ngram_embedding*.metal</code>, layout constants in <code>Qwen4Exp.hpp:80-95</code>. The port
+notes one trap it set: 16 heads × 160 and 8 heads × 2560 have the <em>same element count</em> —
+check shapes, never byte totals.</p>
+
+<h3 id="sA9">1.9 The spec sheet, the precision map, and where each block runs</h3>
+<p>
+Every number below is mirrored as a compile-time constant in <code>models/qwen4exp/Qwen4Exp.hpp</code>
+(from the published config) and checked against the package by the loader:
+</p>
+<table>
+  <tr><th>Dimension</th><th>Value</th><th>Where it lives in this repo</th></tr>
+  <tr><td>trunk</td><td>48 layers · hidden 2560 · vocab 248,320 (same as Qwen3.8) · 262,144 max positions</td><td><code>Qwen4Exp.hpp:41-56</code></td></tr>
+  <tr><td>GDN mixer (36 layers)</td><td>16 key heads · 48 value heads · head dim 128 · conv dim 10,240</td><td><code>runtime/ops/GDN.cpp</code> · state <code>runtime/model/QwenState.*</code></td></tr>
+  <tr><td>full attention (every 4th)</td><td>24 Q / 2 KV heads · head dim 256 · RoPE θ = 10,000,000 · query doubled for an output gate</td><td><code>runtime/ops/PagedAttention.cpp</code></td></tr>
+  <tr><td>indexer</td><td>4 heads × 128 · 1 KV head · budget 2,048 tokens, block-granular</td><td>sparse picker kernel in <code>models/qwen4exp/kernels/</code></td></tr>
+  <tr><td>MoE (every layer)</td><td>512 experts + 1 shared · top-10 · intermediate 640</td><td><code>runtime/ops/MoE.cpp</code> · streaming <code>Qwen4Exp.cpp</code></td></tr>
+  <tr><td>hyper-connections</td><td>4 streams · low-rank 320</td><td><code>hyper_connection*.metal</code></td></tr>
+  <tr><td>n-gram embedding (layer 1)</td><td>order 3 · 320,001,536 rows × 2560 · 128 shards · conv taps 4</td><td><code>ngram_embedding*.metal</code> · <code>Qwen4Exp.hpp:80-95</code></td></tr>
+  <tr><td>MTP draft head</td><td>1 layer, trunk attention shape · reads layer-43 state · 64K draft vocabulary</td><td><code>Qwen4ExpTarget.cpp</code> (addHead) · <code>mtp_pick.metal</code></td></tr>
+</table>
+<p>
+<strong>The precision map</strong> — where the quantization bits went, and why (this is also
+Part II's thesis in one table; source: the tutorial's tensor-table notes + the reference-quant
+recipe in <code>~/models/qwen38-flash-next-reference/README.md</code>):
+</p>
+<table>
+  <tr><th>Tensor group</th><th>Bits</th><th>Why</th></tr>
+  <tr><td>gate/up experts (Q4_0; 138/144 tensors), n-gram table</td><td>4.5</td><td>the bulk (63.6 GiB + 26.8 GiB); every extra bit on the table costs ~6 GiB</td></tr>
+  <tr><td>output head, shared expert, KV projections</td><td>8.5 (Q8_0)</td><td>read on every token and land directly on the output distribution</td></tr>
+  <tr><td>indexer projections</td><td>16 (BF16)</td><td>its scores are only <em>compared with each other</em> — a small error reorders which tokens the layer can see</td></tr>
+  <tr><td>GDN recurrent state</td><td>32 (F32)</td><td>recurrent: by eq. (5.2) error compounds across every token</td></tr>
+</table>
+<div class="callout">
+<p><strong>The pattern:</strong> spend bits where a small error changes a <em>decision</em>
+(which tokens the indexer sees, what the state remembers, which token the head emits); save them
+where an error merely blurs a value. The three highest-precision groups are exactly the
+decision-makers from §1.4, §1.5 and §1.1.</p>
+</div>
+
+<h3 id="sA10">1.10 What each decision costs, and how they compose</h3>
+<table>
+  <tr><th>Mechanism</th><th>Buys</th><th>Concession (a measurable failure mode)</th></tr>
+  <tr><td>top-10-of-512 MoE (§1.2)</td><td>20.24× less weight traffic per token</td><td>assumes routing predictability; a topic-jumping text drops the 99.31% hit rate and the SSD becomes the bottleneck (watch: rising miss rate, §5.1)</td></tr>
+  <tr><td>expert streaming (§1.3)</td><td>3/5 of the file stays on disk at no speed cost</td><td>same predictability bet; cache sizing is an eviction-policy design problem</td></tr>
+  <tr><td>indexer (§1.4)</td><td>27.43× cheaper attention that stays flat with context</td><td>can pick the wrong 2,048 tokens — confident blindness, not an error; break-even ~2,091 tokens</td></tr>
+  <tr><td>3:1 GDN interleave (§1.5)</td><td>3/4 of layers flat in context; KV only 24 KiB/token</td><td>recurrent layers forget; shift the ratio and you trade one failure for the other</td></tr>
+  <tr><td>hyper-connections (§1.6)</td><td>4 channels, less sublayer interference</td><td>~30% of decode time; empirically worth it, not derivable</td></tr>
+  <tr><td>MTP head (§1.7)</td><td>2.06 tokens/pass theoretical, 1.469× measured (2.8–3.1 with Slipstream's deeper draft)</td><td>needs the 4-stream state; optimum depth follows the acceptance curve</td></tr>
+  <tr><td>n-gram embedding (§1.8)</td><td>token-identity features for ~free compute</td><td>26.8 GiB of package and one more cache to plan</td></tr>
+</table>
+<p>
+The mechanisms <em>compose</em>, and that is the real result: sparsity divides bytes by ~20;
+streaming moves 3/5 of the file to disk at no cost; the indexer divides attention by 27 and stops
+it growing; the interleave keeps 3/4 of layers flat; MTP extracts 2.06 tokens from every read. No
+single one makes a 176.94-billion-parameter model run on a 64 GB laptop — the product of all of
+them does. <span class="muted">(Numbers in this section: measured 2026-09-01 on the M5 Pro under
+the llama.cpp fork at 26.5 tok/s; the Slipstream engine's own measurements are in §5 and
+<code>docs/profiling.md</code>.)</span>
+</p>
+<details>
+<summary><strong>Problems</strong> (from the standalone tutorial; answers collapsed)</summary>
+<ol>
+  <li>★ With eq. (1.1) only: show the dense 93.82 GiB model caps at 1.31 tok/s at 131.9 GB/s, and
+  4.6359 GiB/token gives 26.5.
+  <details><summary>Answer</summary>93.82 GiB × 1.0737 = 100.74 GB; 131.9/100.74 = 1.31.
+  4.6359 GiB = 4.978 GB; 131.9/4.978 = 26.5. Equivalently 1.31 × 20.24 = 26.5.</details></li>
+  <li>Recompute the eq. (2.3) blend with router scores (1, 4, 1, 4). Which experts, which weights,
+  and why is “which experts” now ambiguous?
+  <details><summary>Answer</summary>Tie between experts 1 and 3 (both 4); softmax over winners is
+  now (0.5, 0.5) <em>if</em> both are kept — the selection rule must break ties, and the router
+  gives no preference. Any tie-break is a silent numerical choice.</details></li>
+  <li>Raising the expert cache 257 → 400 slots/layer lifts the hit rate 99.31% → 99.8%. Eq. (3.4):
+  new disk traffic?
+  <details><summary>Answer</summary>35.16 × (1 − 0.998) = 0.0703 GB/s, vs 0.2426. The disk was
+  already at 2.5% of its ability (40.7× headroom) — you would buy a 5th× headroom with 18 GiB
+  of the scarcest resource. Not worth it; spend RAM on the KV cache instead.</details></li>
+  <li>★ Indexer break-even: at what n does scoring n/4 blocks + attending 2,048 exceed full
+  attention?
+  <details><summary>Answer</summary>(n/4)(4)(128) + 2048·24·256 ≥ n·24·256 → 128n + 12,582,912 ≥
+  6144n → n ≤ 12,582,912/6016 ≈ 2,091. Below that the indexer costs more than it saves.</details></li>
+  <li>Using eq. (5.2), why does state error compound while feed-forward weight error does not? What
+  property of αₜ bounds the compounding?
+  <details><summary>Answer</summary>S_t feeds S_{t+1}: any perturbation is multiplied by α's all
+  the way forward. Feed-forward error touches one token's one activation. If αₜ ≤ α* &lt; 1 with
+  margin (the gate genuinely forgets), perturbations decay geometrically — bounded
+  compounding.</details></li>
+  <li>Eq. (7.1) at depths 2/3/4 with measured a = 0.647/0.525/0.429. Why does the ceiling barely
+  move?
+  <details><summary>Answer</summary>1+a+a² = 2.064; 1+a+a²+a³ = 2.271; depth-4 sum = 2.226 (a
+  falls faster than the sum grows — the 4th term adds 0.429³ = 0.079 and the 4th draft costs a
+  full drafting unit).</details></li>
+  <li>Eq. (4.6) with 24 KV heads instead of 2: new KV size, and what does it do to §1.3's
+  “cache stays resident”?
+  <details><summary>Answer</summary>24/2 × 24 KiB = 288 KiB/token → 36 GiB at 131k: KV alone eats
+  the expert cache. GQA (2 KV heads) is what makes resident KV affordable.</details></li>
+  <li>Does the Q8_0 shared expert fit the “bits where errors change decisions” rule?
+  <details><summary>Answer</summary>Partially: it runs on every token (use ≈ every token, so bits
+  are cheap per use) <em>and</em> its output is added to every routed expert's, nudging the final
+  distribution on every token — closer to the “decision” rule than the routed experts, whose
+  blend weights gate their influence.</details></li>
+  <li>Double the experts to 1,024 with 10 active: capacity, bytes/token, file size, hit rate —
+  which decides if it's a good idea on 64 GB?
+  <details><summary>Answer</summary>Capacity ↑ (more experts of the same size); bytes/token
+  <em>unchanged</em> (10 are read either way); file doubles to ~155 GiB; hit rate falls — 272
+  cached slots now cover 272/1024 not 272/512 per layer, so misses rise toward the SSD's limit.
+  The hit rate decides — and it likely loses the machine.</details></li>
+</ol>
+</details>
+<p class="muted" style="font-size:13px">
+<strong>Sources.</strong> Numbers from the tutorial's <code>spec.json</code> self-checks
+(<code>~/Documents/shared-with-google-drive/ml-study/flashnext-tutorial/</code> — its SVG figures
+and per-chapter problems live there; the bundle also has paginated pages), measured 2026-09-01 on
+the M5 Pro/64 GB llama.cpp fork (cache 32 GiB/257 slots, warm hit 99.31%, SSD 9.87 GB/s, prefill
+243.6→144.7 tok/s over 0→65k context), architecture constants from
+<code>models/qwen4exp/Qwen4Exp.hpp</code> and the package manifest, and the quantization recipe
+from <code>~/models/qwen38-flash-next-reference/README.md</code>. Lineage: top-k routing from
+Shazeer et al. 2017 → Switch → DeepSeek-MoE (shared expert); GDN from the linear-attention/
+delta-rule lineage (Mamba, RWKV); speculative decoding from Leviathan et al. / Chen et al. 2023;
+trained-in MTP heads from DeepSeek-V3.
+</p>
+
+<h2 id="part2" style="margin-top:56px">Part II · Getting small: Swift and the engine line</h2>
+
+<!-- ================================================================ -->
+<h2 id="sB">2 · Swift quantization, and how the engines evolved</h2>
+<p>
+<strong>Swift-Qwen3.8</strong> is the name of this model family's local quantized builds —
+<code>~/models/swift-qwen38-flash-next-v3/</code>, <code>swift-qwen38-27b/</code>, and their
+<code>*-splash</code> packages. "Getting Swift" is the quantization work; the engine line is what
+ran it. Both lines are history that explains why Slipstream looks the way it does.
+</p>
+
+<h3>2.1 The quantization recipe</h3>
+<p>
+Experts are 97% of the weights and are touched 10-at-a-time, so they tolerate small quantizers;
+everything that runs on every token stays wide. That asymmetry is the whole recipe:
+</p>
+<table>
+  <tr><th>Build</th><th>Recipe</th><th>Size</th><th>Decode speed</th></tr>
+  <tr><td>bf16 reference</td><td>full precision (CPU reference for quality checks)</td><td>~200 GB</td><td>offline only</td></tr>
+  <tr><td><code>swift-…-v3</code> GGUF (llama.cpp)</td><td>Q4_0 experts, Q8_0 output weights, Unsloth dynamic-4-bit spliced into 5 resident tensor groups (<code>attn</code>, <code>hc</code>, <code>token_embd</code>, <code>ssm_out</code>, <code>shexp</code>)</td><td>95.5 GiB, 3 shards</td><td>~26.8 tok/s (MTP draft, n≤2)</td></tr>
+  <tr><td>Slipstream package (today)</td><td>4-bit experts (group size 64, tiled Metal layout, magic <code>MDFN0031</code>), 8-bit everything else — mixer projections and hyper-connection mixes deliberately 8-bit (see the layout comment in <code>Qwen4Exp.hpp</code>: they were 4-bit in format 0001 and the reference check said no)</td><td>~100 GB on SSD, 34 GiB cached in RAM</td><td>~41 tok/s</td></tr>
+  <tr><td>27B dense sibling</td><td><code>swift-qwen38-27b-splash-hq</code>: mixed MLX 4/5-bit dequantized to affine 4-bit, packed with 16 KiB alignment; 64 layers</td><td>16.9 GB</td><td>serves alongside (llama.cpp / Splash)</td></tr>
+</table>
+
+<h3>2.2 The engine line: llama.cpp fork → Splash → Slipstream</h3>
+<table>
+  <tr><th>Engine</th><th>What it added</th><th>Decode</th></tr>
+  <tr><td>llama.cpp V3</td><td>the baseline: custom fork streaming routed MoE experts from SSD with an MTP draft (<code>model-serving/llama.cpp</code>)</td><td>~26.8 tok/s</td></tr>
+  <tr><td>Splash</td><td>the native Metal engine: custom kernels, expert cache, MTP verify pipeline, this repo's parent (~19,300 more lines than the fork it kept)</td><td>36.4 tok/s (2026-09-22)</td></tr>
+  <tr><td>Slipstream</td><td>only what this model needs (~19,300 lines and 1.45 GB of memory less), plus the speed work in §5 (decode step + waves): per-layer expert-slot profiles, 6-expert read-ahead, a 64K draft vocabulary</td><td>~41 tok/s</td></tr>
+</table>
+<p>
+Quality held through every step: greedy output is <strong>token-identical to Splash</strong>, and
+against the bf16 reference Slipstream picks the same top token 91% of the time (llama.cpp V3: 89%).
+Quality is proven with a fixed method — reference logits, top-pick agreement, KL, and the greedy
+10-prompt regression suite — all of it in <code>docs/new-model-playbook.md</code>.
+</p>
+
+<div class="callout tip">
+<p><strong>The two facts that define the project:</strong> (1) quantization made the model small
+enough to <em>exist</em> on this Mac; (2) the model's own MTP head turns every expensive expert
+read into ~3 accepted tokens. Slipstream is the engine that exploits both.</p>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s0" style="margin-top:36px">How to read this tutorial</h2>
 <p>
 Pointers look like <code>runtime/ops/Linear.cpp</code> or
 <code>models/qwen4exp/kernels/mtp_pick.metal:15</code> — a file path, optionally with a line
@@ -113,7 +545,9 @@ loop; and <strong>everything specific to one model lives in one folder, <code>mo
 </div>
 
 <!-- ================================================================ -->
-<h2 id="s1">1 · The big picture: seven layers</h2>
+<h2 id="part3" style="margin-top:56px">Part III · The Slipstream framework</h2>
+
+<h2 id="s1">3 · The big picture: seven layers</h2>
 <p>
 The system is a stack. Requests flow down; each layer owns a narrow job and knows nothing about
 layers above it. The diagram below is the entire architecture — everything else in this tutorial
@@ -219,7 +653,7 @@ means adding a folder, not patching the engine.</p>
 </div>
 
 <!-- ================================================================ -->
-<h2 id="s2">2 · A request's journey</h2>
+<h2 id="s2">4 · A request's journey</h2>
 <p>
 Follow one chat completion request from the wire to the GPU. Six hops; each hop has one file to open.
 </p>
@@ -274,7 +708,7 @@ Follow one chat completion request from the wire to the GPU. Six hops; each hop 
 </ul>
 
 <!-- ================================================================ -->
-<h2 id="s3">3 · One decode step</h2>
+<h2 id="s3">5 · One decode step</h2>
 <p>
 This is the heart of the speed. Instead of the full model producing one token at a time,
 a <strong>small draft head built into the model</strong> guesses the next few tokens first,
@@ -322,10 +756,10 @@ model alone — the draft only changes <em>speed</em>, never the answer.
 </p>
 <p class="muted">
 Open <code>models/qwen4exp/Qwen4ExpTarget.cpp:2493</code> to see the real dispatch that launches
-the draft head's pick kernel — it is the running example of section 5.
+the draft head's pick kernel — it is the running example of section 7.
 </p>
 
-<h3>3.1 · The pipelined step: SSD reads under the GPU</h3>
+<h3>5.1 · The pipelined step: SSD reads under the GPU</h3>
 <p>
 A step touches ~100 GB of weights; 34 GiB sit in RAM and the rest lives on SSD. The naive loop is
 serial — for each layer: find the missing experts, read them, run them, repeat — and the GPU idles
@@ -344,7 +778,7 @@ step as one multi-stage submission before it starts</strong>
   (<code>:2798-2800</code>), and the whole list leaves in a single
   <code>submitPipelineAsync</code> call (<code>:2869-2871</code>): one command buffer per stage,
   all committed at once. The GPU runs each stage the moment the host releases it —
-  <em>the GPU never waits for a submission, only for a host signal</em> (section 4.2).</li>
+  <em>the GPU never waits for a submission, only for a host signal</em> (section 6.2).</li>
   <li><strong>Between stages, the host reads.</strong> The host loop (<code>:2876-2905</code>)
   waits for the event “layer <em>L</em>−1's compute is done”, reads that router's scores out of GPU
   memory, picks the 10 experts per row (<code>hostSelect</code>), stages the experts already
@@ -449,19 +883,19 @@ a step) — <code>readMissedExperts</code>, <code>Qwen4ExpTarget.cpp:385-400</co
 <p><strong>Same numbers, different overlap.</strong> Waves change <em>when</em> experts arrive,
 never <em>what</em> the GPU computes: kernels, order, and grids are identical with waves on and
 off — which is why the comment can quote a speed delta as a measured fact. Determinism is a
-property of the kernels themselves (section 6.7).</p>
+property of the kernels themselves (section 8.7).</p>
 </div>
 
 <!-- ================================================================ -->
-<h2 id="s4">4 · The GPU runtime: what a dispatch becomes</h2>
+<h2 id="s4">6 · The GPU runtime: what a dispatch becomes</h2>
 <p>
 Section 5 shows the call that launches a kernel. This section is what receives it —
 <code>runtime/metal/MetalBackend.mm</code> — and the three pieces of machinery the pipelined step
-of section 3.1 leans on: a lazy pipeline cache, an event counter shared between GPU and host, and
+of section 5.1 leans on: a lazy pipeline cache, an event counter shared between GPU and host, and
 a residency set.
 </p>
 
-<h3>5.1 · Submit: validate, resolve, chunk, commit</h3>
+<h3>6.1 · Submit: validate, resolve, chunk, commit</h3>
 <p>
 <code>submitCommand</code> is thin — <code>submitCommandAsync(dispatches).wait()</code>
 (<code>MetalBackend.mm:1216-1219</code>). The async path, before it commits anything
@@ -472,7 +906,7 @@ a residency set.
   threads-per-threadgroup within the pipeline's own limit (<code>:1385-1421</code>). A typo in a
   binding index is an exception, not a silent garbage kernel.</li>
   <li><strong>Resolves pipelines lazily.</strong> The metallib is loaded once at startup
-  (section 5.7); a kernel's compiled pipeline is created on its <em>first use</em> and cached by
+  (section 7.7); a kernel's compiled pipeline is created on its <em>first use</em> and cached by
   name (<code>MetalBackend.mm:500-525</code>):</li>
 </ul>
 <pre><code>id&lt;MTLComputePipelineState&gt; cached = [pipelines objectForKey:key];
@@ -499,7 +933,7 @@ comes back: default 120 s, and “A completed GPU command stops this clock even 
 continues waiting for CPU work” (<code>runtime/metal/CommandWatchdog.hpp:10-13</code>).
 </p>
 
-<h3>5.2 · Pipeline events: a counter the GPU and host take turns raising</h3>
+<h3>6.2 · Pipeline events: a counter the GPU and host take turns raising</h3>
 <p>
 The whole protocol is the doc comment on the API (<code>runtime/metal/MetalBackend.hpp:346-352</code>):
 </p>
@@ -523,7 +957,7 @@ reason measured (<code>MetalBackend.mm:1272-1275</code>):
 One refinement makes waves possible: a <strong>quiet stage</strong> waits for its event
 (<code>base + 2k</code>) but raises nothing when it ends
 (<code>MetalBackend.hpp:362-365</code>) — “the host can then start stage k + 1 without waiting for
-stage k: the event only ever moves forward”. That is wave A of section 3.1: the cached-expert stage
+stage k: the event only ever moves forward”. That is wave A of section 5.1: the cached-expert stage
 runs, the host's reads land, the host raises the next value, wave B starts — the quiet stage's
 completion is never on the critical path.
 </p>
@@ -567,7 +1001,7 @@ completion is never on the critical path.
 <div class="figcap">Figure 5 — The pipeline-event protocol. Odd values: a GPU stage finished. Even values: the host released the next stage. Quiet stages take part without raising, so the host controls release.</div>
 </div>
 
-<h3>5.3 · Residency: pinning the expert cache</h3>
+<h3>6.3 · Residency: pinning the expert cache</h3>
 <p>
 Metal maps buffers into the GPU's page tables lazily. For a normal app that is a feature; for a
 34 GiB expert cache touched every layer it is a stall, as the call site spells out
@@ -588,8 +1022,8 @@ SSD reads land where the GPU is already looking. <code>SPLASH_NO_RESIDENCY_SET=1
 it for A/B measurement.
 </p>
 
-<h3>5.4 · The knobs that change runtime behavior</h3>
-<p>All of section 3.1 is env-var switchable — every optimization is a measured delta with an off switch:</p>
+<h3>6.4 · The knobs that change runtime behavior</h3>
+<p>All of section 5.1 is env-var switchable — every optimization is a measured delta with an off switch:</p>
 <table>
   <tr><th>Environment variable</th><th>Default</th><th>Effect</th><th>Cited at</th></tr>
   <tr><td><code>SPLASH_NO_PIPELINE</code></td><td>off</td><td>pipelined decode step → plain synchronous submit</td><td><code>Qwen4ExpTarget.cpp:2782</code></td></tr>
@@ -597,19 +1031,19 @@ it for A/B measurement.
   <tr><td><code>SPLASH_NO_LOOKAHEAD</code></td><td>off</td><td>no layer L+2 route prediction / prefetch</td><td><code>Qwen4ExpTarget.cpp:2786</code></td></tr>
   <tr><td><code>SPLASH_LOOKAHEAD_EXPERTS</code></td><td>6</td><td>how many predicted experts to prefetch</td><td><code>Qwen4ExpTarget.cpp:2087</code></td></tr>
   <tr><td><code>SPLASH_TRACE_STAGES</code></td><td>off</td><td>print per-stage host waits for the first 3 steps</td><td><code>Qwen4ExpTarget.cpp:2873</code></td></tr>
-  <tr><td><code>SPLASH_NO_RESIDENCY_SET</code></td><td>off</td><td>don't pin the expert cache (section 4.3)</td><td><code>Qwen4Exp.cpp:741</code></td></tr>
-  <tr><td><code>SPLASH_CHUNK_WORKING_SET_GIB</code></td><td>auto</td><td>command-buffer working-set cap (section 4.1)</td><td><code>MetalBackend.mm:1447</code></td></tr>
+  <tr><td><code>SPLASH_NO_RESIDENCY_SET</code></td><td>off</td><td>don't pin the expert cache (section 6.3)</td><td><code>Qwen4Exp.cpp:741</code></td></tr>
+  <tr><td><code>SPLASH_CHUNK_WORKING_SET_GIB</code></td><td>auto</td><td>command-buffer working-set cap (section 6.1)</td><td><code>MetalBackend.mm:1447</code></td></tr>
 </table>
 
 <!-- ================================================================ -->
-<h2 id="s5">5 · How kernels are created</h2>
+<h2 id="s5">7 · How kernels are created</h2>
 <p>
 A <em>kernel</em> is a function that runs on the GPU: thousands of its copies execute at once,
 each doing a small slice of the work. This section walks through the whole lifecycle of one,
 using real kernels from this repository, in the order you would create them.
 </p>
 
-<h3>5.1 · The six-stage lifecycle</h3>
+<h3>7.1 · The six-stage lifecycle</h3>
 
 <div class="fig">
 <svg viewBox="0 0 960 210" role="img" aria-label="Kernel lifecycle, six stages">
@@ -659,7 +1093,7 @@ using real kernels from this repository, in the order you would create them.
 <div class="figcap">Figure 6 — The kernel lifecycle. Stages 1–3 are writing; 4–5 are plumbing the build gives you; 6 is the part that catches bugs.</div>
 </div>
 
-<h3>5.2 · Stage 1: shared kernel, or model-only kernel?</h3>
+<h3>7.2 · Stage 1: shared kernel, or model-only kernel?</h3>
 <table>
   <tr><th></th><th>Shared</th><th>Model-only</th></tr>
   <tr>
@@ -689,7 +1123,7 @@ it is shared; if it encodes a quirk of <em>this</em> checkpoint, it is model-onl
 The build picks up <strong>both</strong> folders automatically (see 5.6).
 </p>
 
-<h3>5.3 · Stage 3 first: what a kernel actually looks like</h3>
+<h3>7.3 · Stage 3 first: what a kernel actually looks like</h3>
 <p>
 Start with the simplest real kernel in the repo — RMS normalization,
 <code>runtime/metal/kernels/shared/normalization.metal</code> (20 lines, the whole file):
@@ -734,7 +1168,7 @@ Start with the simplest real kernel in the repo — RMS normalization,
       <td>The universal loop: 256 threads each stride through the row, 256 elements apart.</td></tr>
 </table>
 
-<h3>5.4 · The parallelism model</h3>
+<h3>7.4 · The parallelism model</h3>
 <p>
 Everything in a kernel is one of three coordination levels. Learn these three and every kernel in
 this repo becomes readable:
@@ -772,7 +1206,7 @@ this repo becomes readable:
   <tr><td>Make sure everyone wrote before someone reads</td><td><code>threadgroup_barrier(mem_flags::mem_threadgroup)</code></td><td>one threadgroup</td></tr>
 </table>
 
-<h3>5.5 · Stage 2: the ABI — the contract between C++ and Metal</h3>
+<h3>7.5 · Stage 2: the ABI — the contract between C++ and Metal</h3>
 <p>
 Kernels receive their parameters as one plain struct. That struct must have the exact same
 layout on both sides of the GPU boundary, so it is written <strong>once</strong> and included by
@@ -809,7 +1243,7 @@ static_assert(sizeof(HyperConnectionParams) == 32,
   <code>memcpy</code>s the struct straight into the command stream (see 5.8).</li>
 </ul>
 
-<h3>5.6 · Stage 4: the build — three make rules</h3>
+<h3>7.6 · Stage 4: the build — three make rules</h3>
 <p>
 You do not write any build glue. <code>Makefile</code> compiles <strong>every</strong>
 <code>.metal</code> file in both kernel folders into one library:
@@ -834,7 +1268,7 @@ So the moment you drop <code>models/qwen4exp/kernels/my_kernel.metal</code> in t
 That one metallib contains <em>every</em> kernel, shared and model-specific.
 </p>
 
-<h3>5.7 · The loading side — what happens at startup</h3>
+<h3>7.7 · The loading side — what happens at startup</h3>
 <p>
 <code>runtime/metal/MetalBackend.mm</code> reads that single file once, when the engine starts
 (around lines 660–710):
@@ -848,7 +1282,7 @@ A <em>pipeline</em> is the compiled form of one kernel (function + threadgroup s
 first use and cached by name. That is why dispatching is just a <strong>string</strong>:
 </p>
 
-<h3>5.8 · Stage 5: dispatching — one function call</h3>
+<h3>7.8 · Stage 5: dispatching — one function call</h3>
 <p>
 The whole dispatch API is <code>runtime/metal/CommandGraph.hpp</code>. You collect dispatches
 into a graph, then submit it:
@@ -880,11 +1314,11 @@ A real call — the draft-head pick from <code>models/qwen4exp/Qwen4ExpTarget.cp
 Read the C++ call against the kernel signature in <code>models/qwen4exp/kernels/mtp_pick.metal:15-23</code>
 — the buffer order, the scalar parameter, and the grid all line up one-for-one.
 <code>submitCommand</code> encodes the list into Metal command buffers on a queue with 256 buffers
-in flight, so decode stages overlap (section 4.1; the comment at <code>MetalBackend.mm:661-665</code> explains
+in flight, so decode stages overlap (section 6.1; the comment at <code>MetalBackend.mm:661-665</code> explains
 why the queue is sized that way).
 </p>
 
-<h3>5.9 · Walkthrough of a real kernel: <code>mtp_pick.metal</code></h3>
+<h3>7.9 · Walkthrough of a real kernel: <code>mtp_pick.metal</code></h3>
 <p>
 Now you have the vocabulary. Let's read a kernel that does something non-trivial:
 <strong>find the 16 largest values among 248K logits</strong> — the draft head's "what do I guess?"
@@ -957,7 +1391,7 @@ candidates back, merges them into the top 16, and computes the exact confidence 
 <code>(max, sum-of-exp)</code> pair — no second GPU pass needed.
 </p>
 
-<h3>5.10 · The ops layer: how shared kernels get launched</h3>
+<h3>7.10 · The ops layer: how shared kernels get launched</h3>
 <p>
 Model code never names shared kernels directly. It calls an op, e.g.
 <code>operators.linear().addDecodeBatch(graph, input, weights, output, ...)</code>, and the op
@@ -979,7 +1413,7 @@ That is the pattern for any shared kernel family: <em>the .metal file has the va
 the op has the policy; the model folder just asks</em>.
 </p>
 
-<h3>5.11 · Stage 6: proving a kernel is right</h3>
+<h3>7.11 · Stage 6: proving a kernel is right</h3>
 <p>
 Each kernel has a test that runs it on the GPU and compares against a CPU implementation
 (numpy/torch) on random inputs. They live in <code>dev/tests/engine/</code>:
@@ -1000,7 +1434,7 @@ against a copy of your own assumption.</p>
 </div>
 
 <!-- ================================================================ -->
-<h2 id="s6">6 · The kernel catalog</h2>
+<h2 id="s6">8 · The kernel catalog</h2>
 <p>
 Section 5 showed <em>how</em> a kernel is written. This section is an index of <em>which</em>
 kernels exist and the one idea each is built on. Every family below is in the metallib (section
@@ -1066,16 +1500,16 @@ how it uses threads.
   <text x="794" y="296" text-anchor="middle" font-size="10.5" font-family="ui-monospace, monospace">qsa_indexer · qsa_select</text>
   <text x="794" y="312" text-anchor="middle" font-size="10.5" font-family="ui-monospace, monospace">per_layer_embedding · ngram_embedding · capture</text>
   <text x="794" y="332" text-anchor="middle" font-size="10.5" fill="#555">this model only; loaded from the same metallib</text>
-  <text x="794" y="348" text-anchor="middle" font-size="10.5" fill="#555">(section 5.6)</text>
+  <text x="794" y="348" text-anchor="middle" font-size="10.5" fill="#555">(section 7.6)</text>
 
-  <text x="480" y="392" text-anchor="middle" font-size="12" fill="#555">plus shared/normalization.metal: one tiny kernel, <tspan font-family="ui-monospace, monospace">norm_rms</tspan>, section 5.3 — one threadgroup per row.</text>
+  <text x="480" y="392" text-anchor="middle" font-size="12" fill="#555">plus shared/normalization.metal: one tiny kernel, <tspan font-family="ui-monospace, monospace">norm_rms</tspan>, section 7.3 — one threadgroup per row.</text>
   <text x="480" y="424" text-anchor="middle" font-size="12" fill="#555">Names encode their shape: n128/n256 = tile width · m16/m24/m32 = rows · _sg4 = 4-simdgroup variant · _residual/_gate_up/_up_silu = fused epilogues.</text>
-  <text x="480" y="448" text-anchor="middle" font-size="11" fill="#999">Variant selection lives in the ops layer (runtime/ops/Linear.cpp:144-192), not in model code — section 5.10.</text>
+  <text x="480" y="448" text-anchor="middle" font-size="11" fill="#999">Variant selection lives in the ops layer (runtime/ops/Linear.cpp:144-192), not in model code — section 7.10.</text>
 </svg>
 <div class="figcap">Figure 8 — The kernel families. Files under <code>runtime/metal/kernels/</code> are shared (prefill/decode/shared/common); <code>models/qwen4exp/kernels/</code> is this model only.</div>
 </div>
 
-<h3>6.1 · Q4 matmul: one tile engine, twenty variants</h3>
+<h3>8.1 · Q4 matmul: one tile engine, twenty variants</h3>
 <p>
 Every 4-bit projection in the model runs through one tile engine,
 <code>runtime/metal/kernels/common/q4_mpp_tiles.h</code> (349 lines). A threadgroup computes an
@@ -1159,10 +1593,10 @@ tile's prologue cannot overwrite input sums the current epilogue still reads (co
   <text x="24" y="228" font-size="12" fill="#555">Persistent grids: tile += persistent_groups — threadgroups keep taking tiles until the layer's tiles run out; a barrier closes each tile so the next prologue can't race the epilogue.</text>
   <text x="24" y="266" font-size="11" fill="#999">q4_mpp_tiles.h: descriptor :64 · weight read :149-155 · epilogue :170-185 · pipelined pair :190-195 · barrier comment :230-238</text>
 </svg>
-<div class="figcap">Figure 9 — The Q4 tile engine. The same engine, instantiated ~20 ways (section 6.1's table), runs every 4-bit projection: attention, gating, and all 512 experts.</div>
+<div class="figcap">Figure 9 — The Q4 tile engine. The same engine, instantiated ~20 ways (section 8.1's table), runs every 4-bit projection: attention, gating, and all 512 experts.</div>
 </div>
 
-<h3>6.2 · MoE: routing, bucketing, tiles</h3>
+<h3>8.2 · MoE: routing, bucketing, tiles</h3>
 <p><code>runtime/metal/kernels/shared/moe.metal</code> turns “10 of 512 experts per token” into
 grouped GPU work:</p>
 <ul>
@@ -1170,20 +1604,20 @@ grouped GPU work:</p>
   from Q8 router scores. Its K-slices are summed in fixed order and ties break to the lower expert
   id, so the host mirror <code>topExperts</code>
   (<code>models/qwen4exp/Qwen4ExpTarget.cpp:419</code>) reproduces the GPU's choice bit-for-bit —
-  required, because the host must stage from SSD exactly the experts the GPU picked (section 3.1).</li>
+  required, because the host must stage from SSD exactly the experts the GPU picked (section 5.1).</li>
   <li><code>moe_group_routes</code> (<code>_512</code>): buckets token ids by selected expert and
   produces the tile descriptors — (which expert, which token rows) — that the tile kernels consume.</li>
   <li><code>moe_gather_rows</code>: copies selected rows so each expert tile sees a dense block.</li>
   <li><code>moe_expert_gate_up_q4_*</code> / <code>moe_expert_down_q4_*</code>
   (<code>m8/m32</code>, <code>n128/n256</code>, <code>_up_silu</code>): the very same Q4 tile engine
-  of section 6.1, pointed at per-expert weights by the descriptors. The <code>_range</code>
+  of section 8.1, pointed at per-expert weights by the descriptors. The <code>_range</code>
   variants take an expert-range view — the kernels behind wave staging
   (<code>MoE::addExpertTilesInRange</code>).</li>
   <li><code>moe_combine</code> (<code>_no_residual</code>): weighted sum of the experts' outputs
   back into the token stream.</li>
 </ul>
 
-<h3>6.3 · Attention: split-KV over a paged 8-bit cache</h3>
+<h3>8.3 · Attention: split-KV over a paged 8-bit cache</h3>
 <p>
 The KV cache is paged in 32-token pages (<code>abi/ExecutionGeometry.h:16</code>) quantized to
 8 bits; verify rows are padded to 8 (<code>abi/ExecutionGeometry.h:7</code>). The shared tile
@@ -1205,7 +1639,7 @@ heads-per-threadgroup and page-quantization groups against context length; prefi
 kernels over the same page loop.
 </p>
 
-<h3>6.4 · GDN: three phases, one barrier</h3>
+<h3>8.4 · GDN: three phases, one barrier</h3>
 <p>
 The gated-delta-net layers carry a recurrent state per token stream. Decode runs all three phases —
 prologue (4-tap causal conv + SiLU, then q/k RMSNorm,
@@ -1220,21 +1654,21 @@ kernels (<code>prefill_gdn_prepare/scan/gate</code>) — with many tokens per re
 overhead amortizes away.
 </p>
 
-<h3>6.5 · Sampling: top-K without materializing softmax</h3>
+<h3>8.5 · Sampling: top-K without materializing softmax</h3>
 <p>
-The same shard-and-merge pattern as <code>mtp_pick_slices</code> (section 5.9) runs the sampler.
+The same shard-and-merge pattern as <code>mtp_pick_slices</code> (section 7.9) runs the sampler.
 Sorted-insert into a fixed top-K list with ties to the lower id
 (<code>top_insert</code>, <code>decode/sampling.metal:4-19</code>), 8 sorted per-simdgroup lists
 merged by <code>top_shard_store</code>, and per-slice (max, sum-of-exp) so the host gets exact
 probabilities. <code>decode_sample_top32_sharded(_batch)</code> and the <code>_probs</code>
-variants fill the top-32 buffer from section 2; <code>decode_sample_sparse_draw</code> samples from
+variants fill the top-32 buffer from section 4; <code>decode_sample_sparse_draw</code> samples from
 it; <code>decode_sample_argmax_sharded</code> + <code>_reduce</code> is greedy;
 <code>decode_accept_dflash</code> compares draft guesses against the target's top-1 and counts
 accepted tokens (<code>runtime/ops/Sampling.cpp:191</code>); <code>verify_input_tokens</code>
 commits the accepted run (<code>Sampling.cpp:208</code>).
 </p>
 
-<h3>6.6 · The model's own kernels</h3>
+<h3>8.6 · The model's own kernels</h3>
 <ul>
   <li><code>hyper_connection.metal</code> — the residual-mixing layers. Header states the math:
   streams are one row of Count×Hidden each;
@@ -1249,21 +1683,21 @@ commits the accepted run (<code>Sampling.cpp:208</code>).
   k-th-largest score. Scores are non-negative, so their IEEE bit patterns sort exactly like the
   values — a binary search over bit patterns finds the 512th largest, ties broken by block index
   ascending. No sort, no atomics.</li>
-  <li><code>mtp_pick_slices</code> — section 5.9's walkthrough; <code>per_layer_embedding</code> /
-  <code>ngram_embedding</code> — the embedding lookups of section 3; <code>capture.metal</code> —
-  the capture path of section 2.</li>
+  <li><code>mtp_pick_slices</code> — section 7.9's walkthrough; <code>per_layer_embedding</code> /
+  <code>ngram_embedding</code> — the embedding lookups of section 5; <code>capture.metal</code> —
+  the capture path of section 4.</li>
 </ul>
 
 <div class="callout tip">
-<p><strong>6.7 · One rule runs through every family: fixed order.</strong> Router K-slices summed
+<p><strong>8.7 · One rule runs through every family: fixed order.</strong> Router K-slices summed
 in a stated order; ties to the lower id in routing, sampling, and block selection; k-th-largest by
 bit pattern; split-KV partials reduced in fixed order. The same GPU inputs produce the same token
-stream, which is what lets the tests in section 5.11 — and the porting playbook's token-for-token
+stream, which is what lets the tests in section 7.11 — and the porting playbook's token-for-token
 comparison — mean anything.</p>
 </div>
 
 <!-- ================================================================ -->
-<h2 id="s7">7 · Bringing up a new model</h2>
+<h2 id="s7">9 · Bringing up a new model</h2>
 <p>
 The framework was designed so a new model is <strong>one folder + four registrations</strong>.
 The full procedure is <code>docs/new-model-playbook.md</code>; here is the shape of it.
@@ -1360,7 +1794,7 @@ also needs the runtime's buffers and state generalized — that work is not done
 </table>
 
 <!-- ================================================================ -->
-<h2 id="s8">8 · Quick reference</h2>
+<h2 id="s8">10 · Quick reference</h2>
 <h3>The file map</h3>
 <table>
   <tr><th>I want to understand…</th><th>Start at</th></tr>
@@ -1373,7 +1807,7 @@ also needs the runtime's buffers and state generalized — that work is not done
   <tr><td>how kernels are built</td><td><code>Makefile:30-34, 163, 173</code></td></tr>
   <tr><td>how kernels are dispatched</td><td><code>runtime/metal/CommandGraph.hpp</code> (74 lines)</td></tr>
   <tr><td>the GPU runtime</td><td><code>runtime/metal/MetalBackend.mm</code> — queue 661-665 · pipeline cache 500-525 · pipeline events 1260-1295 · <code>CommandWatchdog.hpp</code></td></tr>
-  <tr><td>all the kernels at a glance</td><td>section 6 — <code>runtime/metal/kernels/</code> + <code>models/qwen4exp/kernels/</code></td></tr>
+  <tr><td>all the kernels at a glance</td><td>section 8 — <code>runtime/metal/kernels/</code> + <code>models/qwen4exp/kernels/</code></td></tr>
   <tr><td>a simple kernel</td><td><code>runtime/metal/kernels/shared/normalization.metal</code> (20 lines)</td></tr>
   <tr><td>a real algorithmic kernel</td><td><code>models/qwen4exp/kernels/mtp_pick.metal</code> (82 lines)</td></tr>
   <tr><td>kernel variants + grid policy</td><td><code>runtime/ops/Linear.cpp</code></td></tr>
@@ -1386,9 +1820,9 @@ also needs the runtime's buffers and state generalized — that work is not done
 <ol>
   <li><code>runtime/metal/kernels/shared/normalization.metal</code> — the whole parallelism pattern in 20 lines.</li>
   <li><code>runtime/metal/CommandGraph.hpp</code> — the entire dispatch API, 74 lines.</li>
-  <li><code>models/qwen4exp/kernels/mtp_pick.metal</code> — a real algorithm; re-read with section 5.9 above.</li>
+  <li><code>models/qwen4exp/kernels/mtp_pick.metal</code> — a real algorithm; re-read with section 7.9 above.</li>
   <li><code>models/qwen4exp/Qwen4ExpTarget.cpp:2493-2510</code> — the dispatch of the kernel you just read.</li>
-  <li><code>runtime/metal/MetalBackend.hpp:346-373</code> + <code>Qwen4ExpTarget.cpp:2804-2905</code> — the pipeline-event protocol and the host loop that drives it (section 3.1 + 4.2).</li>
+  <li><code>runtime/metal/MetalBackend.hpp:346-373</code> + <code>Qwen4ExpTarget.cpp:2804-2905</code> — the pipeline-event protocol and the host loop that drives it (section 5.1 + 6.2).</li>
   <li><code>runtime/ops/Linear.cpp</code> — how a whole kernel family gets variants and a grid policy.</li>
   <li><code>dev/tests/engine/hyper_connection_metal_test.mm</code> — how a kernel is proven correct.</li>
 </ol>
