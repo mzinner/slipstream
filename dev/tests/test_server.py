@@ -2240,6 +2240,7 @@ class ServerTest(unittest.TestCase):
                 "auto",
             ],
             startup_timeout=api.NATIVE_START_TIMEOUT,
+            io_timeout=api.NATIVE_IO_TIMEOUT,
             pending_limit=1,
             eager_start=False,
         )

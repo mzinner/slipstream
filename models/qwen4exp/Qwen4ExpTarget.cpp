@@ -28,6 +28,9 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 namespace splash::model {
 namespace {
@@ -288,15 +291,18 @@ void addHyperConnection(metal::CommandGraph &graph,
                         metal::MetalBuffer reduced, metal::MetalBuffer mixed,
                         metal::MetalBuffer injection, uint32_t rows,
                         uint32_t rowStep = 1,
-                        const ops::ExecutionPlans *operators = nullptr) {
+                        const ops::ExecutionPlans *operators = nullptr,
+                        bool preNormalized = false) {
   const bool withInject = weights.blockInject.has_value();
   const uint32_t splits = rows <= kHyperDownSplitRows ? kHyperDownSplits : 1;
   const HyperConnectionParams params{
       rows, geometry.hiddenSize, geometry.hyperConnectionCount,
       geometry.hyperConnectionLowRank, 1e-6f, withInject ? 1u : 0u, rowStep,
       splits};
-  graph.add("hyper_connection_rms", {input, weights.norm, normalized},
-            params, {rows, geometry.hyperConnectionCount, 1}, {256, 1, 1});
+  if (!preNormalized) {
+    graph.add("hyper_connection_rms", {input, weights.norm, normalized},
+              params, {rows, geometry.hyperConnectionCount, 1}, {256, 1, 1});
+  }
   const uint32_t outputs = geometry.hyperConnectionLowRank +
                            (withInject ? geometry.hyperConnectionCount : 0);
   // A prompt's rows run the projections as 8-bit matrix products over the
@@ -468,7 +474,34 @@ void topExperts(const uint16_t *scores, uint32_t experts, uint32_t k,
   // One pass, keeping the k best in order. Scanning ids upward and moving a
   // value past only strictly smaller ones keeps ties at the lower id.
   uint32_t filled = 0;
+#if defined(__ARM_NEON)
+  uint32_t e = 0;
+  for (; e + 8 <= experts; e += 8) {
+    const uint16x8_t raw = vld1q_u16(scores + e);
+    if (filled == k) {
+      const float32x4_t lo = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(raw), 16));
+      const float32x4_t hi = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(raw), 16));
+      const float blockMax = vmaxvq_f32(vmaxq_f32(lo, hi));
+      if (!(blockMax > chosen[k - 1]))
+        continue;
+    }
+    for (uint32_t j = 0; j < 8; ++j) {
+      const float v = widen(scores[e + j]);
+      if (filled == k && !(v > chosen[k - 1])) continue;
+      uint32_t at = filled < k ? filled++ : k - 1;
+      while (at > 0 && chosen[at - 1] < v) {
+        chosen[at] = chosen[at - 1];
+        ids[at] = ids[at - 1];
+        --at;
+      }
+      chosen[at] = v;
+      ids[at] = e + j;
+    }
+  }
+  for (; e < experts; ++e) {
+#else
   for (uint32_t e = 0; e < experts; ++e) {
+#endif
     const float v = widen(scores[e]);
     if (filled == k && !(v > chosen[k - 1])) continue;
     uint32_t at = filled < k ? filled++ : k - 1;
@@ -496,6 +529,42 @@ float sharedExpertGate(const ops::Q8Projection &gate, const uint16_t *input,
   const auto *biases = static_cast<const uint16_t *>(gate.biases.contents());
   auto widen = [](uint16_t bits) { return std::bit_cast<float>(uint32_t{bits} << 16); };
   float total = 0.0f;
+#if defined(__ARM_NEON)
+  const uint32_t groups = size / 64;
+  for (uint32_t group = 0; group < groups; ++group) {
+    const float scale = widen(scales[uint64_t{group} * kStorageN]);
+    const float bias = widen(biases[uint64_t{group} * kStorageN]);
+    const uint8_t *gw = w + uint64_t{group} * kStorageN * 64;
+    const uint16_t *gx = input + uint64_t{group} * 64;
+    float32x4_t wSum0 = vdupq_n_f32(0.0f);
+    float32x4_t wSum1 = vdupq_n_f32(0.0f);
+    float32x4_t xSum0 = vdupq_n_f32(0.0f);
+    float32x4_t xSum1 = vdupq_n_f32(0.0f);
+    for (uint32_t i = 0; i < 64; i += 8) {
+      const uint8x8_t w8 = vld1_u8(gw + i);
+      const uint16x8_t w16 = vmovl_u8(w8);
+      const float32x4_t wf0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(w16)));
+      const float32x4_t wf1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(w16)));
+      const uint16x8_t x16 = vld1q_u16(gx + i);
+      const float32x4_t xf0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(x16), 16));
+      const float32x4_t xf1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(x16), 16));
+      wSum0 = vfmaq_f32(wSum0, xf0, wf0);
+      wSum1 = vfmaq_f32(wSum1, xf1, wf1);
+      xSum0 = vaddq_f32(xSum0, xf0);
+      xSum1 = vaddq_f32(xSum1, xf1);
+    }
+    const float groupW = vaddvq_f32(vaddq_f32(wSum0, wSum1));
+    const float groupX = vaddvq_f32(vaddq_f32(xSum0, xSum1));
+    total += groupW * scale + groupX * bias;
+  }
+  for (uint32_t d = groups * 64; d < size; ++d) {
+    const uint32_t group = d / 64;
+    const float value = float(w[uint64_t{group} * kStorageN * 64 + d % 64]) *
+                            widen(scales[uint64_t{group} * kStorageN]) +
+                        widen(biases[uint64_t{group} * kStorageN]);
+    total += widen(input[d]) * value;
+  }
+#else
   for (uint32_t d = 0; d < size; ++d) {
     const uint32_t group = d / 64;
     const float value = float(w[uint64_t{group} * kStorageN * 64 + d % 64]) *
@@ -503,6 +572,7 @@ float sharedExpertGate(const ops::Q8Projection &gate, const uint16_t *input,
                         widen(biases[uint64_t{group} * kStorageN]);
     total += widen(input[d]) * value;
   }
+#endif
   return 1.0f / (1.0f + std::exp(-total));
 }
 
@@ -551,7 +621,9 @@ void addPleApply(const Qwen4ExpWeights &weights, metal::MetalBackend &backend,
                  metal::CommandGraph &graph, const QwenTargetPleBuffers &ple,
                  const QwenTargetGeometry &geometry, metal::MetalBuffer state,
                  metal::MetalBuffer normalized, metal::MetalBuffer residual,
-                 uint32_t rowBegin, uint32_t rows) {
+                 uint32_t rowBegin, uint32_t rows,
+                 const metal::MetalBuffer *hcNorm = nullptr,
+                 const metal::MetalBuffer *hcNormalized = nullptr) {
   const auto &table = weights.perLayerEmbedding;
   const uint64_t width = uint64_t{geometry.residualWidth()} * 2;
   const uint64_t hidden = uint64_t{geometry.hiddenSize} * 2;
@@ -562,6 +634,23 @@ void addPleApply(const Qwen4ExpWeights &weights, metal::MetalBackend &backend,
       weights.layout.pleConvolutionTaps, weights.layout.ngramSize, 1e-6f};
   metal::MetalBuffer gated =
       backend.view(ple.gated, rowBegin * width, rows * width);
+  static const bool fusePle = [] {
+    const char *v = std::getenv("SPLASH_FUSE_PLE");
+    return !v || std::atoi(v) != 0;
+  }();
+  if (fusePle && hcNorm && hcNormalized) {
+    graph.add("per_layer_embedding_gate",
+              {backend.view(ple.keys, rowBegin * width, rows * width),
+               backend.view(ple.values, rowBegin * hidden, rows * hidden),
+               residual, table.keyNorm, table.queryNorm, table.convolutionNorm,
+               gated, normalized},
+              params, {rows, 1, 1}, {256, 1, 1});
+    graph.add("per_layer_embedding_convolve_add_rms",
+              {std::move(state), normalized, table.convolutionWeights, gated,
+               std::move(residual), *hcNorm, *hcNormalized},
+              params, {rows, geometry.hyperConnectionCount, 1}, {256, 1, 1});
+    return;
+  }
   graph.add("per_layer_embedding_history", {std::move(state), normalized},
             stateParams, {64, 1, 1}, {256, 1, 1});
   graph.add("per_layer_embedding_gate",
@@ -573,8 +662,18 @@ void addPleApply(const Qwen4ExpWeights &weights, metal::MetalBackend &backend,
   graph.add("per_layer_embedding_convolve",
             {normalized, table.convolutionWeights, gated}, params, {64, 1, 1},
             {256, 1, 1});
-  graph.add("per_layer_embedding_add", {gated, std::move(residual)},
-            stateParams, {64, 1, 1}, {256, 1, 1});
+  if (hcNorm && hcNormalized) {
+    graph.add("per_layer_embedding_add", {gated, residual},
+              stateParams, {64, 1, 1}, {256, 1, 1});
+    const HyperConnectionParams hcP{
+        rows, geometry.hiddenSize, geometry.hyperConnectionCount,
+        geometry.hyperConnectionLowRank, 1e-6f, 1, 1, 0};
+    graph.add("hyper_connection_rms", {std::move(residual), *hcNorm, *hcNormalized},
+              hcP, {rows, geometry.hyperConnectionCount, 1}, {256, 1, 1});
+  } else {
+    graph.add("per_layer_embedding_add", {gated, std::move(residual)},
+              stateParams, {64, 1, 1}, {256, 1, 1});
+  }
 }
 
 metal::MetalBuffer auxiliaryView(metal::MetalBackend &backend,
@@ -756,11 +855,16 @@ void Qwen4ExpTarget::addPrefill(
           buffers.ple.normalized,
           (uint64_t{sequence.rowBegin} + uint64_t{index} * history) * width,
           (uint64_t{history} + sequence.rows) * width);
+      const metal::MetalBuffer hcNorm =
+          weights.layers[layerIndex].attentionHyperConnection.norm;
+      const metal::MetalBuffer hcNormSlice = u16(
+          buffers.normalized, sequence.rowBegin, sequence.rows,
+          geometry.residualWidth());
       addPleApply(weights, backend, g, buffers.ple, geometry,
                   sequence.auxiliaryIn, normalized,
                   u16(buffers.hidden[layerIndex & 1], sequence.rowBegin,
                       sequence.rows, geometry.residualWidth()),
-                  sequence.rowBegin, sequence.rows);
+                  sequence.rowBegin, sequence.rows, &hcNorm, &hcNormSlice);
       // A prefill keeps every row it processes.
       const PerLayerEmbeddingStateParams commit =
           pleStateParams(geometry, sequence.rows);
@@ -777,15 +881,18 @@ void Qwen4ExpTarget::addPrefill(
   // priorWorkComplete: every earlier submission of this step has finished,
   // so host-side reads of GPU-written inputs are safe.
   auto encodeAttentionHC = [&](metal::CommandGraph &g, uint32_t layerIndex,
-                               bool priorWorkComplete = false) {
-    if (geometry.hasPerLayerEmbedding() && layerIndex == geometry.pleLayer)
+                               bool priorWorkComplete = false,
+                               bool preNormalized = false) {
+    if (geometry.hasPerLayerEmbedding() && layerIndex == geometry.pleLayer) {
       encodePerLayerEmbedding(g, layerIndex, priorWorkComplete);
+      preNormalized = true;
+    }
     const auto &layer = weights.layers[layerIndex];
     metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
     addHyperConnection(g, geometry, input, layer.attentionHyperConnection,
                        buffers.normalized, buffers.hyperReduced,
                        buffers.hyperMixed, buffers.hyperInjection, rows, 1,
-                       &operators);
+                       &operators, preNormalized);
   };
 
   auto encodeMixer = [&](metal::CommandGraph &g, uint32_t layerIndex,
@@ -906,9 +1013,11 @@ void Qwen4ExpTarget::addPrefill(
   auto encodeMixerUpdate = [&](metal::CommandGraph &g, uint32_t layerIndex,
                                metal::MetalBuffer mixerOutBuffer) {
     metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
-    g.add("hyper_connection_update",
-          {input, mixerOutBuffer, buffers.hyperInjection}, hcParams,
-          {64, 1, 1}, {256, 1, 1});
+    const auto &layer = weights.layers[layerIndex];
+    g.add("hyper_connection_update_rms",
+          {input, mixerOutBuffer, buffers.hyperInjection,
+           layer.mlpHyperConnection.norm, buffers.normalized},
+          hcParams, {rows, geometry.hyperConnectionCount, 1}, {256, 1, 1});
   };
 
   auto encodeMlpHC = [&](metal::CommandGraph &g, uint32_t layerIndex) {
@@ -917,7 +1026,7 @@ void Qwen4ExpTarget::addPrefill(
     addHyperConnection(g, geometry, input, layer.mlpHyperConnection,
                        buffers.normalized, buffers.hyperReduced,
                        buffers.hyperMixed, buffers.hyperInjection, rows, 1,
-                       &operators);
+                       &operators, /*preNormalized=*/true);
   };
 
   auto encodeMoERoute = [&](metal::CommandGraph &g, uint32_t layerIndex) {
@@ -943,12 +1052,26 @@ void Qwen4ExpTarget::addPrefill(
         weightsToUse, moePlan, /*addResidual=*/false);
   };
 
+  auto canFuseNextAttentionHC = [&](uint32_t layerIndex) {
+    return layerIndex + 1 < geometry.layers &&
+           !(geometry.hasPerLayerEmbedding() &&
+             layerIndex + 1 == geometry.pleLayer);
+  };
+
   auto encodeMlpUpdate = [&](metal::CommandGraph &g, uint32_t layerIndex) {
     metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
     metal::MetalBuffer output = buffers.hidden[(layerIndex & 1) ^ 1];
-    g.add("hyper_connection_update_out",
-          {input, output, buffers.gdnOutput, buffers.hyperInjection},
-          hcParams, {64, 1, 1}, {256, 1, 1});
+    if (canFuseNextAttentionHC(layerIndex)) {
+      g.add("hyper_connection_update_out_rms",
+            {input, output, buffers.gdnOutput, buffers.hyperInjection,
+             weights.layers[layerIndex + 1].attentionHyperConnection.norm,
+             buffers.normalized},
+            hcParams, {rows, geometry.hyperConnectionCount, 1}, {256, 1, 1});
+    } else {
+      g.add("hyper_connection_update_out",
+            {input, output, buffers.gdnOutput, buffers.hyperInjection},
+            hcParams, {64, 1, 1}, {256, 1, 1});
+    }
     addPrefillCapture(g, backend, geometry, layerIndex, output, rows);
   };
 
@@ -958,7 +1081,8 @@ void Qwen4ExpTarget::addPrefill(
 
   if (!useStreamingCache) {
     for (uint32_t layerIndex = 0; layerIndex < geometry.layers; ++layerIndex) {
-      encodeAttentionHC(graph, layerIndex);
+      encodeAttentionHC(graph, layerIndex, false,
+                        layerIndex > 0 && canFuseNextAttentionHC(layerIndex - 1));
       metal::MetalBuffer mixerOut = encodeMixer(graph, layerIndex, gdnIndex, attentionIndex);
       encodeMixerUpdate(graph, layerIndex, mixerOut);
       encodeMlpHC(graph, layerIndex);
@@ -1171,7 +1295,8 @@ void Qwen4ExpTarget::addPrefill(
 
   metal::CommandGraph residentGraph = std::move(graph);
   for (uint32_t layerIndex = 0; layerIndex < R; ++layerIndex) {
-    encodeAttentionHC(residentGraph, layerIndex);
+    encodeAttentionHC(residentGraph, layerIndex, false,
+                      layerIndex > 0 && canFuseNextAttentionHC(layerIndex - 1));
     metal::MetalBuffer mixerOut = encodeMixer(residentGraph, layerIndex, gdnIndex, attentionIndex);
     encodeMixerUpdate(residentGraph, layerIndex, mixerOut);
     encodeMlpHC(residentGraph, layerIndex);
@@ -1187,7 +1312,7 @@ void Qwen4ExpTarget::addPrefill(
   }
 
   // Layer R base up to router
-  encodeAttentionHC(residentGraph, R);
+  encodeAttentionHC(residentGraph, R, false, R > 0 && canFuseNextAttentionHC(R - 1));
   metal::MetalBuffer mixerOutR = encodeMixer(residentGraph, R, gdnIndex, attentionIndex);
   encodeMixerUpdate(residentGraph, R, mixerOutR);
   encodeMlpHC(residentGraph, R);
@@ -1512,7 +1637,8 @@ void Qwen4ExpTarget::addPrefill(
     encodeMlpUpdate(stepGraph, L);
 
     // Layer L + 1 base up to router
-    encodeAttentionHC(stepGraph, L + 1, /*priorWorkComplete=*/true);
+    encodeAttentionHC(stepGraph, L + 1, /*priorWorkComplete=*/true,
+                      canFuseNextAttentionHC(L));
     metal::MetalBuffer mixerOutNext = encodeMixer(stepGraph, L + 1, gdnIndex, attentionIndex);
     encodeMixerUpdate(stepGraph, L + 1, mixerOutNext);
     encodeMlpHC(stepGraph, L + 1);
@@ -1616,11 +1742,14 @@ void Qwen4ExpTarget::addPrefill(
       operators.linear().addPrefill(graph, in, combiner.fcHidden, out,
                                     buffers.projectionSums, square, piece);
     }
-    graph.add("hyper_connection_update", {X, e, weights.mtpPrefillOnes}, all,
-              {64, 1, 1}, {256, 1, 1});
+    graph.add("hyper_connection_update_rms",
+              {X, e, weights.mtpPrefillOnes, head.attentionHyperConnection.norm,
+               buffers.normalized},
+              all, {m, count, 1}, {256, 1, 1});
     addHyperConnection(graph, geometry, X, head.attentionHyperConnection,
                        buffers.normalized, buffers.hyperReduced, buffers.hyperMixed,
-                       buffers.hyperInjection, m, 1, &operators);
+                       buffers.hyperInjection, m, 1, &operators,
+                       /*preNormalized=*/true);
     const auto &mixer = std::get<QwenAttentionWeights>(head.mixer);
     const ops::LinearMatrix attentionInput{geometry.packedAttentionWidth, hidden};
     operators.linear().addPrefillSums(graph, buffers.hyperMixed, buffers.projectionSums,
@@ -1775,6 +1904,13 @@ void Qwen4ExpTarget::addVerify(
     // Which rows to keep is not known until the verifier decides, so the
     // history is written by the state commit, not here.
     for (uint32_t lane = 0; lane < lanes; ++lane) {
+      const metal::MetalBuffer *hcNormPtr =
+          (lanes == 1 || buffers.liveRowsPerLane > 1)
+              ? &weights.layers[layerIndex].attentionHyperConnection.norm
+              : nullptr;
+      const metal::MetalBuffer hcNormSlice = backend.view(
+          buffers.normalized, uint64_t{lane} * laneRows * width,
+          laneRows * width);
       addPleApply(
           weights, backend, g, buffers.ple, geometry,
           auxiliaryView(backend, geometry, buffers.currentGdnStates[lane]),
@@ -1782,22 +1918,26 @@ void Qwen4ExpTarget::addVerify(
                        laneNormalized),
           backend.view(buffers.hidden[layerIndex & 1],
                        uint64_t{lane} * laneRows * width, laneRows * width),
-          lane * laneRows, laneRows);
+          lane * laneRows, laneRows, hcNormPtr,
+          hcNormPtr ? &hcNormSlice : nullptr);
     }
   };
 
   // priorWorkComplete: every earlier submission of this step has finished,
   // so host-side reads of GPU-written inputs are safe.
   auto encodeAttentionHC = [&](metal::CommandGraph &g, uint32_t layerIndex,
-                               bool priorWorkComplete = false) {
-    if (geometry.hasPerLayerEmbedding() && layerIndex == geometry.pleLayer)
+                               bool priorWorkComplete = false,
+                               bool preNormalized = false) {
+    if (geometry.hasPerLayerEmbedding() && layerIndex == geometry.pleLayer) {
       encodePerLayerEmbedding(g, layerIndex, priorWorkComplete);
+      preNormalized = (lanes == 1 || buffers.liveRowsPerLane > 1);
+    }
     const auto &layer = weights.layers[layerIndex];
     metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
     addHyperConnection(g, geometry, input, layer.attentionHyperConnection,
                        buffers.normalized, buffers.hyperReduced,
                        buffers.hyperMixed, buffers.hyperInjection, hcRows,
-                       hcStep);
+                       hcStep, nullptr, preNormalized);
   };
 
   auto encodeMixer = [&](metal::CommandGraph &g, uint32_t layerIndex,
@@ -1866,9 +2006,11 @@ void Qwen4ExpTarget::addVerify(
   auto encodeMixerUpdate = [&](metal::CommandGraph &g, uint32_t layerIndex,
                                metal::MetalBuffer mixerOutBuffer) {
     metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
-    g.add("hyper_connection_update",
-          {input, mixerOutBuffer, buffers.hyperInjection}, hcParams,
-          {64, 1, 1}, {256, 1, 1});
+    const auto &layer = weights.layers[layerIndex];
+    g.add("hyper_connection_update_rms",
+          {input, mixerOutBuffer, buffers.hyperInjection,
+           layer.mlpHyperConnection.norm, buffers.normalized},
+          hcParams, {hcRows, geometry.hyperConnectionCount, 1}, {256, 1, 1});
   };
 
   auto encodeMlpHC = [&](metal::CommandGraph &g, uint32_t layerIndex) {
@@ -1877,7 +2019,7 @@ void Qwen4ExpTarget::addVerify(
     addHyperConnection(g, geometry, input, layer.mlpHyperConnection,
                        buffers.normalized, buffers.hyperReduced,
                        buffers.hyperMixed, buffers.hyperInjection, hcRows,
-                       hcStep);
+                       hcStep, nullptr, /*preNormalized=*/true);
   };
 
   auto encodeMoERoute = [&](metal::CommandGraph &g, uint32_t layerIndex) {
@@ -1929,12 +2071,31 @@ void Qwen4ExpTarget::addVerify(
         weightsToUse, moePlan, /*addResidual=*/false, hostGrouped);
   };
 
+  auto canFuseNextAttentionHC = [&](uint32_t layerIndex) {
+    return layerIndex + 1 < geometry.layers &&
+           !(geometry.hasPerLayerEmbedding() &&
+             layerIndex + 1 == geometry.pleLayer);
+  };
+
   auto encodeMlpUpdate = [&](metal::CommandGraph &g, uint32_t layerIndex) {
     metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
     metal::MetalBuffer output = buffers.hidden[(layerIndex & 1) ^ 1];
-    g.add("hyper_connection_update_out",
-          {input, output, buffers.gdnOutput, buffers.hyperInjection},
-          hcParams, {64, 1, 1}, {256, 1, 1});
+    if (canFuseNextAttentionHC(layerIndex)) {
+      g.add("hyper_connection_update_out_rms",
+            {input, output, buffers.gdnOutput, buffers.hyperInjection,
+             weights.layers[layerIndex + 1].attentionHyperConnection.norm,
+             buffers.normalized},
+            hcParams, {hcRows, geometry.hyperConnectionCount, 1}, {256, 1, 1});
+    } else if (layerIndex + 1 == geometry.layers) {
+      g.add("hyper_connection_update_out_rms",
+            {input, output, buffers.gdnOutput, buffers.hyperInjection,
+             weights.hyperConnectionMixer.norm, buffers.normalized},
+            hcParams, {hcRows, geometry.hyperConnectionCount, 1}, {256, 1, 1});
+    } else {
+      g.add("hyper_connection_update_out",
+            {input, output, buffers.gdnOutput, buffers.hyperInjection},
+            hcParams, {64, 1, 1}, {256, 1, 1});
+    }
   };
 
 
@@ -1942,7 +2103,7 @@ void Qwen4ExpTarget::addVerify(
     addHyperConnection(g, geometry, buffers.hidden[geometry.layers & 1],
                        weights.hyperConnectionMixer, buffers.normalized,
                        buffers.hyperReduced, buffers.finalHidden, {}, hcRows,
-                       hcStep);
+                       hcStep, nullptr, /*preNormalized=*/true);
     const ops::LinearMatrix head{geometry.vocabularySize, geometry.hiddenSize};
     operators.linear().addDecodeBatch(g, buffers.finalHidden,
                                       weights.logitsProjection, buffers.logits,
@@ -1954,7 +2115,8 @@ void Qwen4ExpTarget::addVerify(
 
   if (!useStreamingCache) {
     for (uint32_t layerIndex = 0; layerIndex < geometry.layers; ++layerIndex) {
-      encodeAttentionHC(graph, layerIndex);
+      encodeAttentionHC(graph, layerIndex, false,
+                        layerIndex > 0 && canFuseNextAttentionHC(layerIndex - 1));
       metal::MetalBuffer mixerOut = encodeMixer(graph, layerIndex, gdnIndex, attentionIndex);
       encodeMixerUpdate(graph, layerIndex, mixerOut);
       encodeMlpHC(graph, layerIndex);
@@ -2501,10 +2663,6 @@ void Qwen4ExpTarget::addVerify(
     auto *hIn = static_cast<uint16_t *>(weights.mtpHin.contents());
     const auto *hidden0 = static_cast<const uint16_t *>(buffers.hidden[0].contents());
     metal::MetalBuffer X = buffers.hidden[1], Y = buffers.hidden[0];
-    const HyperConnectionParams all{kRows, hidden, geometry.hyperConnectionCount,
-                                    geometry.hyperConnectionLowRank, 1e-6f, 1, 1, 0};
-    const HyperConnectionParams single{kRows, hidden, 1,
-                                       geometry.hyperConnectionLowRank, 1e-6f, 0, 1, 0};
     const ops::LinearMatrix square{hidden, hidden};
     const ops::LinearMatrix attentionInput{geometry.packedAttentionWidth, hidden};
     const ops::LinearMatrix mixerOutput{hidden, geometry.attentionWidth};
@@ -2528,8 +2686,8 @@ void Qwen4ExpTarget::addVerify(
       auto *tokenOut = static_cast<uint32_t *>(weights.mtpTokens.contents());
       auto *cosines = static_cast<float *>(weights.mtpCos.contents());
       auto *sines = static_cast<float *>(weights.mtpSin.contents());
-      for (uint32_t r = 0; r < kRows; ++r) {
-        tokenOut[r] = tokens[std::min(r, live - 1)];
+      for (uint32_t r = 0; r < live; ++r) {
+        tokenOut[r] = tokens[r];
         for (uint32_t d = 0; d < geometry.rotaryPairs; ++d) {
           const float angle = float(position + r) * rotaryFrequencies[d];
           cosines[r * geometry.rotaryPairs + d] = std::cos(angle);
@@ -2551,25 +2709,49 @@ void Qwen4ExpTarget::addVerify(
       const auto plan = operators.verifyAttention(
           lanes, geometry.attentionQueryHeads, geometry.kvLayout, histories);
 
+      const uint32_t streamLanes = (live * geometry.hyperConnectionCount +
+                                    ExecutionLimits::targetVerifyRows - 1) /
+                                   ExecutionLimits::targetVerifyRows;
+      const HyperConnectionParams liveAll{live, hidden, geometry.hyperConnectionCount,
+                                          geometry.hyperConnectionLowRank, 1e-6f, 1, 1, 0};
+      const HyperConnectionParams liveSingle{live, hidden, 1,
+                                             geometry.hyperConnectionLowRank, 1e-6f, 0, 1, 0};
+      const HyperConnectionParams anchorAll{1, hidden, geometry.hyperConnectionCount,
+                                            geometry.hyperConnectionLowRank, 1e-6f, 1, 1, 0};
+      const uint32_t anchorRow = live - 1;
+      const uint64_t anchorXOffset = uint64_t{anchorRow} * width * 2;
+      const uint64_t anchorPackedOffset =
+          uint64_t{anchorRow} * geometry.packedAttentionWidth * 2;
+      const uint64_t anchorAttnOffset =
+          uint64_t{anchorRow} * (geometry.attentionQueryHeads / geometry.kvLayout.kvHeads) *
+          geometry.kvLayout.headDimension * 2;
+      metal::MetalBuffer anchorX =
+          anchorRow ? backend.view(X, anchorXOffset,
+                                   uint64_t{kRows - anchorRow} * width * 2)
+                    : X;
+
       metal::CommandGraph a;
       ops::Embedding::add(a, weights.mtpTokens, weights.tokenEmbedding,
-                          weights.mtpEmbed, kRows);
+                          weights.mtpEmbed, live);
       a.add("hyper_connection_rms", {weights.mtpEmbed, combiner.embeddingNorm,
                                      weights.mtpNorm},
-            single, {kRows, 1, 1}, {256, 1, 1});
+            liveSingle, {live, 1, 1}, {256, 1, 1});
       operators.linear().addDecodeBatch(a, weights.mtpNorm, combiner.fcEmbedding,
                                         weights.mtpE, square, lanes, stats);
       a.add("hyper_connection_rms", {weights.mtpHin, combiner.hiddenNorm,
                                      buffers.normalized},
-            all, {kRows, geometry.hyperConnectionCount, 1}, {256, 1, 1});
-      // fc_hidden on each stream: 8 rows of 4 streams are 32 rows of hidden.
+            liveAll, {live, geometry.hyperConnectionCount, 1}, {256, 1, 1});
+      // fc_hidden on each stream: `live` rows of 4 streams fit in `streamLanes` 8-row tiles.
       operators.linear().addDecodeBatch(a, buffers.normalized, combiner.fcHidden,
-                                        X, square, 4 * lanes, stats);
-      a.add("hyper_connection_update", {X, weights.mtpE, weights.mtpOnes}, all,
-            {64, 1, 1}, {256, 1, 1});
+                                        X, square, streamLanes, stats);
+      a.add("hyper_connection_update_rms",
+            {X, weights.mtpE, weights.mtpOnes, head.attentionHyperConnection.norm,
+             buffers.normalized},
+            liveAll, {live, geometry.hyperConnectionCount, 1}, {256, 1, 1});
       addHyperConnection(a, geometry, X, head.attentionHyperConnection,
                          buffers.normalized, buffers.hyperReduced,
-                         buffers.hyperMixed, buffers.hyperInjection, kRows, 1);
+                         buffers.hyperMixed, buffers.hyperInjection, live, 1,
+                         nullptr, /*preNormalized=*/true);
       const auto &mixer = std::get<QwenAttentionWeights>(head.mixer);
       operators.linear().addDecodeBatch(a, buffers.hyperMixed, mixer.inputProjectionQ8,
                                         buffers.fullPacked, attentionInput, lanes, stats);
@@ -2584,26 +2766,41 @@ void Qwen4ExpTarget::addVerify(
            buffers.fullQueries, buffers.attentionPartials,
            buffers.attentionStatistics, buffers.fullAttention, buffers.pageTables},
           q8m, vm, plan);
+      // Only the anchor row (`live - 1`) produces the next draft token; rows
+      // 0..live-2 only needed their KV entries stored above. Narrow the
+      // post-attention path (gate, o_proj, MLP HC, MoE, and head) to 1 row.
       ops::PagedAttention::addVerifyGate(
-          a, buffers.fullPacked, buffers.fullAttention, buffers.attentionHidden,
-          kRows, kv::kPageTokens, kv::kPageTokens, geometry.attentionQueryHeads,
-          geometry.kvLayout, lanes);
+          a,
+          anchorRow ? backend.view(buffers.fullPacked, anchorPackedOffset,
+                                   buffers.fullPacked.sizeBytes() - anchorPackedOffset)
+                    : buffers.fullPacked,
+          anchorRow ? backend.view(buffers.fullAttention, anchorAttnOffset,
+                                   buffers.fullAttention.sizeBytes() - anchorAttnOffset)
+                    : buffers.fullAttention,
+          buffers.attentionHidden, 1, kv::kPageTokens, kv::kPageTokens,
+          geometry.attentionQueryHeads, geometry.kvLayout, lanes);
       operators.linear().addDecodeBatch(a, buffers.attentionHidden,
                                         mixer.outputProjectionQ8,
                                         buffers.attentionOutput, mixerOutput, lanes, stats);
-      a.add("hyper_connection_update", {X, buffers.attentionOutput,
-                                        buffers.hyperInjection},
-            all, {64, 1, 1}, {256, 1, 1});
-      addHyperConnection(a, geometry, X, head.mlpHyperConnection,
+      a.add("hyper_connection_update_rms",
+            {anchorX, buffers.attentionOutput,
+             anchorRow ? backend.view(buffers.hyperInjection,
+                                      uint64_t{anchorRow} * geometry.hyperConnectionCount * 2,
+                                      uint64_t{kRows - anchorRow} * geometry.hyperConnectionCount * 2)
+                       : buffers.hyperInjection,
+             head.mlpHyperConnection.norm, buffers.normalized},
+            anchorAll, {1, geometry.hyperConnectionCount, 1}, {256, 1, 1});
+      addHyperConnection(a, geometry, anchorX, head.mlpHyperConnection,
                          buffers.normalized, buffers.hyperReduced,
-                         buffers.hyperMixed, buffers.hyperInjection, kRows, 1);
+                         buffers.hyperMixed, buffers.hyperInjection, 1, 1,
+                         nullptr, /*preNormalized=*/true);
       encodeRouteScores(a, mtpIndex, buffers.groupedInput);
       const auto clockA = std::chrono::steady_clock::now();
       (void)backend.submitCommand(a.dispatches());
       const auto clockStage = std::chrono::steady_clock::now();
 
       const uint32_t saved = buffers.liveRowsPerLane;
-      buffers.liveRowsPerLane = live;
+      buffers.liveRowsPerLane = 1;
       hostSelect(mtpIndex);
       if (!stageActiveExperts(mtpIndex))
         throw std::logic_error("MTP head needs more experts than its cache holds");
@@ -2613,11 +2810,13 @@ void Qwen4ExpTarget::addVerify(
 
       metal::CommandGraph b;
       encodeMoEExecute(b, makeCacheWeights(mtpIndex), /*hostGrouped=*/true);
-      b.add("hyper_connection_update_out", {X, Y, buffers.gdnOutput,
-                                            buffers.hyperInjection},
-            all, {64, 1, 1}, {256, 1, 1});
+      b.add("hyper_connection_update_out_rms",
+            {anchorX, Y, buffers.gdnOutput, buffers.hyperInjection,
+             combiner.mixer.norm, buffers.normalized},
+            anchorAll, {1, geometry.hyperConnectionCount, 1}, {256, 1, 1});
       addHyperConnection(b, geometry, Y, combiner.mixer, buffers.normalized,
-                         buffers.hyperReduced, buffers.finalHidden, {}, kRows, 1);
+                         buffers.hyperReduced, buffers.finalHidden, {}, 1, 1,
+                         nullptr, /*preNormalized=*/true);
       // With SPLASH_DRAFT_VOCAB the head scores only the most common tokens;
       // picked positions are mapped back to token ids below.
       const bool subset = !weights.draftVocabIds.empty();
@@ -2632,8 +2831,7 @@ void Qwen4ExpTarget::addVerify(
       shared(weights.mtpPickValues, kSlices * kCandidates * 4, "mtp-pick-values");
       shared(weights.mtpPickMass, kSlices * 2 * 4, "mtp-pick-mass");
       b.add("mtp_pick_slices",
-            {backend.view(buffers.logits, uint64_t{live - 1} * scored * 2,
-                          uint64_t{scored} * 2),
+            {backend.view(buffers.logits, 0, uint64_t{scored} * 2),
              weights.mtpPickIds, weights.mtpPickValues, weights.mtpPickMass},
             scored, {kSlices, 1, 1}, {256, 1, 1});
       (void)backend.submitCommand(b.dispatches());
@@ -2810,7 +3008,7 @@ void Qwen4ExpTarget::addVerify(
       draftProbabilities[5] = lastProbabilities;
 
       std::vector<uint16_t> yAnchor(width);
-      std::memcpy(yAnchor.data(), y + uint64_t{mtp.rows - 1} * width, width * 2);
+      std::memcpy(yAnchor.data(), y, width * 2);
 
       // Guess 1A step -> produces Guess 2A (ids[0]) and Guess 2B (ids[1])
       std::memcpy(hIn, yAnchor.data(), width * 2);
@@ -2834,14 +3032,13 @@ void Qwen4ExpTarget::addVerify(
       if (fits2) {
         std::memcpy(hIn, y1A.data(), width * 2);
         drafts[2] = step(anchorPosition + 1, 1, &drafts[1]);
-        std::memcpy(y2A.data(), y, width * 2);
       } else {
         std::memcpy(hIn, yAnchor.data(), width * 2);
         std::memcpy(hIn + uint64_t{1} * width, y1A.data(), width * 2);
         std::array<uint32_t, 2> branch2{drafts[0], drafts[1]};
         drafts[2] = step(anchorPosition, 2, branch2.data());
-        std::memcpy(y2A.data(), y + uint64_t{1} * width, width * 2);
       }
+      std::memcpy(y2A.data(), y, width * 2);
       draftTrace.chosen[2] = drafts[2];
       draftCandidates[2] = lastCandidates;
       draftProbabilities[2] = lastProbabilities;
@@ -2889,7 +3086,7 @@ void Qwen4ExpTarget::addVerify(
     const uint64_t anchorPosition = mtp.firstPosition + mtp.rows;
     std::vector<uint16_t> chain(maxDrafts * uint64_t{width});
     const auto *y = static_cast<const uint16_t *>(Y.contents());
-    std::memcpy(chain.data(), y + uint64_t{mtp.rows - 1} * width, width * 2);
+    std::memcpy(chain.data(), y, width * 2);
     // Each guess runs one new row: the attention step stores every row's
     // keys and values at its position, so the rows guessed before are read
     // from the cache. (Re-running them, SPLASH_MTP_RERUN, costs each earlier
@@ -2919,8 +3116,7 @@ void Qwen4ExpTarget::addVerify(
       if (lastConfidence < confident || chainConfidence < chainConfident)
         return drafts;
       drafted = k + 1;
-      std::memcpy(chain.data() + uint64_t{k} * width,
-                  y + uint64_t{rerunThis ? k - 1 : 0} * width, width * 2);
+      std::memcpy(chain.data() + uint64_t{k} * width, y, width * 2);
     }
     return drafts;
   };
@@ -3046,7 +3242,8 @@ void Qwen4ExpTarget::addVerify(
 
   metal::CommandGraph residentGraph = std::move(graph);
   for (uint32_t layerIndex = 0; layerIndex < R; ++layerIndex) {
-    encodeAttentionHC(residentGraph, layerIndex);
+    encodeAttentionHC(residentGraph, layerIndex, false,
+                      layerIndex > 0 && canFuseNextAttentionHC(layerIndex - 1));
     metal::MetalBuffer mixerOut = encodeMixer(residentGraph, layerIndex, gdnIndex, attentionIndex);
     encodeMixerUpdate(residentGraph, layerIndex, mixerOut);
     encodeMlpHC(residentGraph, layerIndex);
@@ -3062,7 +3259,7 @@ void Qwen4ExpTarget::addVerify(
   }
 
   // Layer R base up to router
-  encodeAttentionHC(residentGraph, R);
+  encodeAttentionHC(residentGraph, R, false, R > 0 && canFuseNextAttentionHC(R - 1));
   metal::MetalBuffer mixerOutR = encodeMixer(residentGraph, R, gdnIndex, attentionIndex);
   encodeMixerUpdate(residentGraph, R, mixerOutR);
   encodeMlpHC(residentGraph, R);
@@ -3147,7 +3344,8 @@ void Qwen4ExpTarget::addVerify(
         encodeMoEExecute(stepGraph, makeCacheWeights(L), /*hostGrouped=*/true);
       }
       encodeMlpUpdate(stepGraph, L);
-      encodeAttentionHC(stepGraph, L + 1, /*priorWorkComplete=*/true);
+      encodeAttentionHC(stepGraph, L + 1, /*priorWorkComplete=*/true,
+                        canFuseNextAttentionHC(L));
       metal::MetalBuffer mixerOutNext = encodeMixer(stepGraph, L + 1, gdnIndex, attentionIndex);
       encodeMixerUpdate(stepGraph, L + 1, mixerOutNext);
       encodeMlpHC(stepGraph, L + 1);
@@ -3158,14 +3356,30 @@ void Qwen4ExpTarget::addVerify(
       quiet[quietCount++] = false;
       pipelineDeferred = nullptr;
     }
+    encodeMs = std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - encodeStart).count();
+    // Start deferred stage-0 CPU work (such as Layer 1's n-gram gather) on a
+    // background queue while the main thread stages Layer R's experts and
+    // groups routes, then join before signalling the pipeline.
+    dispatch_group_t stage0Group = nullptr;
+    if (!deferredPerStage[0].empty()) {
+      stage0Group = dispatch_group_create();
+      auto *workList = &deferredPerStage[0];
+      dispatch_group_async(
+          stage0Group,
+          dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+            for (auto &work : *workList)
+              work();
+          });
+    }
     // The first stage's host work (layer R's experts) happens before commit:
     // its router result is already in memory. Shift so stage 0 needs none.
     auto ts0 = std::chrono::steady_clock::now();
-    encodeMs = std::chrono::duration<double, std::milli>(ts0 - encodeStart).count();
     if (!stageActiveExperts(R))
       throw std::logic_error("pipelined decode found more experts than the cache holds");
     hostGroup();
-    for (auto &work : deferredPerStage[0]) work();
+    if (stage0Group)
+      dispatch_group_wait(stage0Group, DISPATCH_TIME_FOREVER);
     totalStageMs += std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - ts0).count();
     const uint32_t stages = static_cast<uint32_t>(starts.size());
@@ -3246,7 +3460,8 @@ void Qwen4ExpTarget::addVerify(
       encodeMlpUpdate(stepGraph, L);
 
       // Layer L + 1 base up to router
-      encodeAttentionHC(stepGraph, L + 1, /*priorWorkComplete=*/true);
+      encodeAttentionHC(stepGraph, L + 1, /*priorWorkComplete=*/true,
+                        canFuseNextAttentionHC(L));
       metal::MetalBuffer mixerOutNext = encodeMixer(stepGraph, L + 1, gdnIndex, attentionIndex);
       encodeMixerUpdate(stepGraph, L + 1, mixerOutNext);
       encodeMlpHC(stepGraph, L + 1);

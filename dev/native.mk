@@ -38,6 +38,7 @@ MODEL_OPERATOR_SOURCES := \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \
 	runtime/ops/PagedAttention.cpp \
+	runtime/ops/PromptLookup.cpp \
 	runtime/ops/Sampling.cpp
 TEST_BACKEND_ASAN := $(ENGINE_SANITIZER_BUILD)/kv-first-engine-asan-ubsan
 TEST_BACKEND_TSAN := $(ENGINE_SANITIZER_BUILD)/kv-first-engine-tsan

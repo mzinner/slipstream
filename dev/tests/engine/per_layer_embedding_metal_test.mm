@@ -192,6 +192,77 @@ int main(int argc, const char *argv[]) {
               << "  worst relative error    " << worst << '\n';
     require(worst < 0.02, "the gated output does not match the reference");
 
+    // Verify per_layer_embedding_convolve_add_rms against the unfused sequence:
+    // history copy + gate + convolve + add + hyper_connection_rms.
+    struct StateParams {
+      uint32_t rows, width, history, eos, retained, retained_from_buffer, lane, reserved;
+    };
+    struct HcParams {
+      uint32_t rows, hidden, count, low_rank;
+      float epsilon;
+      uint32_t with_inject, row_step, down_splits;
+    };
+    const StateParams stateParams{params.rows, width, state, 151645u, params.rows, 0, 0, 0};
+    const HcParams hcParams{params.rows, params.hidden, params.count, 32, params.epsilon, 1, 1, 1};
+    std::vector<uint16_t> stateWords(8 + size_t(state) * width, 0);
+    for (size_t i = 8; i < stateWords.size(); ++i)
+      stateWords[i] = toBf16(normal(engine) * 0.2f);
+    std::vector<uint16_t> hcNorm = sample(width, 0.05f);
+    MetalBuffer stateBuf = upload(backend, stateWords, "ple-state");
+    MetalBuffer hcNormBuf = upload(backend, hcNorm, "ple-hc-norm");
+    MetalBuffer residualUnfused = upload(backend, hidden, "ple-res-unfused");
+    MetalBuffer residualFused = upload(backend, hidden, "ple-res-fused");
+    MetalBuffer normUnfused = backend.allocateBuffer(
+        size_t(params.rows + state) * width * 2, BufferStorage::Shared, "ple-norm-unfused");
+    MetalBuffer normFused = backend.allocateBuffer(
+        size_t(params.rows + state) * width * 2, BufferStorage::Shared, "ple-norm-fused");
+    MetalBuffer gatedUnfused = backend.allocateBuffer(
+        size_t(params.rows) * width * 2, BufferStorage::Shared, "ple-gated-unfused");
+    MetalBuffer gatedFused = backend.allocateBuffer(
+        size_t(params.rows) * width * 2, BufferStorage::Shared, "ple-gated-fused");
+    MetalBuffer hcOutUnfused = backend.allocateBuffer(
+        size_t(params.rows) * width * 2, BufferStorage::Shared, "ple-hc-unfused");
+    MetalBuffer hcOutFused = backend.allocateBuffer(
+        size_t(params.rows) * width * 2, BufferStorage::Shared, "ple-hc-fused");
+
+    CommandGraph unfusedGraph;
+    unfusedGraph.add("per_layer_embedding_history", {stateBuf, normUnfused},
+                     stateParams, {64, 1, 1}, {256, 1, 1});
+    unfusedGraph.add("per_layer_embedding_gate",
+                     {keyBuffer, valueBuffer, residualUnfused, keyGainBuffer,
+                      queryGainBuffer, convGainBuffer, gatedUnfused, normUnfused},
+                     params, {params.rows, 1, 1}, {256, 1, 1});
+    unfusedGraph.add("per_layer_embedding_convolve",
+                     {normUnfused, convBuffer, gatedUnfused}, params, {64, 1, 1},
+                     {256, 1, 1});
+    unfusedGraph.add("per_layer_embedding_add", {gatedUnfused, residualUnfused},
+                     stateParams, {64, 1, 1}, {256, 1, 1});
+    unfusedGraph.add("hyper_connection_rms",
+                     {residualUnfused, hcNormBuf, hcOutUnfused}, hcParams,
+                     {params.rows, params.count, 1}, {256, 1, 1});
+    (void)backend.submitCommand(unfusedGraph.dispatches());
+
+    CommandGraph fusedGraph;
+    fusedGraph.add("per_layer_embedding_gate",
+                   {keyBuffer, valueBuffer, residualFused, keyGainBuffer,
+                    queryGainBuffer, convGainBuffer, gatedFused, normFused},
+                   params, {params.rows, 1, 1}, {256, 1, 1});
+    fusedGraph.add("per_layer_embedding_convolve_add_rms",
+                   {stateBuf, normFused, convBuffer, gatedFused,
+                    residualFused, hcNormBuf, hcOutFused},
+                   params, {params.rows, params.count, 1}, {256, 1, 1});
+    (void)backend.submitCommand(fusedGraph.dispatches());
+
+    require(std::memcmp(residualUnfused.contents(), residualFused.contents(),
+                        residualUnfused.sizeBytes()) == 0,
+            "fused PLE residual mismatch");
+    require(std::memcmp(normUnfused.contents(), normFused.contents(),
+                        normUnfused.sizeBytes()) == 0,
+            "fused PLE normalized history mismatch");
+    require(std::memcmp(hcOutUnfused.contents(), hcOutFused.contents(),
+                        hcOutUnfused.sizeBytes()) == 0,
+            "fused PLE HC normalized output mismatch");
+
     std::cout << "per layer embedding metal test passed\n";
     return 0;
   } catch (const std::exception &error) {

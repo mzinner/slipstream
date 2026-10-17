@@ -2,8 +2,15 @@
 #include "model/WeightStore.hpp"
 #include "ops/GDN.hpp"
 
+#include <bit>
+#include <cmath>
 #include <iostream>
+#include <random>
 #include <stdexcept>
+#include <vector>
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 namespace {
 using namespace splash;
@@ -184,6 +191,170 @@ void stateLayoutsAreConsistent() {
           "GDN conv history must be taps minus one");
 }
 
+void neonHostRoutingMatchesScalarReference() {
+  auto widen = [](uint16_t bits) {
+    return std::bit_cast<float>(uint32_t{bits} << 16);
+  };
+  auto toBf16 = [](float value) {
+    const uint32_t bits = std::bit_cast<uint32_t>(value);
+    return static_cast<uint16_t>((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16);
+  };
+
+  auto scalarTopExperts = [&](const uint16_t *scores, uint32_t experts,
+                              uint32_t k, uint32_t *ids, float *weights) {
+    float chosen[16];
+    uint32_t filled = 0;
+    for (uint32_t e = 0; e < experts; ++e) {
+      const float v = widen(scores[e]);
+      if (filled == k && !(v > chosen[k - 1])) continue;
+      uint32_t at = filled < k ? filled++ : k - 1;
+      while (at > 0 && chosen[at - 1] < v) {
+        chosen[at] = chosen[at - 1];
+        ids[at] = ids[at - 1];
+        --at;
+      }
+      chosen[at] = v;
+      ids[at] = e;
+    }
+    float total = 0.0f;
+    for (uint32_t r = 0; r < k; ++r) total += std::exp(chosen[r] - chosen[0]);
+    for (uint32_t r = 0; r < k; ++r)
+      weights[r] = std::exp(chosen[r] - chosen[0]) / total;
+  };
+
+  auto neonTopExperts = [&](const uint16_t *scores, uint32_t experts,
+                            uint32_t k, uint32_t *ids, float *weights) {
+    float chosen[16];
+    uint32_t filled = 0;
+#if defined(__ARM_NEON)
+    uint32_t e = 0;
+    for (; e + 8 <= experts; e += 8) {
+      const uint16x8_t raw = vld1q_u16(scores + e);
+      if (filled == k) {
+        const float32x4_t lo =
+            vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(raw), 16));
+        const float32x4_t hi =
+            vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(raw), 16));
+        const float blockMax = vmaxvq_f32(vmaxq_f32(lo, hi));
+        if (!(blockMax > chosen[k - 1])) continue;
+      }
+      for (uint32_t j = 0; j < 8; ++j) {
+        const float v = widen(scores[e + j]);
+        if (filled == k && !(v > chosen[k - 1])) continue;
+        uint32_t at = filled < k ? filled++ : k - 1;
+        while (at > 0 && chosen[at - 1] < v) {
+          chosen[at] = chosen[at - 1];
+          ids[at] = ids[at - 1];
+          --at;
+        }
+        chosen[at] = v;
+        ids[at] = e + j;
+      }
+    }
+    for (; e < experts; ++e) {
+#else
+    for (uint32_t e = 0; e < experts; ++e) {
+#endif
+      const float v = widen(scores[e]);
+      if (filled == k && !(v > chosen[k - 1])) continue;
+      uint32_t at = filled < k ? filled++ : k - 1;
+      while (at > 0 && chosen[at - 1] < v) {
+        chosen[at] = chosen[at - 1];
+        ids[at] = ids[at - 1];
+        --at;
+      }
+      chosen[at] = v;
+      ids[at] = e;
+    }
+    float total = 0.0f;
+    for (uint32_t r = 0; r < k; ++r) total += std::exp(chosen[r] - chosen[0]);
+    for (uint32_t r = 0; r < k; ++r)
+      weights[r] = std::exp(chosen[r] - chosen[0]) / total;
+  };
+
+  std::mt19937 rng(20261015);
+  std::normal_distribution<float> dist(0.0f, 2.0f);
+  for (uint32_t trial = 0; trial < 32; ++trial) {
+    std::vector<uint16_t> scores(512);
+    for (uint32_t i = 0; i < 512; ++i) {
+      scores[i] = (trial == 0 && i % 17 == 0) ? toBf16(1.5f)
+                                              : toBf16(dist(rng));
+    }
+    uint32_t idsRef[10]{}, idsNeon[10]{};
+    float wRef[10]{}, wNeon[10]{};
+    scalarTopExperts(scores.data(), 512, 10, idsRef, wRef);
+    neonTopExperts(scores.data(), 512, 10, idsNeon, wNeon);
+    for (uint32_t k = 0; k < 10; ++k) {
+      require(idsRef[k] == idsNeon[k],
+              "NEON topExperts selected different expert id");
+      require(toBf16(wRef[k]) == toBf16(wNeon[k]),
+              "NEON topExperts produced different routing weight");
+    }
+  }
+
+  constexpr uint32_t kSize = 2560;
+  constexpr uint32_t kStorageN = 256;
+  constexpr uint32_t kGroups = kSize / 64;
+  std::vector<uint8_t> w(kGroups * kStorageN * 64);
+  std::vector<uint16_t> scales(kGroups * kStorageN);
+  std::vector<uint16_t> biases(kGroups * kStorageN);
+  std::vector<uint16_t> input(kSize);
+  for (auto &b : w) b = static_cast<uint8_t>(rng() & 0xFF);
+  for (auto &s : scales) s = toBf16(dist(rng) * 0.01f);
+  for (auto &b : biases) b = toBf16(dist(rng) * 0.01f);
+  for (auto &x : input) x = toBf16(dist(rng) * 0.5f);
+
+  float scalarTotal = 0.0f;
+  for (uint32_t d = 0; d < kSize; ++d) {
+    const uint32_t group = d / 64;
+    const float value =
+        float(w[uint64_t{group} * kStorageN * 64 + d % 64]) *
+            widen(scales[uint64_t{group} * kStorageN]) +
+        widen(biases[uint64_t{group} * kStorageN]);
+    scalarTotal += widen(input[d]) * value;
+  }
+  const float scalarGate = 1.0f / (1.0f + std::exp(-scalarTotal));
+
+  float neonTotal = 0.0f;
+#if defined(__ARM_NEON)
+  for (uint32_t group = 0; group < kGroups; ++group) {
+    const float scale = widen(scales[uint64_t{group} * kStorageN]);
+    const float bias = widen(biases[uint64_t{group} * kStorageN]);
+    const uint8_t *gw = w.data() + uint64_t{group} * kStorageN * 64;
+    const uint16_t *gx = input.data() + uint64_t{group} * 64;
+    float32x4_t wSum0 = vdupq_n_f32(0.0f);
+    float32x4_t wSum1 = vdupq_n_f32(0.0f);
+    float32x4_t xSum0 = vdupq_n_f32(0.0f);
+    float32x4_t xSum1 = vdupq_n_f32(0.0f);
+    for (uint32_t i = 0; i < 64; i += 8) {
+      const uint8x8_t w8 = vld1_u8(gw + i);
+      const uint16x8_t w16 = vmovl_u8(w8);
+      const float32x4_t wf0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(w16)));
+      const float32x4_t wf1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(w16)));
+      const uint16x8_t x16 = vld1q_u16(gx + i);
+      const float32x4_t xf0 =
+          vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(x16), 16));
+      const float32x4_t xf1 =
+          vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(x16), 16));
+      wSum0 = vfmaq_f32(wSum0, xf0, wf0);
+      wSum1 = vfmaq_f32(wSum1, xf1, wf1);
+      xSum0 = vaddq_f32(xSum0, xf0);
+      xSum1 = vaddq_f32(xSum1, xf1);
+    }
+    const float groupW = vaddvq_f32(vaddq_f32(wSum0, wSum1));
+    const float groupX = vaddvq_f32(vaddq_f32(xSum0, xSum1));
+    neonTotal += groupW * scale + groupX * bias;
+  }
+#else
+  neonTotal = scalarTotal;
+#endif
+  const float neonGate = 1.0f / (1.0f + std::exp(-neonTotal));
+  require(std::fabs(scalarGate - neonGate) < 1e-6f,
+          "NEON sharedExpertGate diverges from scalar reference");
+  require(toBf16(scalarGate) == toBf16(neonGate),
+          "NEON sharedExpertGate bf16 result diverges from scalar reference");
+}
+
 } // namespace
 
 int main() {
@@ -196,6 +367,7 @@ int main() {
     moeShapeIsAccepted();
     ngramGeometryIsPinned();
     stateLayoutsAreConsistent();
+    neonHostRoutingMatchesScalarReference();
   } catch (const std::exception &error) {
     std::cerr << "qwen4exp layout test failed: " << error.what() << '\n';
     return 1;

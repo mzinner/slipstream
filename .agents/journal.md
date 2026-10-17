@@ -391,3 +391,45 @@ Blocked on: nothing.
 
 
 
+
+## 2026-10-12 00:30 PDT — muse-code
+Reviewed Strata (Niko1221) for expert-memory ideas. Main find: ISTA-DASLab Coder prune keeps 256/512 experts per layer via RCO ranking on code/agentic/vision calibration data, ships ranking as rco-allocation.txt, keeps survivors at higher precision; 91.3% SWE-bench, 98.7% LiveCodeBench per authors. Added to tomorrow's plan as the selection method for our parked 256-expert idea. Strata is discrete-GPU Windows/Linux only, no portable code. Also: K_S cache race resolved (single shared inode, refs/main pinned); backbone confirmed Q8_0 by tensor audit, stays per owner.
+
+## 2026-10-14 08:45 PDT — freebuff
+
+Measured the tokenspeed fusion diff (live-row MTP narrowing, `hyper_connection_update_rms` /
+`hyper_connection_update_out_rms`, fused PLE path, stage-0 background overlap) with
+decode-profile A/B against HEAD orchestration on the same metallib: 3 baseline vs 5 fused
+vs 3 `SPLASH_FUSE_PLE=0` trials, interleaved, under `guarded.py`. Prefill 11.45 → 11.31 ms
+(−1.2%, clean rank separation), B1 decode 3.79 → 3.69 ms GPU (−2.6%), B4 −0.6% (noise),
+prefill dispatches −5.9%; HC kernel family halved (17.4 → 9.6 ms profiled). PLE fusion
+unmeasurable (1 of 48 layers). Wall time not attributable: B1 wall is bimodal at 86 vs
+120 ms tracking MTP commands/cycle (9 vs 13), which flips run-to-run within one binary
+(AdaptiveDraftController acceptance feedback). Both fusions bit-exact (memcmp tests).
+Also fixed a pre-existing test-link break: `dev/native.mk` `MODEL_OPERATOR_SOURCES` was
+missing `runtime/ops/PromptLookup.cpp`, failing `model-package` link in test-engine-metal;
+full CPU + Metal suites green after. Numbers in `docs/tokenspeed-optimizations.md` §4.
+Blocked on: nothing.
+
+## 2026-10-15 21:50 PDT — freebuff
+
+Completed the remaining high-leverage items in `docs/tokenspeed-optimizations.md`:
+1. **Priority 1 part 2 (MTP post-attention 1-row narrowing in `Qwen4ExpTarget.cpp`):** after `PagedAttention::addVerify` stores KV for all `live` rows on MTP step 0, narrowed the post-attention path (`addVerifyGate`, `outputProjectionQ8`, `mlpHyperConnection`, `encodeRouteScores`, `hostSelect`, `stageActiveExperts`, `hostGroup`, `encodeMoEExecute`, and `combiner.mixer`) to strictly 1 row (`anchorRow = live - 1`), eliminating MoE routing, SSD expert staging/evictions, and expert GEMMs for rows `0 .. live - 2`.
+2. **Priority 4a (ARM NEON `sharedExpertGate` + `topExperts` in `Qwen4ExpTarget.cpp`):** vectorized the per-64-element Q8 dequantization dot product in `sharedExpertGate` and added an 8-wide NEON `vmaxvq_f32` fast-skip in `topExperts` during the host pipeline stage pause. Added bit-exact bf16 parity test in `dev/tests/engine/qwen4exp_layout_test.cpp`.
+Verified all 18 CPU engine tests, Metal kernel validation tests (`MTL_SHADER_VALIDATION=1`), and all 171 Python server tests (`dev/tests/test_server.py`) pass 100%. Live 10-prompt `speed_suite.py` run deferred by `guarded.py` because an external `splash` server on port 8000 (`Swift-Qwen3.8-27B`) is currently active on the host.
+Blocked on: nothing (run `speed_suite.py` when port 8000 is idle if 10-prompt trace numbers are wanted).
+
+## 2026-10-16 17:45 PDT — freebuff
+
+With port 8000 idle, executed the full 10-prompt `speed_suite.py` (2,509 tokens across 860 decode steps on `~/models/swift-qwen38-flash-next-v3/prepared`) with `SPLASH_TRACE` (`trace_report.py`) and clean (no trace flags), plus the Expert Memory Plan sweep (`SPLASH_EXPERT_CACHE_GIB={25, 32, 34, 36}`):
+- **TokenSpeed & Slipstream optimizations impact (`trace_report.py`):**
+  - MTP draft head total time dropped from **8–13 ms/step** down to **6.2–6.5 ms/step** across 2.57 guesses/step (`~2.0 ms/guess`), and MTP expert staging dropped to **0.9–1.1 ms/step** thanks to Priority 1's 1-row post-attention narrowing (`anchorRow = live - 1`).
+  - SSD expert reads at 34 GiB dropped from the historical **87 reads/step** baseline down to **52 reads/step** (`45 reads/step` at 36 GiB, `62 reads/step` at 32 GiB).
+  - Generated token sequences across `32`, `34`, and `36 GiB` are 100% bit-for-bit identical (`2,509` tokens).
+- **Expert Memory Plan (`32 vs 34 vs 36 GiB` & context cap):**
+  - `32 → 34 GiB` yields **+1.5 tok/s** clean (`37.3 → 38.8 tok/s`, `78.2 → 75.1 ms/step`, SSD reads `62 → 52/step`) with **4.6–5.0 GiB** lowest free RAM (above the 4.0 GiB `guarded.py` floor).
+  - `34 → 36 GiB` flattens on clean wall-clock (`38.8 → 39.0 tok/s`, `+0.5%`) while dropping lowest free RAM to **3.8–3.9 GiB** on <9k prompts — triggering the plan's stop rule. The engine implicit expert-cache budget is now capped at **32 GiB**; explicit `SPLASH_EXPERT_CACHE_GIB` overrides remain available for controlled experiments.
+  - Verified `Q8PageStorage` allocates KV extents lazily on demand (`runtime/engine/MemoryPlan.cpp`), so lowering `--max-context` from 262k/131k to 100k does not free startup RAM for `mlock`ed expert caches.
+Blocked on: nothing.
+
+

@@ -305,6 +305,41 @@ void runCase(MetalBackend &backend, uint32_t rows) {
     require(injectionError < 0.02, "injection gate does not match");
     require(updatedError < 0.02, "residual update does not match");
 
+    // Also verify fused hyper_connection_update_rms and hyper_connection_update_out_rms
+    MetalBuffer xFused = bufferFrom(backend, x, "hc-residual-fused");
+    MetalBuffer xOutFused = backend.allocateBuffer(
+        size_t(params.rows) * width * 2, BufferStorage::Shared, "hc-residual-out-fused");
+    MetalBuffer normFused1 = backend.allocateBuffer(
+        size_t(params.rows) * width * 2, BufferStorage::Shared, "hc-normed-fused1");
+    MetalBuffer normFused2 = backend.allocateBuffer(
+        size_t(params.rows) * width * 2, BufferStorage::Shared, "hc-normed-fused2");
+    MetalBuffer normRef = backend.allocateBuffer(
+        size_t(params.rows) * width * 2, BufferStorage::Shared, "hc-normed-ref");
+
+    CommandGraph fusedGraph;
+    fusedGraph.add("hyper_connection_rms", {xBuffer, gainBuffer, normRef}, params,
+                   {params.rows, params.count, 1}, {256, 1, 1});
+    fusedGraph.add("hyper_connection_update_rms",
+                   {xFused, blockBuffer, injection, gainBuffer, normFused1}, params,
+                   {params.rows, params.count, 1}, {256, 1, 1});
+    MetalBuffer xIn = bufferFrom(backend, x, "hc-residual-in");
+    fusedGraph.add("hyper_connection_update_out_rms",
+                   {xIn, xOutFused, blockBuffer, injection, gainBuffer, normFused2}, params,
+                   {params.rows, params.count, 1}, {256, 1, 1});
+    (void)backend.submitCommand(fusedGraph.dispatches());
+
+    const uint16_t *refNormPtr = hostOf(normRef);
+    const uint16_t *fused1Ptr = hostOf(normFused1);
+    const uint16_t *fused2Ptr = hostOf(normFused2);
+    const uint16_t *xRefPtr = hostOf(xBuffer);
+    const uint16_t *xFusedPtr = hostOf(xFused);
+    const uint16_t *xOutFusedPtr = hostOf(xOutFused);
+    for (size_t i = 0; i < size_t(params.rows) * width; ++i) {
+      require(fused1Ptr[i] == refNormPtr[i], "hyper_connection_update_rms normalized mismatch");
+      require(fused2Ptr[i] == refNormPtr[i], "hyper_connection_update_out_rms normalized mismatch");
+      require(xFusedPtr[i] == xRefPtr[i], "hyper_connection_update_rms residual mismatch");
+      require(xOutFusedPtr[i] == xRefPtr[i], "hyper_connection_update_out_rms residual mismatch");
+    }
 }
 
 
