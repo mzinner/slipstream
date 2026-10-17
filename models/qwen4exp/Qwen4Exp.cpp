@@ -263,15 +263,15 @@ Qwen4ExpCachePlan planQwen4ExpExpertCache(const Qwen4ExpLayout &layout,
     plan.residentLayers = std::min<uint32_t>(layout.layers, std::max(0, std::atoi(envResident)));
   if (plan.residentLayers >= layout.layers) return plan;
   const uint64_t expertStride = uint64_t{layout.expertIntermediateSize} * layout.hiddenSize * 9 / 16;
-  // The expert cache gets the budget llama.cpp's --moe-stream-cache uses on
-  // this machine: everything but ~28 GiB, i.e. 36 GiB of 64. Measured on a
-  // 64 GB M5 Pro: 16 GiB (128 per layer) 10-13 tok/s, 36 GiB 14-19. Past
-  // ~38 GiB both engines swap. SPLASH_EXPERT_CACHE_GIB or _CAPACITY override.
+  // Keep roughly 28 GiB for the OS, applications, and runtime, with a 32 GiB
+  // default cap on the expert cache. On 64 GB Macs this selects 32 GiB; lower
+  // RAM is constrained by the 28 GiB reserve and the 8 GiB minimum. The explicit
+  // SPLASH_EXPERT_CACHE_GIB or _CAPACITY settings override the default.
   uint64_t physical = 0;
   size_t length = sizeof(physical);
   (void)sysctlbyname("hw.memsize", &physical, &length, nullptr, 0);
   const double physicalGiB = double(physical) / double(1ULL << 30);
-  double budgetGiB = std::max(8.0, physicalGiB - 28.0);
+  double budgetGiB = std::max(8.0, std::min(32.0, physicalGiB - 28.0));
   if (const char *envGiB = getenv("SPLASH_EXPERT_CACHE_GIB"))
     budgetGiB = std::max(1.0, std::atof(envGiB));
   // The prompt staging buffer comes out of the same budget.
@@ -630,7 +630,7 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend,
     // The cache is pinned: macOS cannot page it out. If it does not fit in
     // free memory, the machine freezes until its watchdog restarts it (twice
     // on 2026-09-22: two engines at once, then one asked for 60 GiB). The
-    // margin is small on purpose: the default 34 GiB cache normally leaves
+    // margin is small on purpose: the default 32 GiB cache normally leaves
     // ~4 GiB, and the runtime governor guards what follows; a second engine
     // finds ~4 GiB against 35 needed and stops here.
     {

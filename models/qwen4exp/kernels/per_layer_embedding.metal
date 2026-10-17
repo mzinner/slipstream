@@ -239,6 +239,91 @@ kernel void per_layer_embedding_add(
     residual[element] = bfloat(float(residual[element]) + float(gated[element]));
 }
 
+// Fused gate + history copy + convolve + residual add + next-HC RMSNorm.
+// Eliminates per_layer_embedding_history, per_layer_embedding_convolve,
+// per_layer_embedding_add, and the subsequent hyper_connection_rms pass.
+kernel void per_layer_embedding_convolve_add_rms(
+    device const uchar *state [[buffer(0)]],
+    device bfloat *normalized [[buffer(1)]],
+    device const bfloat *weights [[buffer(2)]],
+    device const bfloat *gated [[buffer(3)]],
+    device bfloat *residual [[buffer(4)]],
+    device const bfloat *hc_norm [[buffer(5)]],
+    device bfloat *hc_normalized [[buffer(6)]],
+    constant PerLayerEmbeddingParams &params [[buffer(7)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  const uint row = group.x;
+  const uint stream = group.y;
+  if (row >= params.rows || stream >= params.count)
+    return;
+  const uint hidden = params.hidden;
+  const uint width = params.count * hidden;
+  const uint state_rows = (params.taps - 1) * params.dilation;
+  device const bfloat *state_hist = reinterpret_cast<device const bfloat *>(
+      state + kPleHeaderWords * sizeof(uint));
+
+  // Row 0 threadgroups also copy the history slice for their stream into
+  // `normalized` so `per_layer_embedding_commit` sees the full window.
+  if (row == 0) {
+    for (uint h = 0; h < state_rows; ++h) {
+      const ulong base = ulong(h) * width + ulong(stream) * hidden;
+      for (uint i = thread_index; i < hidden; i += kThreads)
+        normalized[base + i] = state_hist[base + i];
+    }
+  }
+
+  const ulong row_stream_base = ulong(row) * width + ulong(stream) * hidden;
+  device const bfloat *weights_base =
+      weights + ulong(stream) * hidden * params.taps;
+  device const bfloat4 *gated4 =
+      reinterpret_cast<device const bfloat4 *>(gated + row_stream_base);
+  device bfloat4 *res4 =
+      reinterpret_cast<device bfloat4 *>(residual + row_stream_base);
+  float square = 0.0f;
+  for (uint i = thread_index; i < hidden / 4; i += kThreads) {
+    float4 activated;
+    for (uint c = 0; c < 4; ++c) {
+      const uint channel = stream * hidden + 4 * i + c;
+      float sum = 0.0f;
+      for (uint tap = 0; tap < params.taps; ++tap) {
+        const uint source =
+            row + state_rows - (params.taps - 1 - tap) * params.dilation;
+        const bfloat val = source < state_rows
+                               ? state_hist[ulong(source) * width + channel]
+                               : normalized[ulong(source) * width + channel];
+        sum += float(val) *
+               float(weights_base[ulong(4 * i + c) * params.taps + tap]);
+      }
+      activated[c] = sum / (1.0f + exp(-sum));
+    }
+    const float4 g = float4(bfloat4(float4(gated4[i]) + activated));
+    const bfloat4 r_bf = bfloat4(float4(res4[i]) + g);
+    res4[i] = r_bf;
+    const float4 v = float4(res4[i]);
+    square += dot(v, v);
+  }
+
+  threadgroup float partial[kSimdgroups];
+  square = simd_sum(square);
+  if (simd_lane == 0)
+    partial[simd_group] = square;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float total = 0.0f;
+  for (uint s = 0; s < kSimdgroups; ++s)
+    total += partial[s];
+  const float scale = rsqrt(total / float(hidden) + params.epsilon);
+
+  device const bfloat4 *g4 =
+      reinterpret_cast<device const bfloat4 *>(hc_norm + stream * hidden);
+  device bfloat4 *out4 =
+      reinterpret_cast<device bfloat4 *>(hc_normalized + row_stream_base);
+  for (uint i = thread_index; i < hidden / 4; i += kThreads)
+    out4[i] = bfloat4(float4(res4[i]) * scale * (1.0f + float4(g4[i])));
+}
+
 // Write the history the next step starts from, keeping only the rows that
 // were committed. With r rows kept, the convolution history is normalized
 // rows [r, r + history) - the last `history` of the stored history followed

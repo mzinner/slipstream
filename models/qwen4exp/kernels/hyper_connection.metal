@@ -346,6 +346,102 @@ kernel void hyper_connection_rms(
     out4[i] = bfloat4(float4(x4[i]) * scale * (1.0f + float4(g4[i])));
 }
 
+// 1b. Fused residual update + next mixer's per-stream RMSNorm:
+//   r' = r + injection[row, stream] * block[row]
+//   xn = rms_per_stream(r') * (1 + gain)
+// Eliminates a full device-memory round-trip of the [rows, count * hidden]
+// residual tensor and one kernel dispatch at every sublayer boundary.
+kernel void hyper_connection_update_rms(
+    device bfloat *residual [[buffer(0)]],
+    device const bfloat *block [[buffer(1)]],
+    device const bfloat *injection [[buffer(2)]],
+    device const bfloat *gain [[buffer(3)]],
+    device bfloat *normalized [[buffer(4)]],
+    constant HyperConnectionParams &params [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  const uint row = group.x, stream = group.y;
+  if (row >= params.rows || stream >= params.count)
+    return;
+  const uint hidden = params.hidden, width = params.count * hidden;
+  const ulong phys_row = hc_row(params, row);
+  const ulong base = phys_row * width + stream * hidden;
+  const float gate = float(injection[phys_row * params.count + stream]);
+  device bfloat4 *r4 = reinterpret_cast<device bfloat4 *>(residual + base);
+  device const bfloat4 *b4 =
+      reinterpret_cast<device const bfloat4 *>(block + phys_row * hidden);
+  float sum = 0.0f;
+  for (uint i = thread_index; i < hidden / 4; i += kThreads) {
+    const bfloat4 u = bfloat4(float4(r4[i]) + gate * float4(b4[i]));
+    r4[i] = u;
+    const float4 v = float4(u);
+    sum += dot(v, v);
+  }
+  threadgroup float partial[kSimdgroups];
+  sum = simd_sum(sum);
+  if (simd_lane == 0)
+    partial[simd_group] = sum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float total = 0.0f;
+  for (uint s = 0; s < kSimdgroups; ++s)
+    total += partial[s];
+  const float scale = rsqrt(total / float(hidden) + params.epsilon);
+  device const bfloat4 *g4 =
+      reinterpret_cast<device const bfloat4 *>(gain + stream * hidden);
+  device bfloat4 *out4 = reinterpret_cast<device bfloat4 *>(normalized + base);
+  for (uint i = thread_index; i < hidden / 4; i += kThreads)
+    out4[i] = bfloat4(float4(r4[i]) * scale * (1.0f + float4(g4[i])));
+}
+
+kernel void hyper_connection_update_out_rms(
+    device const bfloat *residual_in [[buffer(0)]],
+    device bfloat *residual_out [[buffer(1)]],
+    device const bfloat *block [[buffer(2)]],
+    device const bfloat *injection [[buffer(3)]],
+    device const bfloat *gain [[buffer(4)]],
+    device bfloat *normalized [[buffer(5)]],
+    constant HyperConnectionParams &params [[buffer(6)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  const uint row = group.x, stream = group.y;
+  if (row >= params.rows || stream >= params.count)
+    return;
+  const uint hidden = params.hidden, width = params.count * hidden;
+  const ulong phys_row = hc_row(params, row);
+  const ulong base = phys_row * width + stream * hidden;
+  const float gate = float(injection[phys_row * params.count + stream]);
+  device const bfloat4 *rin4 =
+      reinterpret_cast<device const bfloat4 *>(residual_in + base);
+  device bfloat4 *rout4 = reinterpret_cast<device bfloat4 *>(residual_out + base);
+  device const bfloat4 *b4 =
+      reinterpret_cast<device const bfloat4 *>(block + phys_row * hidden);
+  float sum = 0.0f;
+  for (uint i = thread_index; i < hidden / 4; i += kThreads) {
+    const bfloat4 u = bfloat4(float4(rin4[i]) + gate * float4(b4[i]));
+    rout4[i] = u;
+    const float4 v = float4(u);
+    sum += dot(v, v);
+  }
+  threadgroup float partial[kSimdgroups];
+  sum = simd_sum(sum);
+  if (simd_lane == 0)
+    partial[simd_group] = sum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float total = 0.0f;
+  for (uint s = 0; s < kSimdgroups; ++s)
+    total += partial[s];
+  const float scale = rsqrt(total / float(hidden) + params.epsilon);
+  device const bfloat4 *g4 =
+      reinterpret_cast<device const bfloat4 *>(gain + stream * hidden);
+  device bfloat4 *out4 = reinterpret_cast<device bfloat4 *>(normalized + base);
+  for (uint i = thread_index; i < hidden / 4; i += kThreads)
+    out4[i] = bfloat4(float4(rout4[i]) * scale * (1.0f + float4(g4[i])));
+}
+
 // 2. reduced = silu(down . xn / count), injection = 2 sigmoid(inject . xn / count).
 // A threadgroup owns 8 outputs (one per simdgroup) for up to 8 rows. The
 // rows' normalized input is staged in threadgroup memory a slice at a time,
