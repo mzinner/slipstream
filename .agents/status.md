@@ -1,19 +1,25 @@
 # Status — Slipstream (handoff)
 
-**Updated:** 2026-10-01 13:17 PDT by antigravity.
-**Branch:** `main` (workspace `slipstream-v2` symlinked to `slipstream`).
+**Updated:** 2026-10-11 15:30 PDT by claude-code.
+**Branch:** `main` at October release `11b6034` (`v26.10.4`), in sync with `origin/main`. Week's work kept on `main-backup-2026-10-11` and `27b` (both pushed). User's Swift Flash-Next server is LIVE on :8090 (`local/prepared`).
 
 ## In one line
 
-Refactored Reddit submission (`docs/REDDIT_POST.md` and Desktop pack): zero links in opening paragraph, converted all references to clean markdown hyperlinks, removed raw URLs to avoid automated spam filters. Server is stopped with 50+ GiB free RAM.
+Main model standardized: Swift-Flash-Next V3 at `~/models/swift-qwen38-flash-next-v3`, served from its `prepared/` package as id `local/prepared` on :8090. README top now has the daily-driver block; Work Hub card + agents matrix + omp registry all point at the live id. Removed stale `../slipstream-v1.1.0` worktree and `/tmp/octrel`.
 
 ---
 
 ## How to use it
 
 ```zsh
-# Serve Swift V3 directly pointing at GGUF directory:
-./slipstream serve --model ~/models/swift-qwen38-flash-next-v3 --port 8090
+# Standard: serve the main Swift model (one server at a time):
+./slipstream serve --model ~/models/swift-qwen38-flash-next-v3/prepared --port 8090
+
+# Served id is local/prepared — connect with:
+pi --model slipstream/local/prepared --thinking low
+omp --model splash-flashnext/local/prepared --thinking=low --tools=read,write,edit,bash,grep,glob,todo --approval-mode=yolo
+# NOTE: ./slipstream claude|opencode|codex launch but their requests fail
+# server-side (400 "messages could not be rendered", 2026-10-11) — not documented as working.
 
 # Or serve Nitin's daily V3 model:
 ./slipstream serve --model ~/models/qwen38-flash-next-v3 --port 8090
