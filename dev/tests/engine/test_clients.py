@@ -170,7 +170,7 @@ class ClientTests(unittest.TestCase):
                         "xhigh": {"reasoningEffort": "xhigh"},
                     },
                 )
-                self.assertEqual(argv, ["/bin/opencode"])
+                self.assertEqual(argv, ["/bin/opencode", "--standalone"])
                 self.assertNotIn("variant", config)
                 self.assertNotIn("reasoningEffort", model_config)
                 self.assertNotIn("options", model_config)
@@ -201,8 +201,28 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(configured[name], value)
         self.assertEqual(config["agent"]["build"]["variant"], "brief")
         self.assertEqual(config["agent"]["build"]["prompt"], "Custom prompt")
-        self.assertEqual(argv, ["/bin/opencode", *args])
+        self.assertEqual(argv, ["/bin/opencode", *args, "--standalone"])
         self.assertEqual(original, before)
+
+    def test_opencode_uses_private_server_unless_user_selected_one(self):
+        # OpenCode 2 reads inline config only on a private server; the
+        # background service never sees this process's environment.
+        argv, _ = self.command("opencode")
+        self.assertEqual(argv, ["/bin/opencode", "--standalone"])
+        argv, _ = self.command(
+            "opencode", client_args=["--help", "--", "literal"]
+        )
+        self.assertEqual(
+            argv, ["/bin/opencode", "--help", "--standalone", "--", "literal"]
+        )
+        for args in (
+            ["--standalone"],
+            ["--server", "http://127.0.0.1:4096"],
+            ["--server=http://127.0.0.1:4096"],
+        ):
+            with self.subTest(args=args):
+                argv, _ = self.command("opencode", client_args=args)
+                self.assertEqual(argv, ["/bin/opencode", *args])
 
     def test_opencode_points_built_in_agents_at_the_served_model(self):
         # An agent-level model in the user's global config outranks the
@@ -401,7 +421,15 @@ class ClientTests(unittest.TestCase):
             with self.subTest(name=name):
                 args = ["--help", "--", "literal"]
                 argv, _ = self.command(name, client_args=args)
-                self.assertEqual(argv[-len(args) :], args)
+                if name == "opencode":
+                    # The private-server flag precedes the end-of-options
+                    # separator; everything from "--" on is verbatim.
+                    self.assertEqual(
+                        argv,
+                        [f"/bin/{name}", "--help", "--standalone", *args[1:]],
+                    )
+                else:
+                    self.assertEqual(argv[-len(args) :], args)
 
     def test_claude_hides_only_hosted_search_and_preserves_user_restrictions(self):
         args = ["--disallowedTools", "Bash", "mcp__private__write", "--print", "hello"]

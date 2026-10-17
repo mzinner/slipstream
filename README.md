@@ -10,6 +10,29 @@ Everything is open source under Apache-2.0.
 
 ---
 
+## Daily driver (the one local model to run)
+
+**Main model:** Swift-Flash-Next V3 lives at `~/models/swift-qwen38-flash-next-v3` (71 GiB, ready-to-serve `prepared/` package inside). Published speed: 41–52 tok/s decode. Run one model server at a time.
+
+```zsh
+# Once per boot: lift the GPU memory limit (required on 64 GB Macs)
+sudo sysctl iogpu.wired_limit_mb=59392
+
+# Serve the main model (stop any other model server first)
+./slipstream serve --model ~/models/swift-qwen38-flash-next-v3/prepared --port 8090
+
+# Check it: the served model id is local/prepared
+curl -s http://127.0.0.1:8090/v1/models
+```
+
+Point any harness at `http://127.0.0.1:8090` with model id `local/prepared`:
+
+- **pi:** `pi --model slipstream/local/prepared --thinking low`
+- **omp:** `omp --model splash-flashnext/local/prepared --thinking=low --tools=read,write,edit,bash,grep,glob,todo --approval-mode=yolo`
+- **curl / python:** OpenAI-style `POST /v1/chat/completions` with `"model": "local/prepared"`
+
+---
+
 ## Why Qwen3.8-Flash-Next V3?
 
 | Model Variant | HF Checkpoint (GGUF) | Active / Total Weights | Reasoning (Scorecard) | Peak Speed | RAM Needed |
@@ -191,8 +214,8 @@ print(response.choices[0].message.content)
 
 #### Oh My Pi (omp) & Coding Agents
 ```zsh
-# Launch omp connected directly to Slipstream
-omp --model splash-flashnext/local/swift-qwen38-flash-next-v3 \
+# Launch omp connected directly to Slipstream (served id is local/prepared)
+omp --model splash-flashnext/local/prepared \
     --tools=read,write,edit,bash,grep,glob,todo \
     --thinking=low --approval-mode=yolo
 ```

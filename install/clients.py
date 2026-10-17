@@ -26,6 +26,18 @@ def _output_budget(context):
     return min(32768, max(1, context // 4))
 
 
+def _selects_opencode_server(arguments):
+    """The user already chose the server: an explicit URL or a private one."""
+    if "--" in arguments:
+        arguments = arguments[: arguments.index("--")]
+    return any(
+        argument == "--standalone"
+        or argument == "--server"
+        or argument.startswith("--server=")
+        for argument in arguments
+    )
+
+
 def find_executable(name):
     path = shutil.which(name)
     if path is None:
@@ -216,7 +228,17 @@ def command(
                 "OPENCODE_CONFIG_CONTENT must be a JSON object"
             ) from error
         environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(config)
-        return [path, *client_args], environment
+        # OpenCode 2 loads configuration inside its persistent background
+        # service, which this process's environment never reaches; a private
+        # server keeps the inline configuration authoritative.
+        argv = [path, *client_args]
+        if not _selects_opencode_server(client_args):
+            # V2 parses this as a command-local flag, so it must follow any
+            # subcommand and precede the end-of-options separator.
+            argv.insert(
+                argv.index("--") if "--" in argv else len(argv), "--standalone"
+            )
+        return argv, environment
 
     if name == "codex":
         environment["SLIPSTREAM_V2_API_KEY"] = api_key

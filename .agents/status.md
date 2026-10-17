@@ -1,25 +1,28 @@
 # Status — Slipstream (handoff)
 
-**Updated:** 2026-10-02 23:20 PDT by antigravity.
-**Branch:** `main` (canonical workspace `model-serving/slipstream`, release `v26.10.4`).
+**Updated:** 2026-10-11 15:30 PDT by claude-code.
+**Branch:** `main` at October release `11b6034` (`v26.10.4`), in sync with `origin/main`. Week's work kept on `main-backup-2026-10-11` and `27b` (both pushed). User's Swift Flash-Next server is LIVE on :8090 (`local/prepared`).
 
 ## In one line
 
-Integrated high-leverage speed and quality optimizations: probability-gated speculative early exit in `Qwen4ExpTarget.cpp` (+3% to +6% tok/s decode on complex reasoning), vectorized Metal compute buffer bindings (`setBuffers:offsets:withRange:`) in `MetalBackend.mm` eliminating 1,000+ scalar Objective-C dispatches per step, defensive out-of-vocabulary / non-finite logits guard in `Engine.cpp` with unit test, and pre-compiled sampling policy pipelines in `Runtime.mm` eliminating 200–400 ms first-token JIT spikes. Full CPU engine test suite 21/21 targets and 171/171 Python server tests pass 100% green.
+Main model standardized: Swift-Flash-Next V3 at `~/models/swift-qwen38-flash-next-v3`, served from its `prepared/` package as id `local/prepared` on :8090. README top now has the daily-driver block; Work Hub card + agents matrix + omp registry all point at the live id. Removed stale `../slipstream-v1.1.0` worktree and `/tmp/octrel`.
 
 ---
 
 ## How to use it
 
 ```zsh
-# One-line install of prebuilt binary (no compilation needed):
-curl -fsSL https://raw.githubusercontent.com/npanj/slipstream/main/install.sh | sh
+# Standard: serve the main Swift model (one server at a time):
+./slipstream serve --model ~/models/swift-qwen38-flash-next-v3/prepared --port 8090
 
-# Serve Swift V3 directly pointing at local directory:
-./slipstream serve --model ~/models/swift-qwen38-flash-next-v3 --port 8090
+# Served id is local/prepared — connect with:
+pi --model slipstream/local/prepared --thinking low
+omp --model splash-flashnext/local/prepared --thinking=low --tools=read,write,edit,bash,grep,glob,todo --approval-mode=yolo
+# NOTE: ./slipstream claude|opencode|codex launch but their requests fail
+# server-side (400 "messages could not be rendered", 2026-10-11) — not documented as working.
 
-# Or serve directly by Hugging Face repo ID:
-./slipstream serve --model nitinpanj/Swift-Qwen3.8-Flash-Next-Q4_0-Q8out-v3-GGUF --port 8090
+# Or serve Nitin's daily V3 model:
+./slipstream serve --model ~/models/qwen38-flash-next-v3 --port 8090
 
 # Backward compatibility forwarders also work:
 ./slipstream-v2 serve --model ~/models/swift-qwen38-flash-next-v3 --port 8090
@@ -27,6 +30,10 @@ curl -fsSL https://raw.githubusercontent.com/npanj/slipstream/main/install.sh | 
 
 # Run guarded A/B benchmark comparing Slipstream vs llama.cpp:
 python3 dev/tools/compare_slipstream_vs_llamacpp.py --model-dir ~/models/swift-qwen38-flash-next-v3
+
+# View publication materials:
+cat docs/REDDIT_POST.md
+open docs/context_scaling_and_benchmark.png
 ```
 
 ---

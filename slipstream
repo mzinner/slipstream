@@ -1,4 +1,12 @@
 #!/bin/sh
 set -eu
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+script=$0
+while [ -L "$script" ]; do
+    target=$(readlink "$script")
+    case $target in
+        /*) script=$target ;;
+        *) script=$(dirname -- "$script")/$target ;;
+    esac
+done
+ROOT=$(CDPATH= cd -P -- "$(dirname -- "$script")" && pwd)
 exec "$ROOT/slipstream-v2" "$@"
