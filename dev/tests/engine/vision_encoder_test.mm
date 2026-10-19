@@ -190,7 +190,10 @@ int main(int argc, char **argv) {
   @autoreleasepool {
     try {
       verifyComparison();
-      splash::ops::VisionLayout visionLayout;
+      const auto descriptor = splash::model::inspectModelPackage(argv[2]);
+      if (!descriptor.vision.has_value())
+        throw std::runtime_error("model package does not configure vision");
+      const splash::ops::VisionLayout visionLayout = *descriptor.vision;
       MetalBackend backend(argv[1]);
       const splash::model::QwenVisionWeights model =
           splash::model::loadQwenVisionWeights(
