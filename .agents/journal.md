@@ -1,5 +1,10 @@
 # Journal — qwen4exp port
 
+## 2026-10-19 16:35 PDT — antigravity
+
+Executed comprehensive side-by-side benchmark (`dev/benchmarks/benchmark_vision_vs_text.py`) comparing text-only against multimodal (text+vision) on `Swift-Qwen3.8-Flash-Next-V3`. Confirmed 0% text regression: text decode averaged 38.7 tok/s (matching the historical 38.8 tok/s baseline at 75.2 ms/step) with 0 bytes allocated for vision. Multimodal requests dynamically admitted and achieved 38.0 tok/s decode and 560–1500 ms TTFT (including cold vision loading). Raw GPU vision encoder achieved 0.9998 cosine similarity to fp32 reference (15.77 ms on 6x8 grids; 281.62 ms on 64x64 grids).
+Blocked on: nothing.
+
 ## 2026-10-19 16:21 PDT — antigravity
 
 Completed vision model support and lazy loading in Slipstream on branch `feat/optional-vision`. Extracted real 27-layer vision weights from `ukisai/Swift-Qwen3.8-Flash-Next` shard 1 into `prepared/vision/model.bin` (865 MB, `MDFV0001`), restored Metal vision kernels, dynamic lazy loading in `Runtime.mm` (0 bytes unified memory on pure text), and synchronized native wire protocol v5. All 171 Python server tests, 21 CPU engine tests, 22 protocol and packaging tests, and `vision-encoder` binary pass 100% green.
