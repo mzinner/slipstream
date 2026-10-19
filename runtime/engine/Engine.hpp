@@ -5,6 +5,7 @@
 #include "engine/Scheduler.hpp"
 #include "engine/Types.hpp"
 #include "ops/PagedKv.hpp"
+#include "ops/Vision.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -21,6 +22,7 @@ struct EngineConfig final {
   // Spacing of prompt checkpoints saved for prefix reuse (whole KV pages).
   // Zero disables progress checkpoints without changing reusable end states.
   uint32_t prefillCheckpointTokens = 4096;
+  uint32_t maxImagePatches = ops::kMaximumImagePatches;
   // Rows per prompt command: the package's chunk, at most the built maximum.
   uint32_t prefillChunkTokens = model::ExecutionLimits::defaultPrefillChunkTokens;
   double resourceWaitTimeoutMilliseconds = 30000.0;
@@ -129,6 +131,10 @@ private:
     uint64_t resumeKvTargetTokens = 0;
     ResourceWait resourceWait;
     std::vector<uint32_t> exactTokens;
+    // The first output token, sent to the client when the prefill selected it
+    // (ModelStepResult::firstToken) and until the first decode cycle commits
+    // it: that cycle emits it first, and its event leaves it out.
+    std::optional<uint32_t> sentFirstToken;
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;
     StateCheckpoint latestCheckpoint;
@@ -146,6 +152,10 @@ private:
   double nextHealthCheckMilliseconds_ = 0.0;
 
   [[nodiscard]] Request &request(uint64_t requestId);
+  // The output tokens the client was sent: the committed ones and a first
+  // token that no cycle has committed yet (Request::sentFirstToken), as when
+  // the request is suspended or cancelled before its first decode cycle.
+  [[nodiscard]] static uint32_t generatedTokens(const Request &request) noexcept;
   [[nodiscard]] bool admitQueued(double nowMilliseconds);
   [[nodiscard]] bool admit(Request &request, double nowMilliseconds);
   void configureStateBoundaries(Request &request, uint32_t stateBoundary,

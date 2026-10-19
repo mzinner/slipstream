@@ -1,5 +1,13 @@
 # Decisions — qwen4exp port
 
+## Optional Vision Subsystem & Zero-Overhead Lazy Loading (2026-10-19)
+
+We restored vision support for Qwen3.8-Flash-Next on `feat/optional-vision` with strict zero-cost text inference invariants:
+1. **Zero Text-Time Footprint:** Text-only sessions consume 0 bytes of unified memory for vision weights, 0 scratch bytes, and 0 additional GPU dispatches. `Runtime::Impl` holds `vision` and `visionWeights` as `nullptr` until an image input arrives.
+2. **Dynamic Admission & Size Verification:** Instead of fixed layout assumptions, `stageImages` computes `std::filesystem::file_size(package.visionDirectory / "model.bin")` and queries `MemoryGovernor::canAdmitAdditional(visionBytes)` to ensure host memory stays safely above the >4.0 GiB watchdog floor before mapping weights.
+3. **Reclaimable Under Pressure:** `Runtime::reclaimIdleState()` drops `embeddingCache` and releases mapped vision weights when the engine is idle or encountering memory pressure.
+4. **Native Wire Protocol Synchronized (v5):** Request header aligned to 60 bytes (including image span offset and count). Python protocol encoder and C++ protocol decoder are verified against golden frames.
+
 ## Graceful Output Budget Clamping for Context Ceilings (2026-09-30)
 
 When prompt tokens approach the context window ceiling (e.g. during lengthy agent tool loops), OpenAI `/v1/chat/completions` previously raised an unrecoverable HTTP 400 `context_length_exceeded` if `prompt_tokens + max_completion_tokens > max_context`. We added `--clamp-output-budget` (and `FrontendServer.clamp_output_budget`) to gracefully clamp the output budget to `max_context - prompt_tokens` and return `finish_reason: "length"`, aligning `/v1/chat/completions` with the graceful behavior of Anthropic `/v1/messages`.

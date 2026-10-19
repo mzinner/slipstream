@@ -270,7 +270,8 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<MemoryGovernor> memoryGovernor,
     std::unique_ptr<kv::Q8PageStorage> kvPages,
     std::unique_ptr<model::StateStorage> stateStorage,
-    std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache)
+    std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
+    uint32_t maximumImagePatches)
     : backend_(std::move(backend)), model_(std::move(model)),
       operators_(std::move(operators)),
       memoryPlan_(std::move(memoryPlan)),
@@ -278,7 +279,7 @@ RuntimeResources::RuntimeResources(
       cacheIdentity_(std::move(cacheIdentity)),
       memoryGovernor_(std::move(memoryGovernor)), kvPages_(std::move(kvPages)),
       stateStorage_(std::move(stateStorage)), kvPool_(std::move(kvPool)),
-      cache_(std::move(cache)) {}
+      cache_(std::move(cache)), maximumImagePatches_(maximumImagePatches) {}
 
 std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config) {
@@ -531,7 +532,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         std::move(memoryPlan),
         std::move(modelMemoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
-        std::move(kvPool), std::move(cache)));
+        std::move(kvPool), std::move(cache), config.maximumImagePatches));
     return result;
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::StorageAllocation,
@@ -554,6 +555,7 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       *kvPages_,
       *stateStorage_,
       operators_,
+      maximumImagePatches_,
       budget.pipelineReserveBytes,
       budget.runtimeOverheadReserveBytes,
   };

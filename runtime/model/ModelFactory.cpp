@@ -36,6 +36,17 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),
                                         result.targetFiles().end());
+  if (result.descriptor.supportsVision()) {
+    result.visionDirectory = root / "vision";
+    const char *preload = std::getenv("SPLASH_PRELOAD_VISION");
+    if (preload && std::string_view(preload) == "1" &&
+        std::filesystem::exists(result.visionDirectory / "model.bin")) {
+      result.vision = loadQwenVisionWeights(backend, result.visionDirectory,
+                                            *result.descriptor.vision);
+      records.insert(records.end(), result.vision->files.begin(),
+                     result.vision->files.end());
+    }
+  }
   result.manifestFingerprintSha256 = weightManifestFingerprint(records);
   requireCompatibleModelPackage(result);
   return result;

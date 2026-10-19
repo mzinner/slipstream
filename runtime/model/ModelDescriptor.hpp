@@ -2,10 +2,12 @@
 
 #include "Model.hpp"
 #include "models/qwen4exp/Qwen4Exp.hpp"
+#include "ops/Vision.hpp"
 
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <variant>
 
@@ -22,9 +24,14 @@ struct ModelDescriptor final {
   ModelCapabilities capabilities;
   kv::Q8Layout targetKvLayout;
   CompositeStateLayout stateLayout;
+  std::optional<ops::VisionLayout> vision;
   // Exact bytes parsed during package inspection, including artifact digests.
   // Synthetic descriptors retain zero; this is separate from layout identity.
   std::array<uint8_t, 32> packageManifestSha256{};
+
+  [[nodiscard]] bool supportsVision() const noexcept {
+    return vision.has_value();
+  }
 
   [[nodiscard]] bool valid() const noexcept;
 };

@@ -164,6 +164,12 @@ class GenerationRequest:
     cohort: wire.Cohort = wire.Cohort.GREEDY
     constraint: wire.ConstraintMode = wire.ConstraintMode.NONE
     mask_provider: MaskProvider | None = None
+    # Image spans in prompt order with their concatenated resized pixels.
+    image_spans: tuple[wire.ImageSpan, ...] = ()
+    image_pixels: bytes = b""
+    # Keeps the frontend's byte reservation alive across cancellation and CPU
+    # mask work. It is ownership only and is never serialized to the engine.
+    image_owner: object | None = None
     return_progress: bool = False
 
 
@@ -584,6 +590,8 @@ class MultiplexedRuntime:
                 seed=request.seed,
                 cohort=request.cohort,
                 constraint=request.constraint,
+                image_spans=request.image_spans,
+                image_pixels=request.image_pixels,
                 return_progress=request.return_progress,
             )
             try:
@@ -875,7 +883,11 @@ class MultiplexedRuntime:
     ) -> None:
         caller_deadline = deadline
         io_deadline = time.monotonic() + self._io_timeout
-        deadline = min(caller_deadline, io_deadline) if caller_deadline is not None else io_deadline
+        deadline = (
+            min(caller_deadline, io_deadline)
+            if caller_deadline is not None
+            else io_deadline
+        )
         if not self._write_lock.acquire(timeout=_remaining(deadline)):
             raise TimeoutError("native write lock timed out")
         failure: BaseException | None = None
@@ -918,7 +930,11 @@ class MultiplexedRuntime:
                     # frames or high-context prompts are not killed when the engine is actively
                     # draining the OS pipe buffer.
                     io_deadline = time.monotonic() + self._io_timeout
-                    deadline = min(caller_deadline, io_deadline) if caller_deadline is not None else io_deadline
+                    deadline = (
+                        min(caller_deadline, io_deadline)
+                        if caller_deadline is not None
+                        else io_deadline
+                    )
                 self._crash_trace.record_bytes(generation, "client_to_engine", encoded)
             except TimeoutError:
                 if offset == 0:

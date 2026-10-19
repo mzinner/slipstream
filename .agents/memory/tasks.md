@@ -1,0 +1,2 @@
+- [x] Standardize Flash-Next main model (2026-10-11): canonical dir `~/models/swift-qwen38-flash-next-v3`, serve `prepared/` on :8090 as `local/prepared`; README daily-driver block; hub card + agents matrix + omp registry fixed to live id; stale v1.1.0 worktree and /tmp/octrel removed
+- [ ] Full hub pass: 29 leftover `./slipstream code` mentions (27B/base rows) predate the October build, which has no `code` subcommand; verify base-V3 served id before fixing its rows

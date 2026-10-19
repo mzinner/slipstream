@@ -65,6 +65,10 @@ struct QwenSlotMetadata final {
   uint64_t requestId = 0;
   uint32_t activeParity = 0;
   QwenLogicalLengths lengths;
+  // The rows of the lane's last decode step it retained, which its current
+  // cell does not hold: they wait on the lane's tape for its next decode step
+  // (ops::GdnTapeLane). Zero after a prefill step or a restore.
+  uint32_t pendingRows = 0;
 };
 
 class QwenStateStorage;
@@ -134,9 +138,10 @@ public:
   [[nodiscard]] uint64_t releaseIdle(uint32_t keepCells) noexcept override;
   [[nodiscard]] uint32_t idleCells() const noexcept;
 
-  // Hot-path metadata operations; neither performs a buffer copy.
+  // Hot-path metadata operations; none performs a buffer copy.
   void updateLengths(uint32_t slot, QwenLogicalLengths lengths);
   void swapParity(uint32_t slot);
+  void swapDecodeParity(uint32_t slot, uint32_t retainedRows);
 
   // Copies committed state into a pooled or newly admitted cache slot while
   // the lane retains its own cells. Returns nullptr on capacity pressure;
@@ -163,6 +168,7 @@ private:
   void validateLengths(const QwenLogicalLengths &lengths,
                        bool cacheSnapshot) const;
   static void requireAssigned(const Slot &slot);
+  static void requireCommitted(const Slot &slot);
   [[nodiscard]] metal::AllocationResult allocateSlot(uint32_t index);
   [[nodiscard]] std::shared_ptr<QwenGdnCell> acquireCell(std::string_view label);
   [[nodiscard]] std::shared_ptr<QwenGdnCell>

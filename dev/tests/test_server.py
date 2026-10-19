@@ -1213,17 +1213,19 @@ class ServerTest(unittest.TestCase):
     def test_image_inputs_are_validated_before_inference(self):
         runtime = FakeRuntime()
         harness = self.harness(runtime, tokenizer=self.ImagePadTokenizer())
-        text_only = "this model reads text only"
         cases = (
-            ([self._image_message("https://example.com/x.png")], text_only),
-            ([self._image_message("data:image/png;base64,@@@")], text_only),
+            (
+                [self._image_message("https://example.com/x.png")],
+                "only data: image URLs",
+            ),
+            ([self._image_message("data:image/png;base64,@@@")], "not valid base64"),
             (
                 [{"role": "user", "content": [{"type": "video", "video": "x"}]}],
                 "video content is not supported",
             ),
             (
                 [{"role": "user", "content": [{"type": "image_url", "image_url": 5}]}],
-                text_only,
+                "invalid image content part",
             ),
             (
                 [
@@ -1243,6 +1245,16 @@ class ServerTest(unittest.TestCase):
                 self.assertEqual(status, 400)
                 self.assertIn(message, json.loads(payload)["error"]["message"])
         self.assertEqual(runtime.requests, [])
+
+        # A template that drops the placeholder cannot carry the image.
+        plain = self.harness(runtime)
+        status, _, payload = plain.request(
+            "POST", "/v1/chat/completions", self.body(messages=[self._image_message()])
+        )
+        self.assertEqual(status, 400)
+        self.assertIn(
+            "does not define the image pad", json.loads(payload)["error"]["message"]
+        )
 
     def test_anthropic_messages_nonstream_stream_and_errors(self):
         runtime = FakeRuntime(Plan([[4]]), Plan([[4]]))
@@ -3486,7 +3498,9 @@ class ServerTest(unittest.TestCase):
         self.assertFalse(generation_constraints.LLMatcher.validate_grammar(grammar))
         for reference in references:
             self.assertIn(json.dumps(reference, separators=(",", ":")), grammar)
-        self.assertIn('"items":{"$ref":"#/$defs/__slipstream_v2_root/$defs/x"}', grammar)
+        self.assertIn(
+            '"items":{"$ref":"#/$defs/__slipstream_v2_root/$defs/x"}', grammar
+        )
         self.assertNotIn("__slipstream_v2_root/x", grammar)
         arguments = {
             "pattern": "literal",
@@ -6673,7 +6687,7 @@ class ServerTest(unittest.TestCase):
                         }
                     ]
                 },
-                "this model reads text only",
+                "only data: image URLs",
             ),
         )
         for extra, message in cases:

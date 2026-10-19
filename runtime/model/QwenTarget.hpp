@@ -342,10 +342,11 @@ struct QwenTargetVerifyBuffers final {
   metal::MetalBuffer finalHidden;
   metal::MetalBuffer logits;
   metal::MetalBuffer denseGateScratch;
-  std::span<const metal::MetalBuffer> gdnPacked;
-  std::span<const metal::MetalBuffer> gdnMixed;
-  std::span<const metal::MetalBuffer> gdnDecay;
-  std::span<const metal::MetalBuffer> gdnBeta;
+  metal::MetalBuffer gdnPacked;
+  // The lanes' decode tapes (ops::GdnTapeLane).
+  metal::MetalBuffer gdnTape;
+  std::array<ops::GdnTapeLane, ExecutionLimits::maximumBatchWidth>
+      gdnTapeLanes{};
   std::span<const metal::MetalBuffer> chunkKeys;
   std::span<const metal::MetalBuffer> chunkValues;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
@@ -370,10 +371,6 @@ struct QwenTargetVerifyBuffers final {
 };
 
 struct QwenTargetCommitBuffers final {
-  metal::MetalBuffer packed;
-  metal::MetalBuffer mixed;
-  metal::MetalBuffer decay;
-  metal::MetalBuffer beta;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
       currentStates;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>

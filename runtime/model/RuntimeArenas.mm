@@ -151,17 +151,9 @@ static uint64_t gdnPackedStride(const RuntimeGeometry &geometry) noexcept {
   return bytesFor<uint16_t>(uint64_t{kDecodeRows} *
                             geometry.target.packedGdnWidth);
 }
-static uint64_t gdnMixedStride(const RuntimeGeometry &geometry) noexcept {
-  return bytesFor<uint16_t>(uint64_t{kDecodeRows} *
-                            geometry.target.convolutionDimension);
-}
-static uint64_t gdnDecayStride(const RuntimeGeometry &geometry) noexcept {
-  return bytesFor<float>(uint64_t{kDecodeRows} *
-                         geometry.target.gdnValueHeads);
-}
-static uint64_t gdnBetaStride(const RuntimeGeometry &geometry) noexcept {
-  return bytesFor<uint16_t>(uint64_t{kDecodeRows} *
-                            geometry.target.gdnValueHeads);
+uint64_t gdnTapeSlotBytes(const RuntimeGeometry &geometry) noexcept {
+  return uint64_t{geometry.target.stateLayout.layers} *
+         ops::gdnTapeLayerBytes(geometry.target.gdnShape());
 }
 uint64_t decodeChunkLayerBytes(const RuntimeGeometry &geometry) noexcept {
   return bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
@@ -241,18 +233,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::ProposalProbs, selectorWorkspace.proposalProbabilitiesBytes);
   put(DecodeTensor::ProposedTokens, bytesFor<uint32_t>(kDraftProposalTokens));
   put(DecodeTensor::PageTable, bytesFor<uint32_t>(kMaximumPageTableEntries));
-  put(DecodeTensor::VerifyPackedBase,
-      uint64_t{geometry.target.stateLayout.layers} *
-          gdnPackedStride(geometry));
-  put(DecodeTensor::VerifyMixedBase,
-      uint64_t{geometry.target.stateLayout.layers} *
-          gdnMixedStride(geometry));
-  put(DecodeTensor::VerifyDecayBase,
-      uint64_t{geometry.target.stateLayout.layers} *
-          gdnDecayStride(geometry));
-  put(DecodeTensor::VerifyBetaBase,
-      uint64_t{geometry.target.stateLayout.layers} *
-          gdnBetaStride(geometry));
+  put(DecodeTensor::GdnPacked, gdnPackedStride(geometry));
+  put(DecodeTensor::GdnTape, 2 * gdnTapeSlotBytes(geometry));
   put(DecodeTensor::ChunkKeysBase,
       uint64_t{geometry.target.kvLayout.attentionLayers} *
           decodeChunkLayerBytes(geometry));

@@ -874,6 +874,18 @@ def write_manifest(root: Path) -> None:
             "placeholder": True,
         },
     }
+    if (root / "vision" / "model.bin").exists():
+        manifest["vision"] = {
+            "architecture": "QwenVision",
+            "depth": 27,
+            "hidden_size": 1152,
+            "intermediate_size": 4304,
+            "num_heads": 16,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+            "out_hidden_size": LAYOUT["hidden"],
+        }
     (root / "manifest.json").write_text(json.dumps(manifest, indent=1))
     tokenizer = root / "tokenizer"
     tokenizer.mkdir(parents=True, exist_ok=True)
@@ -1019,7 +1031,8 @@ def main() -> int:
         idx_data = json.loads(index.read_text())["weight_map"]
         if arguments.non_layers_only:
             needed_tensors = [
-                name for name in idx_data
+                name
+                for name in idx_data
                 if ".ple." in name or "mtp." in name or ".layers." not in name
             ]
             wanted = {idx_data[name] for name in needed_tensors}
@@ -1066,9 +1079,7 @@ def main() -> int:
                     [
                         name
                         for name in source._where
-                        if ".ple." in name
-                        or "mtp." in name
-                        or ".layers." not in name
+                        if ".ple." in name or "mtp." in name or ".layers." not in name
                     ]
                 )
             freed = source.release(still_needed)

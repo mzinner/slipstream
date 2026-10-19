@@ -128,6 +128,7 @@ public:
 
   StateAdmission begin(const ModelRequest &request) override {
     ++beginAttempts;
+    lastBeginId = request.id;
     if (beginObserver) beginObserver();
     if (beginGrowthBlocked && beginGrowthBlocked())
       return {{}, StateFailure::MemoryPressure, beginAllocationFailure};
@@ -141,7 +142,10 @@ public:
             return entry.second.resident && entry.second.slot == slot;
           });
       if (!used) {
-        requests.emplace(request.id, Request{slot, 0, true});
+        requests.emplace(request.id,
+                         Request{slot, 0, true, false,
+                                 static_cast<uint32_t>(request.prompt.size()),
+                                 request.constraint != ConstraintMode::None});
         return {slot, StateFailure::None};
       }
     }
@@ -203,6 +207,11 @@ public:
         step.outputTokens = {42};
         step.outputTokensWithoutKv = 1;
         step.finished = *prefillAnchor;
+      } else if (firstTokens && !requests.at(item.requestId).replaying &&
+                 !requests.at(item.requestId).constrained &&
+                 requests.at(item.requestId).position ==
+                     requests.at(item.requestId).promptTokens) {
+        step.firstToken = 42;
       }
       result.push_back(std::move(step));
     }
@@ -228,8 +237,9 @@ public:
                           0,
                           0});
       } else {
-        ModelStepResult step{item.requestId, 0, {42}, decodeFinishes,
-                             DecodeStage::Regular, 0, 0};
+        ModelStepResult step{item.requestId, 0,
+                             std::vector<uint32_t>(decodeTokens, 42),
+                             decodeFinishes, DecodeStage::Regular, 0, 0};
         step.outputTokensWithoutKv = decodeTokensWithoutKv;
         result.push_back(std::move(step));
       }
@@ -295,8 +305,11 @@ public:
     uint32_t position = 0;
     bool resident = false;
     bool replaying = false;
+    uint32_t promptTokens = 0;
+    bool constrained = false;
   };
   std::unordered_map<uint64_t, Request> requests;
+  uint64_t lastBeginId = 0;
   uint32_t prefillRows = 0;
   uint32_t restored = 0;
   uint32_t snapshots = 0;
@@ -320,10 +333,15 @@ public:
   bool *physicalGrowthBlocked = nullptr;
   bool unblockGrowthOnSuspend = true;
   bool decodeFinishes = true;
+  uint32_t decodeTokens = 1;
   DecodeStage replayDecodeStage = DecodeStage::Regular;
   uint32_t decodeTokensWithoutKv = 0;
   // Set when prefill itself ends the request: the value is `finished` (stop).
   std::optional<bool> prefillAnchor;
+  // Whether the step that completes an unconstrained request's prompt reports
+  // its first token (ModelStepResult::firstToken), as the runtime does. It is
+  // 42, which the first decode step's tokens start with.
+  bool firstTokens = false;
   std::shared_ptr<bool> holdDecodeUntil;
   std::shared_ptr<bool> holdPrefillUntil;
   std::shared_ptr<MaskOverlapState> overlap;
@@ -2238,6 +2256,95 @@ void testPrefillCanCompleteTheRequest() {
   }
 }
 
+// An unconstrained request's first token reaches the client when the prefill
+// selects it, before the first decode cycle that commits it; that cycle's
+// event leaves it out, and the usage counts what the client got, also when the
+// request is cancelled before that cycle.
+void testFirstTokenIsSentAtPrefill() {
+  for (const bool cancel : {false, true}) {
+    Backing backing(8);
+    KvPool pool(backing);
+    engine::Cache resources(pool, CacheNamespace{});
+    Executor executor(1);
+    executor.firstTokens = true;
+    executor.decodeFinishes = false;
+    executor.decodeTokens = 4;
+    executor.holdDecodeUntil = std::make_shared<bool>(false);
+    Events events;
+    engine::Engine engine({}, resources, executor, events);
+
+    EngineRequest value = request(91, std::vector<uint32_t>(40, 91));
+    value.maxNewTokens = 12;
+    engine.submit(std::move(value));
+    // The first cycle is held in flight: the client has the first token.
+    for (uint32_t step = 0; step < 32; ++step) {
+      static_cast<void>(engine.tick(step + 1));
+      if (!events.outputs[91].empty() && engine.commandInFlight())
+        break;
+    }
+    require(events.outputs[91] == std::vector<uint32_t>{42} &&
+                engine.commandInFlight(),
+            "the first token did not reach the client before the first cycle");
+    if (cancel)
+      engine.cancel(91);
+    *executor.holdDecodeUntil = true;
+    runUntilIdle(engine);
+    const uint32_t expected = cancel ? 1 : 12;
+    require(events.completedCount == 1 && events.outputs[91].size() == expected &&
+                events.usage[91] == std::pair<uint32_t, uint32_t>{40, expected},
+            cancel ? "a cancelled request's usage left out the first token it was sent"
+                   : "the stream and the usage disagree on the tokens sent");
+  }
+}
+
+// A request suspended after its first token was sent and before its first
+// decode cycle keeps that token pending: it resumes with its prompt alone, and
+// the cycle that commits the token does not send it again.
+void testFirstTokenSentBeforeASuspensionIsNotSentAgain() {
+  Backing backing(512);
+  KvPool pool(backing);
+  engine::Cache resources(pool, CacheNamespace{});
+  Executor executor(1);
+  executor.firstTokens = true;
+  executor.decodeFinishes = false;
+  executor.decodeTokens = 4;
+  Events events;
+  MemoryPressure pressure = MemoryPressure::Normal;
+  EngineConfig config;
+  config.memoryPressure = [&] { return pressure; };
+  engine::Engine engine(config, resources, executor, events);
+
+  const std::vector<uint32_t> prompt(128, 1);
+  auto background = request(1, prompt);
+  background.priority = RequestPriority::Background;
+  background.maxNewTokens = 12;
+  engine.submit(std::move(background));
+  double now = 1;
+  while (executor.prefillRows < 128)
+    require(engine.tick(now++), "prefill made no progress");
+  if (engine.commandInFlight())
+    require(engine.tick(now++), "prefill completion made no progress");
+  require(events.outputs.contains(1) &&
+              events.outputs.at(1) == std::vector<uint32_t>{42},
+          "the first token was not sent at the prefill");
+  backing.growthBlocked = true;
+  pressure = MemoryPressure::Warning;
+  require(engine.tick(now++) && executor.suspensions == 1 &&
+              !executor.requests.at(1).resident,
+          "the lane was not suspended before its first decode cycle");
+  backing.growthBlocked = false;
+  pressure = MemoryPressure::Normal;
+  now += 101;
+  for (; now < 256 && !engine.idle(); ++now)
+    static_cast<void>(engine.tick(now));
+  require(engine.idle() &&
+              executor.resumedPrompts == std::vector<std::vector<uint32_t>>{prompt} &&
+              events.completedCount == 1 && events.failedCount == 0 &&
+              events.outputs.at(1) == std::vector<uint32_t>(12, 42) &&
+              events.usage.at(1) == std::pair<uint32_t, uint32_t>{128, 12},
+          "the resumed lane replayed its first token or sent it again");
+}
+
 const uint32_t defaultCheckpointTokens = EngineConfig{}.prefillCheckpointTokens;
 
 void runUntilCheckpoint(engine::Engine &engine, uint64_t publications) {
@@ -2808,6 +2915,8 @@ int main() {
     testStalledSuspensionFailsWithCapacity();
     testTerminalAnchorWithoutKvIsNotCached();
     testPrefillCanCompleteTheRequest();
+    testFirstTokenIsSentAtPrefill();
+    testFirstTokenSentBeforeASuspensionIsNotSentAgain();
     std::cout << "KV-first engine tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

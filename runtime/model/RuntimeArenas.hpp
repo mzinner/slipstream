@@ -222,10 +222,11 @@ enum class DecodeTensor : uint32_t {
   ProposalProbs,
   ProposedTokens,
   PageTable,
-  VerifyPackedBase,
-  VerifyMixedBase,
-  VerifyDecayBase,
-  VerifyBetaBase,
+  // A GDN layer's packed input projection rows, which its mixer reads.
+  GdnPacked,
+  // Indexed by state slot, like PageTable: the lane's two decode tape slots
+  // (ops::GdnTapeLane), one per state parity (gdnTapeSlot).
+  GdnTape,
   ChunkKeysBase,
   ChunkValuesBase,
   MoeSelectedExperts,
@@ -252,22 +253,18 @@ enum class DecodeTensor : uint32_t {
 constexpr uint32_t decodeTensorCount =
     static_cast<uint32_t>(DecodeTensor::Count);
 
-constexpr bool isGdnLayerTensor(DecodeTensor tensor) noexcept {
-  return tensor == DecodeTensor::VerifyPackedBase ||
-         tensor == DecodeTensor::VerifyMixedBase ||
-         tensor == DecodeTensor::VerifyDecayBase ||
-         tensor == DecodeTensor::VerifyBetaBase;
-}
-
 constexpr bool isAttentionLayerTensor(DecodeTensor tensor) noexcept {
   return tensor == DecodeTensor::ChunkKeysBase ||
          tensor == DecodeTensor::ChunkValuesBase;
 }
 
 constexpr bool isLayerMajorTensor(DecodeTensor tensor) noexcept {
-  return isGdnLayerTensor(tensor) || isAttentionLayerTensor(tensor);
+  return isAttentionLayerTensor(tensor);
 }
 
+// One slot of a state lane's decode tape (DecodeTensor::GdnTape): one step of
+// every GDN layer (ops::GdnTapeLane). A lane holds two, one per state parity.
+[[nodiscard]] uint64_t gdnTapeSlotBytes(const RuntimeGeometry &geometry) noexcept;
 [[nodiscard]] uint64_t decodeChunkLayerBytes(const RuntimeGeometry &geometry) noexcept;
 [[nodiscard]] std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
@@ -352,28 +349,12 @@ public:
         : 0;
   }
 
-  [[nodiscard]] metal::MetalBuffer gdnBatchSlice(DecodeTensor base, uint32_t gdnLayer,
-                                          uint32_t lanes) const {
-    const uint32_t layers = geometry_.target.stateLayout.layers;
-    if (!lanes || lanes > kLaneCount || gdnLayer >= layers ||
-        !isGdnLayerTensor(base))
-      throw std::out_of_range("invalid batched GDN layer");
-    const uint32_t index = static_cast<uint32_t>(base);
-    // Each GDN tensor holds one stride per layer per lane; the planner sized
-    // it as layers x stride, so the stride is recovered here, not supplied.
-    const uint64_t stride = sizes_[index] / layers;
-    const uint64_t relative = uint64_t{gdnLayer} * kLaneCount * stride;
-    const uint64_t bytes = uint64_t{lanes} * stride;
-    if (relative + bytes > sizes_[index] * kLaneCount)
-      throw std::logic_error("batched GDN layer exceeds decode arena");
-    return backend_.view(base_, offsets_[index] + relative, bytes);
-  }
-
-  [[nodiscard]] metal::MetalBuffer gdnStorage(DecodeTensor base) const {
-    if (!isGdnLayerTensor(base))
-      throw std::invalid_argument("tensor is not GDN replay scratch");
-    const uint32_t index = static_cast<uint32_t>(base);
-    return backend_.view(base_, offsets_[index], sizes_[index] * kLaneCount);
+  // The offset in packed(DecodeTensor::GdnTape, kLaneCount) of state
+  // slot `stateSlot`'s tape slot of parity `parity`.
+  [[nodiscard]] uint64_t gdnTapeSlot(uint32_t stateSlot, uint32_t parity) const {
+    if (stateSlot >= kLaneCount || parity > 1)
+      throw std::out_of_range("invalid GDN tape slot");
+    return (uint64_t{stateSlot} * 2 + parity) * gdnTapeSlotBytes(geometry_);
   }
 
   [[nodiscard]] metal::MetalBuffer attentionBatchSlice(DecodeTensor base,

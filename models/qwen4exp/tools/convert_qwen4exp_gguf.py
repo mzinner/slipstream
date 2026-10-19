@@ -482,12 +482,33 @@ def default_workers() -> int:
     memory = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     return max(1, min(8, memory // WORKER_MEMORY_BYTES))
 
+def attach_vision_bin(vision_bin: str | Path, output_dir: str | Path) -> None:
+    """Link a packed vision tower into a prepared package, copying when the
+    source lives on another volume. A present vision/model.bin is kept as is,
+    so re-running prepare never clobbers it."""
+    vision_src = Path(vision_bin).expanduser()
+    with open(vision_src, "rb") as probe:
+        header = probe.read(16)
+    if len(header) != 16 or header[:8] != b"MDFV0001":
+        raise SystemExit(f"error: {vision_src} is not a packed vision tower")
+    vision_dst = Path(output_dir).expanduser() / "vision" / "model.bin"
+    if not vision_dst.exists():
+        vision_dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(vision_src, vision_dst)
+            print(f"Linked vision/model.bin from {vision_src} (0 extra bytes)")
+        except Exception:
+            shutil.copyfile(vision_src, vision_dst)
+            print(f"Copied vision/model.bin from {vision_src}")
+
+
 def prepare_gguf_model(
     model_dir: str | Path,
     output_dir: str | Path,
     sidecar_path: str | Path | None = None,
     reference_dir: str | Path | None = None,
-    workers: int | None = None
+    workers: int | None = None,
+    vision_bin: str | Path | None = None,
 ) -> None:
     if workers is None:
         workers = default_workers()
@@ -571,6 +592,12 @@ def prepare_gguf_model(
         write_placeholder_draft(draft_dir)
         print("Wrote placeholder draft")
 
+    # Attach vision tower if requested or available in reference
+    if vision_bin:
+        attach_vision_bin(vision_bin, output_dir)
+    elif reference_dir and (Path(reference_dir) / "vision/model.bin").exists():
+        attach_vision_bin(Path(reference_dir) / "vision/model.bin", output_dir)
+
     # Parallel conversion tasks
     tasks = []
     with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
@@ -629,9 +656,17 @@ def main():
     parser.add_argument("--sidecar", default=None, help="Path to MTP draft sidecar GGUF")
     parser.add_argument("--reference", default=None, help="Previously prepared package to reuse ngram.bin, tokenizer and draft from")
     parser.add_argument("--workers", type=int, default=None, help="Number of worker processes (default: by installed memory, at most 8)")
+    parser.add_argument("--vision-bin", default=None, help="Path to packed vision binary (MDFV0001)")
     args = parser.parse_args()
 
-    prepare_gguf_model(args.model_dir, args.output, args.sidecar, args.reference, workers=args.workers)
+    prepare_gguf_model(
+        args.model_dir,
+        args.output,
+        args.sidecar,
+        args.reference,
+        workers=args.workers,
+        vision_bin=args.vision_bin,
+    )
 
 if __name__ == "__main__":
     main()

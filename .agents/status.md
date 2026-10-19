@@ -1,11 +1,11 @@
 # Status — Slipstream (handoff)
 
-**Updated:** 2026-10-11 15:30 PDT by claude-code.
-**Branch:** `main` at October release `11b6034` (`v26.10.4`), in sync with `origin/main`. Week's work kept on `main-backup-2026-10-11` and `27b` (both pushed). User's Swift Flash-Next server is LIVE on :8090 (`local/prepared`).
+**Updated:** 2026-10-19 16:21 PDT by antigravity.
+**Branch:** `feat/optional-vision` (branched from `main` at `2c7ac4d6`). Optional vision restored and verified. Server stopped.
 
 ## In one line
 
-Main model standardized: Swift-Flash-Next V3 at `~/models/swift-qwen38-flash-next-v3`, served from its `prepared/` package as id `local/prepared` on :8090. README top now has the daily-driver block; Work Hub card + agents matrix + omp registry all point at the live id. Removed stale `../slipstream-v1.1.0` worktree and `/tmp/octrel`.
+Optional vision subsystem implemented and verified on `feat/optional-vision`: real 27-layer vision weights extracted from Swift-Qwen3.8-Flash-Next into `prepared/vision/model.bin` (865 MB), dynamic zero-overhead lazy loading in `Runtime.mm`, Metal kernels compiled, Protocol v5 synchronized, all 171 server tests and 21 CPU engine tests pass 100% green. Server on port 8090 stopped.
 
 ---
 

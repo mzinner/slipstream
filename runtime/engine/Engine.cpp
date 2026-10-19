@@ -46,6 +46,23 @@ void Engine::submit(EngineRequest value) {
       })) {
     throw std::invalid_argument("prompt token is out of vocabulary");
   }
+  uint64_t previousImageEnd = 0;
+  uint64_t pixelBytes = 0;
+  for (const ImageSpan &image : value.images) {
+    const uint64_t patches = uint64_t{image.gridHeight} * image.gridWidth;
+    if (image.gridHeight < 2 || image.gridWidth < 2 || image.gridHeight % 2 ||
+        image.gridWidth % 2 || patches > config_.maxImagePatches ||
+        image.tokens != (image.gridHeight / 2) * (image.gridWidth / 2) ||
+        image.offset < previousImageEnd ||
+        uint64_t{image.offset} + image.tokens > value.prompt.size()) {
+      throw std::invalid_argument("invalid backend request image span");
+    }
+    previousImageEnd = image.end();
+    pixelBytes += image.pixelBytes();
+  }
+  if (value.imagePixels.size() != pixelBytes) {
+    throw std::invalid_argument("invalid backend request image pixels");
+  }
   const uint64_t id = value.id;
   Request requestState;
   requestState.promptTokens = static_cast<uint32_t>(value.prompt.size());
@@ -796,6 +813,15 @@ uint64_t Engine::reclaimMemory(const MemoryReclaimDirective &directive) {
   return released;
 }
 
+uint32_t Engine::generatedTokens(const Request &active) noexcept {
+  const uint32_t committed =
+      active.exactTokens.size() > active.promptTokens
+          ? static_cast<uint32_t>(active.exactTokens.size() -
+                                  active.promptTokens)
+          : 0;
+  return committed + (active.sentFirstToken ? 1 : 0);
+}
+
 void Engine::apply(const BatchPlan &plan,
                    std::span<const ModelStepResult> results,
                    double wallMilliseconds, bool representativePrefillTiming) {
@@ -852,7 +878,23 @@ void Engine::apply(const BatchPlan &plan,
                                 result.outputTokens.begin(),
                                 result.outputTokens.end());
       outputTokens += static_cast<uint32_t>(result.outputTokens.size());
-      events_.tokens(active.request.id, result.outputTokens);
+      std::span<const uint32_t> unsent = result.outputTokens;
+      if (active.sentFirstToken) {
+        if (unsent.front() != *active.sentFirstToken)
+          throw std::logic_error(
+              "model committed another first token than the one sent");
+        unsent = unsent.subspan(1);
+        active.sentFirstToken.reset();
+      }
+      if (!unsent.empty())
+        events_.tokens(active.request.id, unsent);
+    }
+    if (result.firstToken) {
+      if (active.sentFirstToken || !result.outputTokens.empty())
+        throw std::logic_error(
+            "model reported a first token twice or beside output");
+      active.sentFirstToken = result.firstToken;
+      events_.tokens(active.request.id, {&*result.firstToken, 1});
     }
     if (plan.kind == WorkKind::Decode) {
       draftedTokens += result.draftedTokens;
@@ -908,11 +950,7 @@ void Engine::finish(Request &active, EngineFinishReason reason) {
     scheduler_.cancel(active.request.id);
   }
   active.finalized = true;
-  const uint32_t completionTokens =
-      active.exactTokens.size() > active.promptTokens
-          ? static_cast<uint32_t>(active.exactTokens.size() -
-                                  active.promptTokens)
-          : 0;
+  const uint32_t completionTokens = generatedTokens(active);
   events_.completed(active.request.id, reason, active.promptTokens,
                     completionTokens);
   if (reason == EngineFinishReason::Cancelled) {

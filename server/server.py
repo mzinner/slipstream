@@ -21,6 +21,7 @@ from huggingface_hub.utils import validate_repo_id
 from transformers import AutoTokenizer
 
 if __package__:
+    from . import images as image_input
     from . import runtime as engine_runtime
     from .api_shapes import (
         anthropic_response,
@@ -59,6 +60,7 @@ if __package__:
     from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
     from .tool_schema import strict_json_loads
 else:
+    import images as image_input
     from api_shapes import (
         anthropic_response,
         anthropic_stop,
@@ -198,6 +200,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 f"prompt is too long: {error.input_tokens} tokens > "
                 f"{error.maximum_input_tokens} maximum input tokens"
             )
+            if error.image_tokens_only:
+                message += " (image tokens alone; text not yet counted)"
         self._json(
             error.status,
             {"type": "error", "error": {"type": error_type, "message": message}}
@@ -1562,6 +1566,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--max-context", type=_parse_max_context, default=None)
     parser.add_argument("--max-memory", type=_parse_max_memory, default=None)
+    parser.add_argument("--max-image-pixels", type=int, default=image_input.MAX_PIXELS)
     parser.add_argument("--max-new-tokens", type=int, default=32768)
     parser.add_argument("--request-timeout", type=float, default=1800)
     parser.add_argument("--queue-size", type=int, default=32)
@@ -1581,9 +1586,12 @@ def parse_args(argv=None):
     _bin_v1 = ROOT / "build" / "slipstream"
     _bin_splash = ROOT / "build" / "splash"
     _default_bin = (
-        _bin_v2 if _bin_v2.exists()
-        else _bin_v1 if _bin_v1.exists()
-        else _bin_splash if _bin_splash.exists()
+        _bin_v2
+        if _bin_v2.exists()
+        else _bin_v1
+        if _bin_v1.exists()
+        else _bin_splash
+        if _bin_splash.exists()
         else _bin_v2
     )
     parser.add_argument(
@@ -1607,6 +1615,11 @@ def parse_args(argv=None):
             parser.error(str(error))
     if args.max_new_tokens <= 0:
         parser.error("--max-new-tokens must be positive")
+    if not image_input.MIN_PIXELS <= args.max_image_pixels <= image_input.MAX_PIXELS:
+        parser.error(
+            "--max-image-pixels must be in "
+            f"[{image_input.MIN_PIXELS}, {image_input.MAX_PIXELS}]"
+        )
     if not is_finite_number(args.request_timeout) or args.request_timeout <= 0:
         parser.error("--request-timeout must be positive and finite")
     if args.queue_size <= 0:
@@ -1699,6 +1712,7 @@ def main():
             args.request_timeout,
             readiness.max_concurrent_requests,
             constraint_factory,
+            max_image_pixels=getattr(args, "max_image_pixels", image_input.MAX_PIXELS),
             thinking_codec=thinking_codec,
         )
         server.app = app

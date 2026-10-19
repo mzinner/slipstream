@@ -1825,10 +1825,6 @@ void Qwen4ExpTarget::addVerify(
       q8.size() != ExecutionLimits::maximumBatchWidth ||
       verify.size() != ExecutionLimits::maximumBatchWidth ||
       kvLayers.size() != geometry.kvLayout.attentionLayers ||
-      buffers.gdnPacked.size() != geometry.stateLayout.layers ||
-      buffers.gdnMixed.size() != geometry.stateLayout.layers ||
-      buffers.gdnDecay.size() != geometry.stateLayout.layers ||
-      buffers.gdnBeta.size() != geometry.stateLayout.layers ||
       buffers.chunkKeys.size() != geometry.kvLayout.attentionLayers ||
       buffers.chunkValues.size() != geometry.kvLayout.attentionLayers) {
     throw std::invalid_argument("invalid Qwen verify batch");
@@ -1948,13 +1944,13 @@ void Qwen4ExpTarget::addVerify(
       const auto &mixer = std::get<QwenGdnWeights>(layer.mixer);
       operators.linear().addDecodeBatch(
           g, buffers.hyperMixed, mixer.inputProjectionQ8,
-          buffers.gdnPacked[gdnIdx], gdnInput, lanes, stats);
+          buffers.gdnPacked, gdnInput, lanes, stats);
       ops::GDN::addDecode(
           g,
-          {buffers.gdnPacked[gdnIdx], mixer.convolutionWeights,
+          {buffers.gdnPacked, mixer.convolutionWeights,
            buffers.currentGdnStates, buffers.nextGdnStates,
-           buffers.gdnMixed[gdnIdx], mixer.decay, mixer.timeBias,
-           buffers.gdnDecay[gdnIdx], buffers.gdnBeta[gdnIdx],
+           buffers.gdnTape, std::span(buffers.gdnTapeLanes).first(lanes),
+           mixer.decay, mixer.timeBias,
            buffers.recurrent, mixer.mixerNorm, buffers.gdnHidden,
            buffers.arrived, buffers.generation},
           gdnShape(geometry, [] {

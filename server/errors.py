@@ -33,9 +33,10 @@ class NativeError(Exception):
 
 
 class ContextLengthError(APIError):
-    def __init__(self, input_tokens, context_tokens):
+    def __init__(self, input_tokens, context_tokens, *, image_tokens_only=False):
         super().__init__(
             400, "prompt exceeds the context window", "context_length_exceeded"
         )
         self.input_tokens = input_tokens
         self.maximum_input_tokens = context_tokens - 1
+        self.image_tokens_only = image_tokens_only

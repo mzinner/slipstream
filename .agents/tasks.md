@@ -163,6 +163,18 @@
   - [x] Compiled head-to-head comparison tables against llama.cpp fork (1.76x speedup) and Swift KV-sparsity gains (+8.6% GPQA Diamond, 70.3% overall)
   - [x] Authored complete, focused Reddit release post draft in `docs/REDDIT_POST.md` and conversation artifact
 
+## Optional Vision Subsystem (`feat/optional-vision`)
+
+- [x] Research & Upstream Verification: confirmed upstream Qwen3.8-Flash-Next officially includes native vision (27-layer ViT, `image_token_id: 248056`, `Qwen4ExpForConditionalGeneration`)
+- [x] Architecture Planning: authored end-to-end plan (`.agents/plans/2026-10-19-optional-vision-plan.md`) with memory safety invariants (<4.5 GiB watchdog floor), lazy loading, M-RoPE, and prefix cache digest integration
+- [x] Created dedicated feature branch `feat/optional-vision`
+- [x] Phase 1: Package & Manifest Contract (`ModelDescriptor.mm`, `pack_vision.py`, `convert_qwen4exp.py`, `convert_qwen4exp_gguf.py`, `prepared/vision/model.bin` 865 MB extracted from shard 1)
+- [x] Phase 2: Protocol & Frontend Integration (Protocol v5 synchronized, `--max-image-pixels`, `_prepare_images`, base64 image parsing, `images.py`, fake runtime test harness)
+- [x] Phase 3: Metal Vision Kernels & Operators (`vision.metal` compiled into metallib, `runtime/ops/Vision.mm`, `runtime/model/QwenVision.cpp`, `build/engine-tests/vision-encoder`)
+- [x] Phase 4: Runtime Wiring & Lazy Loading (`Runtime::Impl` zero-overhead lazy vision admission in `stageImages`, LRU embedding cache, M-RoPE rotary positioning, `reclaimIdleState` release)
+- [x] Phase 5: Verification & Gate Parity (all 171 server tests pass, all 21 CPU engine tests pass, 22 protocol/pack_vision tests pass, 0 compile warnings with `-Wall -Wextra -Werror`)
+
+
 
 
 

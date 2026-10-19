@@ -141,7 +141,7 @@ metal::AllocationResult QwenStateStorage::tryActivateSlot(uint32_t index, uint64
   // Zeroed auxiliary state reads as "no history yet"; see the model's layout.
   if (current.buffers.gdn[0].auxiliary)
     clear(current.buffers.gdn[0].auxiliary, "slot auxiliary state");
-  current.metadata = {true, requestId, 0, {}};
+  current.metadata = {true, requestId, 0, {}, 0};
   return true;
 }
 
@@ -184,14 +184,23 @@ void QwenStateStorage::updateLengths(uint32_t index,
 
 void QwenStateStorage::swapParity(uint32_t index) {
   Slot &current = slot(index);
-  requireAssigned(current);
+  requireCommitted(current);
   current.metadata.activeParity ^= 1;
+}
+
+void QwenStateStorage::swapDecodeParity(uint32_t index, uint32_t retainedRows) {
+  Slot &current = slot(index);
+  requireAssigned(current);
+  if (!retainedRows || retainedRows > ExecutionLimits::targetVerifyRows)
+    throw std::invalid_argument("a decode step retains one to all of its rows");
+  current.metadata.activeParity ^= 1;
+  current.metadata.pendingRows = retainedRows;
 }
 
 std::shared_ptr<const QwenCompositeState>
 QwenStateStorage::snapshot(uint32_t index) {
   Slot &source = slot(index);
-  requireAssigned(source);
+  requireCommitted(source);
   validateLengths(source.metadata.lengths, true);
   // Pooled buffers first; a denied admission puts a pooled cell back and
   // drops a fresh one, leaving no trace.
@@ -225,7 +234,7 @@ void QwenStateStorage::restore(uint32_t index, const CompositeState &state) {
   }
   validateLengths(typed->lengths_, true);
   Slot &destination = slot(index);
-  requireAssigned(destination);
+  requireCommitted(destination);
   if (!typed->slot_.gdn) {
     throw std::invalid_argument("incompatible Qwen composite state");
   }
@@ -234,7 +243,7 @@ void QwenStateStorage::restore(uint32_t index, const CompositeState &state) {
   copyExact(destination.gdn[active]->buffers().stateBase,
             typed->slot_.gdn->buffers().stateBase, "restored GDN state");
   const uint64_t requestId = destination.metadata.requestId;
-  destination.metadata = {true, requestId, active, typed->lengths_};
+  destination.metadata = {true, requestId, active, typed->lengths_, 0};
 }
 
 uint64_t QwenStateStorage::actualSlotBytes(uint32_t index) const {
@@ -331,6 +340,12 @@ void QwenStateStorage::requireAssigned(const Slot &current) {
   if (!current.metadata.assigned || !current.metadata.requestId) {
     throw std::logic_error("Qwen state slot is not assigned");
   }
+}
+
+void QwenStateStorage::requireCommitted(const Slot &current) {
+  requireAssigned(current);
+  if (current.metadata.pendingRows)
+    throw std::logic_error("Qwen lane state has decoded rows pending");
 }
 
 } // namespace splash::model

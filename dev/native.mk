@@ -26,6 +26,7 @@ BACKEND_CONTROL_SOURCES := \
 MODEL_SOURCES := \
 	runtime/model/WeightStore.cpp \
 	models/qwen4exp/Qwen4Exp.cpp \
+	runtime/model/QwenVision.cpp \
 	runtime/model/QwenTarget.cpp \
 	models/qwen4exp/Qwen4ExpTarget.cpp \
 	runtime/model/ModelFactory.cpp \
@@ -92,6 +93,7 @@ TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
 TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
 TEST_GENERATE_SAMPLE := $(ENGINE_TEST_BUILD)/generate-sample
 TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
+TEST_VISION_ENCODER_TEST := $(ENGINE_TEST_BUILD)/vision-encoder
 TEST_Q8_AIR := $(ENGINE_TEST_BUILD)/q8-paged-kv.air
 TEST_Q8_LIB := $(ENGINE_TEST_BUILD)/q8-paged-kv.metallib
 # Both Q8 tests share the attention and store kernels of both phases.
@@ -158,6 +160,7 @@ TEST_UNIT_TEST_TARGETS := $(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))
 # Keep every output that uses a flag set together, including standalone
 # benchmarks, real-model tests and intermediate test AIRs/metallibs.
 TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(TEST_UNIT_TEST_TARGETS)) \
+	$(TEST_VISION_ENCODER_TEST) \
 	$(TEST_DECODE_PROFILE) $(TEST_GENERATE_SAMPLE) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_METAL_BACKEND_AIR)
 PRODUCTION_CONFIG_TARGETS += $(TEST_Q4_PREFILL_PROFILE) \
@@ -510,6 +513,15 @@ $(TEST_BACKEND_BENCHMARK): dev/benchmarks/backend_benchmark.mm \
 		| $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) -include $(BUILD_ID_HEADER) $< \
 		$(ENGINE_LIBRARY) \
+		$(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_VISION_ENCODER_TEST): runtime/metal/DeviceCapabilities.cpp \
+		runtime/metal/MetalBackend.mm \
+		$(MODEL_SOURCES) \
+		$(MODEL_OPERATOR_SOURCES) \
+		runtime/ops/Vision.mm \
+		dev/tests/engine/vision_encoder_test.mm | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
 
 .PHONY: verify-build-identity

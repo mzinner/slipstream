@@ -1,5 +1,15 @@
 # Journal — qwen4exp port
 
+## 2026-10-19 16:21 PDT — antigravity
+
+Completed vision model support and lazy loading in Slipstream on branch `feat/optional-vision`. Extracted real 27-layer vision weights from `ukisai/Swift-Qwen3.8-Flash-Next` shard 1 into `prepared/vision/model.bin` (865 MB, `MDFV0001`), restored Metal vision kernels, dynamic lazy loading in `Runtime.mm` (0 bytes unified memory on pure text), and synchronized native wire protocol v5. All 171 Python server tests, 21 CPU engine tests, 22 protocol and packaging tests, and `vision-encoder` binary pass 100% green.
+Blocked on: user direction for deployment or merge.
+
+## 2026-10-19 12:21 PDT — antigravity
+
+Investigated vision support for Qwen3.8-Flash-Next: verified that upstream Qwen officially includes native vision (27-layer ViT, `image_token_id: 248056`, `Qwen4ExpForConditionalGeneration`), whereas Slipstream Phase 2 (commit `114d979a`) had stripped vision to run as pure text. Authored comprehensive architectural plan (`.agents/plans/2026-10-19-optional-vision-plan.md`) to conditionally and lazily restore vision in Slipstream with 0-byte memory and 0-ns decode overhead on text prompts.
+Blocked on: user feedback on implementation plan.
+
 ## 2026-10-01 13:17 PDT — antigravity
 
 Refactored Reddit submission post to minimize links and eliminate automated spam-filter triggers:

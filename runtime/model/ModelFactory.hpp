@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ModelDescriptor.hpp"
+#include "QwenVision.hpp"
 #include "models/qwen4exp/Qwen4Exp.hpp"
 #include "ops/Q8PageStorage.hpp"
 #include "ops/ExecutionPlans.hpp"
@@ -17,10 +18,19 @@ using TargetWeights = std::variant<Qwen4ExpWeights>;
 struct ModelPackage final {
   ModelDescriptor descriptor;
   TargetWeights target;
+  std::optional<QwenVisionWeights> vision;
+  std::filesystem::path visionDirectory;
   std::string manifestFingerprintSha256;
+
+  [[nodiscard]] uint64_t visionActualAllocatedBytes() const noexcept {
+    return vision.has_value() ? vision->actualAllocatedBytes : 0;
+  }
 
   [[nodiscard]] const std::string &name() const noexcept {
     return descriptor.name;
+  }
+  [[nodiscard]] bool supportsVision() const noexcept {
+    return descriptor.supportsVision();
   }
   [[nodiscard]] kv::Q8Layout targetKvLayout() const noexcept {
     return descriptor.targetKvLayout;
@@ -78,6 +88,7 @@ struct RuntimeContext final {
   kv::Q8PageStorage &kvPages;
   StateStorage &stateStorage;
   const ops::ExecutionPlans &operators;
+  uint32_t maximumImagePatches = ops::kMaximumImagePatches;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
 };

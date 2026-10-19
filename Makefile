@@ -241,11 +241,13 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/QwenTarget.cpp \
 	models/qwen4exp/Qwen4ExpTarget.cpp \
 	runtime/model/ModelFactory.cpp \
+	runtime/model/QwenVision.cpp \
 	runtime/model/QwenState.cpp
 ENGINE_MM_SOURCES := \
 	runtime/model/ModelDescriptor.mm \
 	runtime/model/Runtime.mm \
 	runtime/model/RuntimeArenas.mm \
+	runtime/ops/Vision.mm \
 	runtime/ops/Q8PageStorage.mm \
 	runtime/engine/RuntimeResources.mm \
 	runtime/engine/Bootstrap.mm

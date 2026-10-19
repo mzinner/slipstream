@@ -65,12 +65,15 @@ makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
                          std::string_view buildId,
                          kv::Q8Layout targetKvLayout);
 
+#include "ops/Vision.hpp"
+
 struct RuntimeResourcesConfig {
   std::filesystem::path metallibPath;
   std::filesystem::path modelRoot;
   model::ModelDescriptor model;
   std::string buildId;
   uint64_t maximumMemoryBytes = 0;
+  uint32_t maximumImagePatches = ops::kMaximumImagePatches;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Creation seeds the memory governor with it
   // once; after Ready the transport control handler keeps it current.
@@ -184,7 +187,8 @@ private:
                    std::unique_ptr<kv::Q8PageStorage> kvPages,
                    std::unique_ptr<model::StateStorage> stateStorage,
                    std::unique_ptr<KvPool> kvPool,
-                   std::unique_ptr<engine::Cache> cache);
+                   std::unique_ptr<engine::Cache> cache,
+                   uint32_t maximumImagePatches);
 
   std::unique_ptr<metal::MetalBackend> backend_;
   model::ModelPackage model_;
@@ -197,6 +201,7 @@ private:
   std::unique_ptr<model::StateStorage> stateStorage_;
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
+  uint32_t maximumImagePatches_ = 0;
 };
 
 } // namespace splash::engine

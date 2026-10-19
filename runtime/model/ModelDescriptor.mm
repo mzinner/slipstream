@@ -299,6 +299,12 @@ bool ModelDescriptor::valid() const noexcept {
       !targetKvLayout.valid() || !stateLayout.valid()) {
     return false;
   }
+  if (vision.has_value()) {
+    const uint32_t hidden = std::visit(
+        [](const auto &layout) { return layout.hiddenSize; }, target);
+    if (vision->outputHiddenSize != hidden)
+      return false;
+  }
   return std::visit(
       [&](const auto &layout) {
         return layout.vocabularySize == capabilities.vocabularySize &&
@@ -329,6 +335,24 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
     }
     descriptor.packageManifestSha256 = packageManifestSha256;
     descriptor.capabilities.prefillTokenBudget = packagePrefillChunk(manifest);
+
+    NSDictionary *visionDict = manifest[@"vision"];
+    if ([visionDict isKindOfClass:[NSDictionary class]]) {
+      ops::VisionLayout visionLayout;
+      visionLayout.outputHiddenSize = std::visit(
+          [](const auto &layout) { return layout.hiddenSize; }, descriptor.target);
+      if (NSNumber *depth = visionDict[@"depth"]; [depth isKindOfClass:[NSNumber class]])
+        visionLayout.depth = depth.unsignedIntValue;
+      if (NSNumber *hidden = visionDict[@"hidden_size"]; [hidden isKindOfClass:[NSNumber class]])
+        visionLayout.hiddenSize = hidden.unsignedIntValue;
+      descriptor.vision = visionLayout;
+    } else if (std::filesystem::exists(root / "vision" / "model.bin")) {
+      ops::VisionLayout visionLayout;
+      visionLayout.outputHiddenSize = std::visit(
+          [](const auto &layout) { return layout.hiddenSize; }, descriptor.target);
+      descriptor.vision = visionLayout;
+    }
+
     if (!descriptor.valid())
       throw std::logic_error("built-in model descriptor is inconsistent");
     return descriptor;

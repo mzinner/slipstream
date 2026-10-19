@@ -11,13 +11,41 @@ inline int tree_parent(uint tree_parents, int node) {
   return int((tree_parents >> (uint(node) * 4)) & 0xFu);
 }
 
+// The convolution inputs before a command's first row: the rows a state
+// cell carries, or after `consumed` rows (in `rows`) the last of those rows
+// and the carried ones: at(r, c) is row r of the carried state the rows
+// leave.
+struct GdnConvHistory {
+  device const bfloat *carried;
+  device const bfloat *rows;
+  uint conv_dim;
+  uint rows_width;
+  uint consumed;
+  uint tree_parents;
+
+  bfloat at(uint row, uint channel) const {
+    constexpr uint Carried = SPLASH_GDN_CONVOLUTION_TAPS - 1;
+    if (tree_parents == 0) {
+      const uint source = consumed + row;
+      return source < Carried ? carried[source * conv_dim + channel]
+                              : rows[(source - Carried) * rows_width + channel];
+    }
+    int node = int(consumed) - 1;
+    for (uint step = Carried - 1; step > row; --step) {
+      node = tree_parent(tree_parents, node);
+    }
+    return node < 0 ? carried[uint(int(Carried) + node) * conv_dim + channel]
+                    : rows[uint(node) * rows_width + channel];
+  }
+};
+
 // Four-tap causal convolution of one channel at one token of the command,
 // reading the three preceding tokens from the carried state, rounded to bf16
 // and gated by SiLU.
 inline bfloat gdn_conv_silu(device const bfloat *packed,
-                            device const bfloat *conv_state_in,
+                            GdnConvHistory history,
                             device const bfloat *conv_weights,
-                            uint packed_width, uint conv_dim, uint token,
+                            uint packed_width, uint token,
                             uint channel, uint tree_parents = 0) {
   float value = 0.0f;
   int tap_node[4];
@@ -28,12 +56,22 @@ inline bfloat gdn_conv_silu(device const bfloat *packed,
   for (uint tap = 0; tap < 4; ++tap) {
     int node = tap_node[tap];
     bfloat input = node < 0
-                       ? conv_state_in[uint(3 + node) * conv_dim + channel]
+                       ? history.at(uint(3 + node), channel)
                        : packed[uint(node) * packed_width + channel];
     value += float(input) * float(conv_weights[channel * 4 + tap]);
   }
   value = float(bfloat(value));
   return bfloat(value / (1.0f + fast::exp2(-1.44269504089f * value)));
+}
+
+inline bfloat gdn_conv_silu(device const bfloat *packed,
+                            device const bfloat *conv_state_in,
+                            device const bfloat *conv_weights,
+                            uint packed_width, uint conv_dim, uint token,
+                            uint channel, uint tree_parents = 0) {
+  const GdnConvHistory history{conv_state_in, packed, conv_dim, packed_width, 0, 0};
+  return gdn_conv_silu(packed, history, conv_weights, packed_width, token,
+                       channel, tree_parents);
 }
 
 // Row `row` of the carried state after consumed_tokens: the last three inputs

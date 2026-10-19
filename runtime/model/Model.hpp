@@ -2,6 +2,7 @@
 
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "ops/Vision.hpp"
 
 #include <array>
 #include <atomic>
@@ -37,12 +38,29 @@ struct SamplingParameters final {
   uint64_t seed = 0;
 };
 
+struct ImageSpan final {
+  uint32_t offset = 0;
+  uint32_t tokens = 0;
+  uint32_t gridHeight = 0;
+  uint32_t gridWidth = 0;
+  uint64_t digestLo = 0;
+  uint64_t digestHi = 0;
+
+  [[nodiscard]] uint32_t end() const noexcept { return offset + tokens; }
+  [[nodiscard]] uint64_t pixelBytes() const noexcept {
+    return ops::imagePixelBytes(gridHeight, gridWidth);
+  }
+  bool operator==(const ImageSpan &) const = default;
+};
+
 // Immutable view of the fields a model needs to activate a sequence.  Engine
 // priority and deadline policy deliberately do not cross this boundary.
 struct ModelRequest final {
   uint64_t id = 0;
   BatchCohort cohort = BatchCohort::Greedy;
   std::span<const uint32_t> prompt;
+  std::span<const struct ImageSpan> images{};
+  std::span<const uint8_t> imagePixels{};
   uint32_t maxNewTokens = 0;
   SamplingParameters sampling;
   ConstraintMode constraint = ConstraintMode::None;
@@ -113,6 +131,11 @@ struct ModelStepResult final {
   // last budgeted token is emitted as soon as it is selected instead of
   // spending one more verify cycle on it. They never enter a cached block.
   uint32_t outputTokensWithoutKv = 0;
+  // The request's first output token, which the step that completes its
+  // prompt selected and left pending: the first decode cycle writes its KV row
+  // and emits it first. Reported so that the engine can send it to the client
+  // now rather than with that cycle.
+  std::optional<uint32_t> firstToken{};
 
   bool operator==(const ModelStepResult &) const = default;
 };
@@ -238,6 +261,8 @@ struct ModelTelemetry final {
   uint64_t draftContextRowsAvoided = 0;
   uint64_t draftStateRestoreSkipped = 0;
   uint64_t draftStateResets = 0;
+  uint64_t imageEncodes = 0;
+  uint64_t imageEmbeddingReuses = 0;
   uint32_t lastDecodeWidth = 0;
   uint64_t lastDecodeFusedOperations = 0;
   uint64_t lastDecodeM16Dispatches = 0;
