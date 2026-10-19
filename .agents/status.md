@@ -1,7 +1,7 @@
 # Status — Slipstream (handoff)
 
-**Updated:** 2026-10-19 16:35 PDT by antigravity.
-**Branch:** `feat/optional-vision` (branched from `main` at `2c7ac4d6`). Optional vision benchmarked side-by-side against text-only. 0% text regression confirmed. Server stopped.
+**Updated:** 2026-10-19 16:40 PDT by antigravity.
+**Branch:** `main`. Optional vision merged and benchmarked side-by-side against text-only (0% text regression confirmed). Server stopped.
 
 ## In one line
 
