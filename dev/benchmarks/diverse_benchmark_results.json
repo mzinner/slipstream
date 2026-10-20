@@ -1,0 +1,174 @@
+{
+  "text_prompts": [
+    {
+      "id": "math_arithmetic",
+      "category": "Math Reasoning (Arithmetic)",
+      "prompt": "Janet's ducks lay 16 eggs per day. She eats three for breakfast every morning and bakes muffins for her friends every day with four. She sells the remainder at the farmers' market daily for $2 per fresh duck egg. How much in dollars does she make every day at the farmers' market? Think step by step and conclude with: Therefore, the final answer is $ANSWER.",
+      "max_tokens": 384,
+      "token_count": 193,
+      "elapsed_s": 7.614674041979015,
+      "ttft_ms": 2772.398000000976,
+      "decode_tok_s": 39.65077544847468,
+      "content": "\n\nJanet's ducks lay 16 eggs per day.\n\nShe eats 3 eggs for breakfast, leaving:\n16 \u2212 3 = 13 eggs.\n\nShe uses 4 eggs to bake muffins, leaving:\n13 \u2212 4 = 9 eggs.\n\nShe sells the remaining 9 eggs for $2 each:\n9 \u00d7 2 = 18.\n\nTherefore, the final answer is $18.",
+      "reasoning": "We need answer simple arithmetic. Need final with step by step and conclude exact phrase. Compute: ducks lay 16 eggs/day. Eats 3 breakfast, bakes muffins with 4. Remainder = 16-3-4=9. Sells at $2 each => $18. Need final: Therefore, the final answer is $18. Ensure no extra? User asks think step by step and conclude with. We can provide concise steps.\n"
+    },
+    {
+      "id": "math_derivation",
+      "category": "Advanced Math (Symbolic Derivation)",
+      "prompt": "Define p = sum_{k=1}^inf 1/k^2 and q = sum_{k=1}^inf 1/k^3. Find a way to write sum_{j=1}^inf sum_{k=1}^inf 1/(j+k)^3 in terms of p and q. Think step by step and conclude your response with: Therefore, the final answer is \\boxed{ANSWER}",
+      "max_tokens": 512,
+      "token_count": 493,
+      "elapsed_s": 14.457899917033501,
+      "ttft_ms": 2003.4330000635237,
+      "decode_tok_s": 39.503898744122054,
+      "content": "\n\nLet\n\n\\[\nS=\\sum_{j=1}^{\\infty}\\sum_{k=1}^{\\infty}\\frac{1}{(j+k)^3}.\n\\]\n\nGroup the terms by the value of \\(n=j+k\\). Since \\(j,k\\ge 1\\), we have \\(n\\ge 2\\). For a fixed \\(n\\), the number of positive integer pairs \\((j,k)\\) satisfying \\(j+k=n\\) is \\(n-1\\). Therefore,\n\n\\[\nS=\\sum_{n=2}^{\\infty}\\frac{n-1}{n^3}.\n\\]\n\nNow simplify the summand:\n\n\\[\n\\frac{n-1}{n^3}",
+      "reasoning": "We need answer math problem. Need solve carefully. Problem: Define p = sum_{k=1}^\u221e 1/k^2 = \u03b6(2), q = sum 1/k^3 = \u03b6(3). Find way to write sum_{j=1}^\u221e sum_{k=1}^\u221e 1/(j+k)^3 in terms of p and q. Need step by step conclude boxed.\n\nWe need compute S = \u2211_{j=1}\u221e \u2211_{k=1}\u221e 1/(j+k)^3. Let n = j+k. For n\u22652, number of positive integer pairs (j,k) with j+k=n is n-1. So S = \u2211_{n=2}\u221e (n-1)/n^3 = \u2211_{n=2}\u221e (1/n^2 - 1/n^3) = (\u2211_{n=1}\u221e 1/n^2 -1) - (\u2211_{n=1}\u221e 1/n^3 -1) = p - q. Check: n=1 term? (n-1)/n^3=0, so can start n=1. \u2211_{n=1}\u221e (1/n^2 -1/n^3)=p-q. Yes.\n\nNeed final answer boxed{p-q}. Ensure no issue convergence? Absolutely convergent? Terms positive, sum finite? \u2211 (n-1)/n^3 ~1/n^2 finite. Good.\n\nNeed produce final with step by step. Include p and q definitions. Final exactly \\boxed{p-q}.\n"
+    },
+    {
+      "id": "logic_puzzle",
+      "category": "Constraint Satisfaction Logic",
+      "prompt": "Five colleagues (A, B, C, D, E) are assigned to contiguous offices 1 to 5 in a row. Constraints:\n1. C is in office 3.\n2. A is immediately to the left of B (A's office number is B - 1).\n3. D is not in office 1 or 5.\n4. E is to the right of C.\nDeduce the unique office assignment for all five colleagues step by step.",
+      "max_tokens": 448,
+      "token_count": 447,
+      "elapsed_s": 11.935314542031847,
+      "ttft_ms": 1100.619750097394,
+      "decode_tok_s": 41.16405755444174,
+      "content": "\n\nWe have offices 1 through 5 in a row.\n\n1. **C is in office 3.**  \n   So the current assignment is:\n\n   | Office | 1 | 2 | 3 | 4 | 5 |\n   |---|---|---|---|---|---|\n   | Person |   |   | C |   |   |\n\n2. **E is to the right of C.**  \n   Since C is in office 3, E must be in office 4 or 5.\n\n3. **D is not in office 1 or 5.**  \n   So D can only be in office 2, 3, or 4.  \n   Office 3 is already occupied by C, so D must be in office 2 or",
+      "reasoning": "We need answer puzzle. Need solve step by step. Let's analyze.\n\nOffices 1-5. C=3. E to right of C => E in 4 or 5. D not 1 or 5 => D in 2,3,4. 3 occupied C, so D in 2 or 4. A immediately left of B: pairs (1,2),(2,3),(3,4),(4,5). 3 occupied C, so pairs cannot include 3? A=2,B=3 impossible B=C; A=3,B=4 impossible A=C. So possible (1,2) or (4,5). Need assign all.\n\nCase AB=(1,2): remaining offices 4,5 for D,E. D not 5 => D=4, E=5. E right of C yes. Valid: A1 B2 C3 D4 E5.\nCase AB=(4,5): remaining offices 1,2 for D,E. D not 1 => D=2, E=1. E right of C? E=1 not right of 3 invalid. So unique.\n\nNeed final step-by-step. Ensure no hidden issue: \"E is to the right of C\" not necessarily immediately. Yes. Unique assignment. Provide concise.\n"
+    },
+    {
+      "id": "rust_ring_buffer",
+      "category": "Systems Programming (Rust)",
+      "prompt": "Write a lock-free or single-atomic circular ring buffer struct in Rust `CircularBuffer<T, const N: usize>` with `push` and `pop` methods. Include safety docstrings and a unit test.",
+      "max_tokens": 512,
+      "token_count": 512,
+      "elapsed_s": 17.859315125038847,
+      "ttft_ms": 973.6856670351699,
+      "decode_tok_s": 30.262419370915982,
+      "content": "",
+      "reasoning": "We need answer user: \"Write a lock-free or single-atomic circular ring buffer struct in Rust `CircularBuffer<T, const N: usize>` with `push` and `pop` methods. Include safety docstrings and a unit test.\"\n\nNeed produce Rust code. Need think carefully. User asks lock-free or single-atomic circular ring buffer struct in Rust. Need likely implement SPSC? \"lock-free or single-atomic\" ambiguous. Need provide safe API? Need safety docstrings and unit test. Need ensure correctness. Need discuss constraints: T? For ring buffer with N const. Need push/pop. Lock-free single-producer single-consumer? Single-atomic? Could implement using AtomicUsize head/tail? Single-atomic? \"single-atomic\" maybe one atomic index? Need design.\n\nNeed produce code that compiles. Need include safety docstrings. Need unit test. Need consider Rust const generics, arrays, UnsafeCell, AtomicUsize, Ordering. Need avoid data races. Need memory ordering. Need handle full/empty. Need T: Send? For lock-free SPSC. Need push returns bool? pop Option<T>. Need single-atomic? If one atomic counter? For SPSC ring buffer can use single atomic size? Let's explore.\n\nA classic lock-free SPSC queue uses two atomics head/tail with acquire/release. Single atomic? There is a single-producer single-consumer queue with one atomic counter? For bounded ring buffer, if only one producer and one consumer, can use atomic size? Producer increments size after write, consumer decrements after read? Need ensure no overwrite. If size atomic, producer checks size < N, writes, increments. Consumer checks size > 0, reads, decrements. Is that safe? Race: producer checks size=N-1, consumer reads and decrements to N-2, producer writes slot? Need slot index? Need indices. If use head/tail derived from size? Need know positions. If size only, producer writes at head? head = write index, tail = read index. Need maintain head/tail non-atomic? Producer owns head, consumer owns tail. Size atomic can coordinate. Producer: if size.load(Acquire) < N { write at head; head +=1; size.fetch_add(1, Release); } Consumer: if size.load(Acquire)>0 { read at tail; tail +=1; size.fetch_sub(1, Release); } Is this safe? Need ensure producer doesn't write"
+    },
+    {
+      "id": "python_algorithms",
+      "category": "Algorithms & Coding (Python)",
+      "prompt": "Write a Python function `find_cheapest_flight(n: int, flights: list[list[int]], src: int, dst: int, k: int) -> int` using Bellman-Ford or Dijkstra to find the cheapest flight from src to dst with at most k stops. Include type hints and 2 test assertions.",
+      "max_tokens": 448,
+      "token_count": 448,
+      "elapsed_s": 13.538565166993067,
+      "ttft_ms": 833.3717919886112,
+      "decode_tok_s": 35.18246332868926,
+      "content": "",
+      "reasoning": "We need answer user's request: Write Python function find_cheapest_flight(n, flights, src, dst, k) using Bellman-Ford or Dijkstra to find cheapest flight from src to dst with at most k stops. Include type hints and 2 test assertions.\n\nNeed produce final code. Need think details.\n\nProblem: Cheapest Flights Within K Stops (LeetCode 787). n nodes 0..n-1, flights list [from,to,price], src, dst, k stops. Need at most k stops means at most k+1 edges. Return cheapest price or -1.\n\nCan implement Bellman-Ford: dist array, iterate k+1 times, copy prev to avoid using more than current edges. For each flight, if prev[u] != inf: dist[v] = min(dist[v], prev[u]+price). Return dist[dst] if finite else -1.\n\nType hints: def find_cheapest_flight(n: int, flights: list[list[int]], src: int, dst: int, k: int) -> int:\nNeed Python 3.9+ list[list[int]] ok. Include 2 test assertions.\n\nPotential edge cases: src==dst return 0. Bellman-Ford handles.\n\nNeed ensure at most k stops: k stops = k intermediate nodes, edges <= k+1. Loop for _ in range(k+1). Use prev = dist[:] each iteration.\n\nTest assertions:\nassert find_cheapest_flight(4, [[0,1,100],[1,2,100],[2,0,100],[1,3,600],[2,3,200]], 0, 3, 1) == 700\nassert find_cheapest_flight(3, [[0,1,100],[1,2,100],[0,2,500]], 0, 2, 1) == 200\nMaybe include direct? Good.\n\nNeed final answer likely code block only? User asks write function include type hints and 2 test assertions. We can provide concise"
+    },
+    {
+      "id": "sql_cohorts",
+      "category": "Data Engineering (SQL)",
+      "prompt": "Write an ANSI SQL query that computes monthly customer retention cohorts over an `orders(customer_id, order_date, amount)` table. The output should show: cohort_month, months_since_first_order, active_customers, and retention_rate. Explain the window functions used.",
+      "max_tokens": 448,
+      "token_count": 448,
+      "elapsed_s": 13.852015041047707,
+      "ttft_ms": 802.5690000504255,
+      "decode_tok_s": 34.25432762399765,
+      "content": "",
+      "reasoning": "We need answer user: \"Write an ANSI SQL query that computes monthly customer retention cohorts over an `orders(customer_id, order_date, amount)` table. The output should show: cohort_month, months_since_first_order, active_customers, and retention_rate. Explain the window functions used.\"\n\nNeed produce final answer. Need think through SQL. Need ANSI SQL? Use standard SQL, likely no vendor-specific. Need compute monthly cohorts: cohort_month = month of first order per customer. months_since_first_order = difference in months between order month and cohort month. active_customers = count distinct customers active in that cohort/month offset. retention_rate = active_customers / cohort_size (number of customers in cohort). Need output cohort_month, months_since_first_order, active_customers, retention_rate.\n\nNeed ANSI SQL. Date functions: EXTRACT? DATE_TRUNC? ANSI has EXTRACT, date arithmetic? Month difference not standard? Need portable? ANSI SQL has date literals, interval, date addition. Month difference can be computed using EXTRACT(YEAR FROM date)*12 + EXTRACT(MONTH FROM date). That's ANSI-ish. Use CAST(order_date AS DATE). Need first_order per customer: MIN(order_date) OVER (PARTITION BY customer_id) window function. Then cohort_month = first_order month. months_since = (year*12+month of order) - (year*12+month of first). active_customers = COUNT(DISTINCT customer_id). retention_rate = active_customers / cohort_size. Need cohort_size: count distinct customers per cohort_month. Can compute with window function COUNT(DISTINCT customer_id) OVER (PARTITION BY cohort_month)? ANSI SQL: COUNT(DISTINCT) as window function? SQL standard? Many DBs support COUNT(DISTINCT) OVER? ANSI? Not sure. SQL:2003? Window functions with DISTINCT? I think standard allows aggregate functions as window functions, and DISTINCT in aggregate? COUNT(DISTINCT x) OVER? PostgreSQL supports? SQL Server? Oracle? ANSI? To be safe, compute cohort_size in subquery/CTE with GROUP BY cohort_month, join. User asks explain window functions used. Need include window"
+    },
+    {
+      "id": "distributed_systems",
+      "category": "Technical Architecture Writing",
+      "prompt": "Compare the leader election and log commitment mechanics between the Raft consensus protocol and Multi-Paxos. Explain how Raft avoids conflicting uncommitted log entries in 3 concise paragraphs.",
+      "max_tokens": 448,
+      "token_count": 447,
+      "elapsed_s": 15.1973122919444,
+      "ttft_ms": 739.8665839573368,
+      "decode_tok_s": 30.849156137837394,
+      "content": "\n\nIn Raft, leader election is tightly coupled to log state: a candidate must win a majority of votes in a term, and",
+      "reasoning": "We need answer user's request. Need produce final answer. User asks: Compare leader election and log commitment mechanics between Raft and Multi-Paxos. Explain how Raft avoids conflicting uncommitted log entries in 3 concise paragraphs.\n\nNeed ensure 3 paragraphs. Concise. Need cover leader election and log commitment mechanics. Explain Raft avoids conflicting uncommitted log entries. Need likely mention Raft: single leader elected via quorum, terms, votes, log matching, leader forces followers to match by finding last common index and overwriting suffix. Commitment: leader commits entry when replicated to majority and current term; commits by advancing commitIndex, entries from previous terms committed indirectly. Multi-Paxos: leader elected (optional) to optimize, each slot independent Paxos instance; proposals with ballot numbers; acceptors accept highest ballot; leader can propose values per slot; commitment when majority accepts; leader can change uncommitted slots by higher ballot; committed slots stable. Conflicts: Multi-Paxos can have multiple leaders/proposals in slots, uncommitted entries can be overwritten by higher ballot; leader election not tied to log continuity. Raft avoids conflicting uncommitted log entries by restricting writes to current leader, term-based log entries, leader election ensures new leader has most up-to-date log (votes only for candidate with log at least as up-to-date), leader overwrites follower suffixes, no gaps, commit only majority and current term. Need 3 paragraphs.\n\nNeed be careful: Raft avoids conflicting uncommitted log entries? It can have uncommitted entries from old leaders on followers, and new leader overwrites them. It avoids committed conflicts via safety. The phrase \"conflicting uncommitted log entries\" likely means entries not committed can be overwritten, not committed. Need explain.\n\nLet's craft 3 concise paragraphs.\n\nParagraph 1: leader election comparison.\nParagraph 2: log commitment mechanics.\nParagraph 3: Raft avoids conflicting uncommitted log entries.\n\nNeed concise. Ensure exactly 3 paragraphs. No bullets? Paragraphs.\n"
+    },
+    {
+      "id": "cpp_code_review",
+      "category": "Security & Concurrency Review",
+      "prompt": "Review this C++ concurrency snippet:\n```cpp\ntemplate<typename K, typename V>\nclass Cache {\n  std::unordered_map<K, V*> map;\n  std::mutex mtx;\npublic:\n  V* get(const K& k) {\n    std::lock_guard lock(mtx);\n    return map[k];\n  }\n  void set(const K& k, V* v) {\n    std::lock_guard lock(mtx);\n    delete map[k];\n    map[k] = v;\n  }\n};\n```\nIdentify at least 3 serious bugs, undefined behavior, or memory leak risks, and provide the modern RAII C++20 fix.",
+      "max_tokens": 512,
+      "token_count": 512,
+      "elapsed_s": 15.507752042030916,
+      "ttft_ms": 1376.6220420366153,
+      "decode_tok_s": 36.16129778724038,
+      "content": "",
+      "reasoning": "We need answer user: Review C++ concurrency snippet, identify at least 3 serious bugs, UB, memory leak risks, provide modern RAII C++20 fix. Need think thoroughly. Need final answer. Need analyze code.\n\nCode:\ntemplate<typename K, typename V>\nclass Cache {\n  std::unordered_map<K, V*> map;\n  std::mutex mtx;\npublic:\n  V* get(const K& k) {\n    std::lock_guard lock(mtx);\n    return map[k];\n  }\n  void set(const K& k, V* v) {\n    std::lock_guard lock(mtx);\n    delete map[k];\n    map[k] = v;\n  }\n};\n\nNeed identify at least 3 serious bugs/UB/memory leak risks.\n\nIssues:\n1. get uses operator[] on unordered_map, which inserts default-constructed value (nullptr for V*) if key absent. This mutates map under lock, okay, but returns nullptr. More serious: get is not const, mutates cache; can cause rehash? operator[] may insert and rehash, invalidating references/iterators? It's under mutex, so thread-safe for map. But returning raw pointer to V*? It returns V* value, not reference. If key absent, inserts nullptr. Memory leak? Not directly. It can grow cache unbounded with null entries. Also get has side effect. If map contains V* and get returns pointer, caller may use after set deletes? Concurrency lifetime issue.\n\n2. set deletes map[k] before assignment. If key absent, operator[] inserts nullptr, delete nullptr okay. If key present, deletes old pointer. Then map[k] = v. If v is nullptr? okay. If v aliases old pointer? e.g. set(k, map[k])? delete old then assign same pointer? If v is same pointer as old, delete old then map[k]=v leaves dangling pointer. UB if later used. Also if v is pointer to object owned elsewhere, double delete. Raw pointer ownership ambiguous.\n\n3. Exception safety: set deletes old pointer then assigns. If map[k] = v throws? operator[] after delete? Actually delete map[k] uses operator[]; if key absent inserts nullptr. Then delete. Then map[k] = v: operator[] may rehash? It may throw? If throws after delete, old pointer deleted, map entry remains nullptr? If"
+    }
+  ],
+  "vision_prompts": [
+    {
+      "id": "financial_barchart",
+      "category": "Financial Analytics (Multi-Bar Chart)",
+      "prompt": "Analyze this quarterly financial chart showing Revenue and Expenses for Q1 through Q4. 1. Extract the exact Revenue and Expense figures for each quarter.\n2. Calculate the Net Profit (Revenue - Expenses) for each quarter.\n3. State which quarter achieved the highest profit margin.",
+      "max_tokens": 448,
+      "token_count": 448,
+      "elapsed_s": 12.884582625003532,
+      "ttft_ms": 1813.4844999294728,
+      "decode_tok_s": 40.375398623522706,
+      "content": "",
+      "reasoning": "The user wants me to analyze a bar chart. Let me carefully read the values from the image.\n\nThe chart title is \"Quarterly ($k)\" with a legend: blue = Revenue, red = Expenses.\n\nLooking at the bars, I see labels on top of each bar. Let me read them carefully.\n\nThe x-axis labels visible are Q2, Q3, Q4. There's a first pair of bars on the left with no visible x-axis label (likely Q1, the label is cut off).\n\nLet me read the bar values. The first pair (leftmost): blue bar has no visible number label? Let me look. The image shows the first blue bar with no number on top (it's cut off at top). The red bar next to it has \"180\" on top.\n\nSecond pair (Q2): blue bar \"250\", red bar \"110\".\n\nThird pair (Q3): blue bar \"300\", red bar \"180\".\n\nFourth pair (Q4): blue bar \"350\", red bar \"200\".\n\nHmm, let me look more carefully at the image. The labels I can see: \"180\" above the first red bar. \"250\" above second blue, \"110\" above second red. \"300\" above third blue, \"180\" above third red. \"350\" above fourth blue, \"200\" above fourth red.\n\nThe first blue bar's value is not visible (cut off). I need to estimate it. The first blue bar height looks between 180 and 250. Let's look at relative heights. The first red bar is 180. The first blue bar is taller than the first red bar (180) and shorter than the second blue bar (250). Visually the first blue bar top is around the level between 180 and 250. Hard to say exactly.\n\nCommon dataset for these synthetic charts: often Q1 Revenue = 200, Expenses = 180"
+    },
+    {
+      "id": "architecture_flowchart",
+      "category": "System Architecture (Diagram)",
+      "prompt": "Look at this system architecture diagram. 1. Trace the path of an incoming user request from Client to Data Stores.\n2. List all microservices shown in the middle tier.\n3. Identify which data store is connected to each service.",
+      "max_tokens": 448,
+      "token_count": 448,
+      "elapsed_s": 11.758098834077828,
+      "ttft_ms": 1331.9366670912132,
+      "decode_tok_s": 42.87291841818653,
+      "content": "",
+      "reasoning": "The user wants me to look at a system architecture diagram and answer three specific questions. Let me carefully examine the image.\n\nThe diagram shows boxes connected by lines. Let me parse the layout.\n\nOn the left, there's a blue box labeled \"Web / API\". This is the entry point (the client-facing gateway / API layer).\n\nFrom \"Web / API\", there are lines going to the right. Let me trace them. There's a line going up-right to a green box labeled \"Service\". There's a line going right (middle) to a green box labeled \"Service\". There's a line going down-right to a green box labeled \"Service\".\n\nSo the middle tier has three green boxes, each labeled \"Service\".\n\nNow from each green \"Service\" box, there's a line to an orange box on the right (data stores).\n\nTop green \"Service\" connects to top orange box labeled \"Redis\".\n\nMiddle green \"Service\" connects to middle orange box labeled \"Postgre\" (PostgreSQL).\n\nBottom green \"Service\" connects to bottom orange box labeled \"Mongo\" (MongoDB).\n\nLet me double check the connections by looking at the lines. The \"Web / API\" box has three lines emanating from its right side: one to top Service, one to middle Service, one to bottom Service. Yes.\n\nTop Service has a line to Redis. Middle Service has a line to Postgre. Bottom Service has a line to Mongo.\n\nNow the questions:\n\n1. Trace the path of an incoming user request from Client to Data Stores. The diagram doesn't explicitly show a \"Client\" box; the leftmost is \"Web / API\". The user says \"from Client to Data Stores\". So the path is: Client (implied, external) -> Web / API (gateway) -> Service (one of the three microservices) -> Data Store (Redis / Postgre / Mongo). I should describe the path generically and note the three possible branches.\n\n2. List all microservices shown in the middle tier. They are all labeled \"Service\" (three instances). I should note that the diagram labels them generically as \"Service\""
+    },
+    {
+      "id": "market_pie_chart",
+      "category": "Proportional Reasoning (Pie Chart)",
+      "prompt": "Look at this cloud infrastructure market share chart. 1. Extract the percentage share for AWS, Azure, GCP, and Others.\n2. Compute the combined market share of the top two providers.",
+      "max_tokens": 384,
+      "token_count": 384,
+      "elapsed_s": 11.439120583003387,
+      "ttft_ms": 1188.076207996346,
+      "decode_tok_s": 37.36204683044667,
+      "content": "",
+      "reasoning": "The user wants me to look at a pie chart showing cloud infrastructure market share. The chart has a legend with AWS (blue), Azure (green), GCP (yellow), and Others (red). The pie chart itself shows colored slices.\n\nLet me look carefully at the image. The pie chart has slices. The blue slice is the largest, taking up roughly the bottom half. The yellow slice is at the top left. The red slice is on the left. The green slice is tiny (a thin sliver).\n\nThe problem is the chart has no data labels/percentages visible. The user asks me to \"extract the percentage share\" for each. There are no numbers on the chart. So I need to estimate from the visual proportions, or recognize this is a known dataset.\n\nThis looks like a typical cloud infrastructure market share chart. Common figures (e.g., from Synergy Research / Canalys around 2020-2021): AWS ~32-33%, Azure ~20%, GCP ~11%, Others ~34%. But the visual here: blue (AWS) looks like ~50%? Let's look. The blue slice spans from about the bottom-left around to the right side. Hard to say.\n\nLet me look at the geometry. The pie chart center. The blue slice: it appears to start at the top (12 o'clock) going clockwise? Let's look. The yellow slice is at top, from about 11 o'clock to 1 o'clock. The red slice from about 9 o'clock to 11 o'clock. The green is a tiny sliver at about 1 o'clock to 1:30. The blue is the rest, from 1:30 around through 6 o'clock to 9 o'clock.\n\nSo blue is huge, like"
+    },
+    {
+      "id": "geometric_spatial_scatter",
+      "category": "Spatial Geometry & Object Counting",
+      "prompt": "Examine this 4-quadrant geometric diagram carefully: 1. Count how many red stars are in the top-left quadrant.\n2. Count how many blue circles are in the top-right quadrant.\n3. What shapes are located in the bottom-left and bottom-right quadrants?",
+      "max_tokens": 384,
+      "token_count": 384,
+      "elapsed_s": 9.971408250043169,
+      "ttft_ms": 1116.6348750703037,
+      "decode_tok_s": 43.25350675631195,
+      "content": "",
+      "reasoning": "The user wants me to look carefully at a 4-quadrant image and answer three specific questions. Let me look at the image carefully.\n\nThe image has a 2x2 grid divided by thin lines (a vertical line and a horizontal line crossing in the middle).\n\nTop-left quadrant: I see a red star. Let me look at the coordinates. The red star is at the top, around x=140, y=30. The vertical dividing line is around x=180. The horizontal dividing line is around y=110. So the red star at (140, 30) is in the top-left quadrant. Are there any other red stars? I see only one red star in the image. Let me double check. The image shows one red star at top-left area. Yes, one red star.\n\nTop-right quadrant: blue circles. I see two blue circles: one at around (235, 20) and one at (310, 25). Both are to the right of the vertical line (x=180) and above the horizontal line (y=110). So two blue circles in top-right.\n\nBottom-left quadrant: green triangles. I see two green triangles at (30, 175) and (130, 180). Both left of vertical line and below horizontal line. So bottom-left has green triangles (two of them).\n\nBottom-right quadrant: yellow/orange squares. I see two squares at (210, 130) and (290, 175). Both right of vertical line and below horizontal line. So bottom-right has yellow squares (two of them).\n\nNow answer the questions:\n\n1. Red stars in top-left: 1.\n2"
+    },
+    {
+      "id": "invoice_table_ocr",
+      "category": "Tabular OCR & Arithmetic Verification",
+      "prompt": "Transcribe this invoice table into clean Markdown. Verify whether the item totals (Qty * Price) sum correctly to the Grand Total shown.",
+      "max_tokens": 384,
+      "token_count": 384,
+      "elapsed_s": 11.218620416941121,
+      "ttft_ms": 1052.5487919803709,
+      "decode_tok_s": 37.67433617717391,
+      "content": "",
+      "reasoning": "The user wants me to transcribe the invoice table from the image into Markdown format.\nI also need to verify the math: sum of (Qty * Price) vs Grand Total.\n\n1.  **Extract Data:**\n    *   **Header:** SKU, Price\n    *   **Row 1:** SSD 2, $280.00\n    *   **Row 2:** 205 1, $190.00\n    *   **Row 3:** C-B 3, $135.00\n    *   **Footer:** Total, $1,005.00 (The image shows `$1,005.00` in red, partially cut off, looks like `$1,005.00` or `$1,005.00`? Let's check the math first to infer the total).\n\n2.  **Verify Math:**\n    *   Row 1: 2 * $280.00 = $560.00\n    *   Row 2: 1 * $190.00 = $190.00\n    *   Row 3: 3 * $135.00 = $405.00\n    *   Sum: 560 + 190 + 405 = 1155.\n    *   The image shows a red number at the bottom right. It looks like `$1,005.00`? No, let's look closer. It's cut off. It looks like `$1,005.00`? No, the last digit is cut off. It looks like `$1,005.00`?"
+    },
+    {
+      "id": "scientific_curve_plot",
+      "category": "Scientific Plot & Curve Analysis",
+      "prompt": "Analyze the plotted curve in this scientific figure: 1. State the mathematical formula shown in the title.\n2. Describe the physical phenomenon this equation models.\n3. What is the value of the function as t -> infinity?",
+      "max_tokens": 384,
+      "token_count": 384,
+      "elapsed_s": 11.838326042052358,
+      "ttft_ms": 1764.2813749844208,
+      "decode_tok_s": 38.01849333188162,
+      "content": "",
+      "reasoning": "The user wants me to analyze a plot. Let me look carefully at the image.\n\nThe title reads \"Oscillator + cos(2t)\". The plot shows a curve that starts at a positive value (around +1 at t=0), goes down to a negative trough, rises to a positive peak, then oscillates with decreasing amplitude, settling toward a small positive value near the right edge. The y-axis ranges from -1 to +1.\n\nLet me parse the title. \"Oscillator + cos(2t)\" \u2014 this is a bit ambiguous. It likely refers to a damped oscillator plus a driving term cos(2t). The classic equation for a driven damped harmonic oscillator has a solution consisting of a transient (damped) part plus a steady-state part. The transient decays as t -> infinity, leaving the steady-state oscillation.\n\nLooking at the curve: it starts at +1, oscillates with decaying amplitude, and at the right edge it seems to settle to a small positive value, not oscillating around zero with large amplitude. Hmm, but if the steady state is cos(2t), it would oscillate between -1 and +1 forever, not settle. Let me look at the curve more carefully.\n\nThe curve: starts high (~+1), dips to about -0.8, rises to about +0.7, dips to about -0.3, rises to about +0.2, then at the right edge it's around +0.1 to +0.2. The amplitude is decaying. If the steady state were cos(2t), the amplitude would not decay to near zero; it would persist. So the curve looks like a damped oscillator that decays to zero, plus cos(2t)? That doesn't match the visual decay to near zero.\n\nWait, let me"
+    }
+  ]
+}

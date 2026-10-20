@@ -301,7 +301,12 @@ bool Engine::admit(Request &active, double now) {
   ModelRequest modelRequest = active.request.modelView();
   if (resuming)
     modelRequest.prompt = active.exactTokens;
-  CacheLookup lookup = cache_.lookup(modelRequest.prompt);
+  const uint32_t maxLookup = active.request.images.empty()
+                                 ? static_cast<uint32_t>(modelRequest.prompt.size())
+                                 : std::min<uint32_t>(
+                                       static_cast<uint32_t>(modelRequest.prompt.size()),
+                                       static_cast<uint32_t>(active.request.images.front().offset));
+  CacheLookup lookup = cache_.lookup(modelRequest.prompt.subspan(0, maxLookup));
   bool executorStarted = false;
   bool resourcesStarted = false;
   try {
@@ -543,6 +548,8 @@ bool Engine::retireCheckpoint(Request &active) {
 
 void Engine::publishReachedStateBoundaries(Request &active,
                                            uint32_t promptProcessed) {
+  if (!active.request.images.empty())
+    return;
   while (active.stateBoundaryCursor < active.stateBoundaries.size() &&
          active.stateBoundaries[active.stateBoundaryCursor].tokens <=
              promptProcessed) {
@@ -861,8 +868,13 @@ void Engine::apply(const BatchPlan &plan,
         counters_.resourceReplayTokens += result.consumedPromptTokens;
       if (promptProcessed == active.replayTokens)
         active.replaying = false;
+      const uint32_t maxPublish =
+          active.request.images.empty()
+              ? promptProcessed
+              : std::min(promptProcessed,
+                         static_cast<uint32_t>(active.request.images.front().offset));
       static_cast<void>(cache_.publishCommittedBlocks(
-          active.request.id, active.exactTokens, promptProcessed));
+          active.request.id, active.exactTokens, maxPublish));
       publishReachedStateBoundaries(active, promptProcessed);
       // Recovery may replay an already reported prefix, including generated
       // history.
@@ -901,11 +913,13 @@ void Engine::apply(const BatchPlan &plan,
       acceptedDraftTokens += result.acceptedDraftTokens;
       // A terminal anchor is emitted without a target KV row; it never enters
       // a cached block.
-      const uint32_t storedTokens =
-          static_cast<uint32_t>(active.exactTokens.size()) -
-          result.outputTokensWithoutKv;
-      static_cast<void>(cache_.publishCommittedBlocks(
-          active.request.id, active.exactTokens, storedTokens));
+      if (active.request.images.empty()) {
+        const uint32_t storedTokens =
+            static_cast<uint32_t>(active.exactTokens.size()) -
+            result.outputTokensWithoutKv;
+        static_cast<void>(cache_.publishCommittedBlocks(
+            active.request.id, active.exactTokens, storedTokens));
+      }
     }
     const uint64_t completionTokens =
         active.exactTokens.size() - active.promptTokens;
