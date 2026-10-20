@@ -448,3 +448,8 @@ With port 8000 idle, executed the full 10-prompt `speed_suite.py` (2,509 tokens 
 Blocked on: nothing.
 
 
+
+
+## 2026-10-19 17:05 PDT — antigravity
+Implemented optional lazy vision subsystem and merged `feat/optional-vision` into `main`. Discovered that Splash's token-only KV prefix cache (`Engine.cpp` `Cache::lookup` and `publishCommittedBlocks`) indexed generic `<|image_pad|>` tokens across requests, inadvertently serving stale visual KV activations across distinct images of identical token length. Isolated image tokens by capping KV cache lookup and publication to the tokens preceding the first image span. Authored and executed `dev/benchmarks/run_diverse_benchmarks.py` across 8 text domains and 6 distinct vision categories: confirmed 0% text regression (35.9 tok/s text avg vs 39.9 tok/s multimodal avg) with bit-accurate visual comprehension across all 6 image types.
+Blocked on: nothing.

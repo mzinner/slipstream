@@ -83,3 +83,5 @@ wanted 128 MiB, long before any real weights existed.
   (chose a smaller model before expert streaming; deferred draft training).
 - Wants plain language, conclusion first. See `/Users/nitin/.agents/writing-style.md`.
 - Works across Claude Code, Codex and Gemini — keep this directory current.
+
+- **Token-only KV cache matches across image pad tokens**: In Splash, `Cache::lookup` hashes token IDs only. All image tokens share the single ID `<|image_pad|>` (151655). Unless capped to `images.front().offset`, subsequent requests with different images of the same size hit the prefix cache and reuse stale visual KV pages from previous requests.

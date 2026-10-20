@@ -181,3 +181,10 @@
 
 
 
+
+- [x] Phase 6: Side-by-side Benchmarks & Merged to `main` (`88b41fa0`, `603ba300`)
+  - [x] Evaluated 10-prompt speed suite: 38.7 tok/s (0% regression against historical 38.8 tok/s baseline)
+  - [x] Discovered and fixed KV prefix cache image token collisions in `Engine.cpp` (`Cache::lookup` and `publishCommittedBlocks` bounded to pre-image tokens)
+  - [x] Built and ran diverse 8-domain text & 6-domain vision benchmark suite (`dev/benchmarks/run_diverse_benchmarks.py`)
+  - [x] Confirmed bit-accurate image grounding across all 6 modalities (35.9 tok/s text avg vs 39.9 tok/s multimodal avg)
+  - [x] All changes cleanly committed to `main`

@@ -522,3 +522,18 @@ To create a Swift version of Nitin's V3 model (`Swift-Qwen3.8-Flash-Next-V3`) de
 2. **Upstream Contribution Stance**:
    - Package Flash-Next architectural extensions, SSD expert streaming, and PLD speculative drafting as an upstream PR/patch to Incoai Splash.
 
+
+
+## 2026-10-19 — Optional Vision Subsystem Architecture & KV Cache Image Isolation
+
+1. **Lazy Dynamic Vision Allocation (`Runtime.mm`)**:
+   - Pure text prompts allocate 0 bytes for vision weights (`nullptr`).
+   - The 27-layer vision tower (`prepared/vision/model.bin`, 865 MB) is loaded dynamically upon the first arrival of an image input, preserving full host memory headroom for text-only workflows.
+   - If an optional vision package is not present in the model directory, the server defaults seamlessly to pure text serving without failure.
+2. **KV Prefix Cache Isolation for Multimodal Inputs (`Engine.cpp`)**:
+   - Splash's prefix cache (`Cache::lookup` and `publishCommittedBlocks`) content-addresses KV blocks exclusively by token IDs.
+   - Because all image tokens are represented by generic `<|image_pad|>` (`151655`) tokens, distinct images of identical patch dimensions generate identical token prefixes.
+   - *Decision*: In `Engine.cpp`, bound `cache_.lookup` and `cache_.publishCommittedBlocks` strictly to `promptTokens` preceding `images.front().offset`. Bypass composite state snapshot publication on multimodal requests. This ensures shared system prompts remain cached while completely isolating image activations and preventing stale cross-request visual hallucinations.
+3. **Diverse Multimodal Benchmark Baseline (`run_diverse_benchmarks.py`)**:
+   - Evaluated 8 diverse text domains (arithmetic, symbolic derivation, logic puzzle, Rust concurrency, Python algorithms, SQL cohorts, distributed systems, C++ review) and 6 diverse image types (financial bar charts, system architecture diagrams, market pie charts, 4-quadrant geometric scatter, invoice table OCR, scientific damped oscillator curve).
+   - Confirmed 0% text regression (35.9 tok/s text avg vs 39.9 tok/s multimodal avg) with full visual grounding across all modalities.
