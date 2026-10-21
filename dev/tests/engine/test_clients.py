@@ -209,9 +209,7 @@ class ClientTests(unittest.TestCase):
         # background service never sees this process's environment.
         argv, _ = self.command("opencode")
         self.assertEqual(argv, ["/bin/opencode", "--standalone"])
-        argv, _ = self.command(
-            "opencode", client_args=["--help", "--", "literal"]
-        )
+        argv, _ = self.command("opencode", client_args=["--help", "--", "literal"])
         self.assertEqual(
             argv, ["/bin/opencode", "--help", "--standalone", "--", "literal"]
         )

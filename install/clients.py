@@ -235,9 +235,7 @@ def command(
         if not _selects_opencode_server(client_args):
             # V2 parses this as a command-local flag, so it must follow any
             # subcommand and precede the end-of-options separator.
-            argv.insert(
-                argv.index("--") if "--" in argv else len(argv), "--standalone"
-            )
+            argv.insert(argv.index("--") if "--" in argv else len(argv), "--standalone")
         return argv, environment
 
     if name == "codex":
