@@ -9,9 +9,14 @@ Record a log (SPLASH_ROUTE_LOG=path on generate-sample), then:
 
 Reports, per eviction rule:
   - SSD reads per check step with the same number of slots in every layer;
-  - the same with the slots split unevenly (more where a layer's reads fall
+  - the same after fitting the slots unevenly (more where a layer's reads fall
     fastest), under the same total;
-  - the split itself (for SPLASH_EXPERT_SLOTS).
+  - that split itself (for SPLASH_EXPERT_SLOTS).
+
+The slot split is fitted twice: to the mean reads a step (what a total does)
+and to the 95th percentile (what a slow step does). Same slots either way;
+only their distribution changes. A step is gated by its own experts, so the
+tail is what shows up as a stalled decode - see docs/tokenspeed-optimizations.md.
 
 Rules:
   engine   today's rule: evict the least used (use counts halve every 512
@@ -51,14 +56,14 @@ def load(path):
 
 
 def replay(sequence, capacity, rule):
-    """SSD reads during check steps for one layer."""
+    """SSD reads during each check step for one layer, in step order."""
     half_life = int(rule.split(":")[1]) if ":" in rule else HALF_LIFE
     rule = rule.split(":")[0]
     slot_of = np.full(EXPERTS, -1)
     expert_in = np.full(capacity, -1)
     recent = np.zeros(capacity, np.int64)
     frequency = np.zeros(EXPERTS, np.int64)
-    clock, next_halving, used, reads = 0, half_life, 0, 0
+    clock, next_halving, per_step, reads = 0, half_life, [], 0
     if rule == "optimal":
         future = defaultdict(list)
         for t, (_, uses) in enumerate(sequence):
@@ -99,11 +104,13 @@ def replay(sequence, capacity, rule):
             [e for e, _ in uses.most_common(capacity)] if phase == "P" else list(uses)
         )
         protected = np.array(wanted)
+        step_reads = 0
         for e in wanted:
             if slot_of[e] >= 0:
                 recent[slot_of[e]] = clock
                 continue
             if phase == "D":
+                step_reads += 1
                 reads += 1
             slot = victim(protected, t)
             if slot is None:
@@ -111,8 +118,81 @@ def replay(sequence, capacity, rule):
             if expert_in[slot] >= 0:
                 slot_of[expert_in[slot]] = -1
             expert_in[slot], slot_of[e], recent[slot] = e, slot, clock
-        used += 1
-    return reads
+        if phase == "D":
+            per_step.append(step_reads)
+    return per_step
+
+
+def p95(reads):
+    """Nearest-rank 95th percentile: a real step, not an interpolation."""
+    if not len(reads):
+        return 0.0
+    values = np.sort(np.asarray(reads))
+    return float(values[min(len(values) - 1, int(np.ceil(0.95 * len(values))) - 1)])
+
+
+def summary(reads):
+    """Mean and tail reads a check step, for one layer's step list."""
+    if not reads:
+        return 0.0, 0.0, 0.0
+    values = np.asarray(reads)
+    return (float(values.mean()), p95(values), float(values.max()))
+
+
+def summed(per_layer):
+    """Total reads across layers for each step (all layers run every step)."""
+    return np.sum(np.asarray(per_layer), axis=0).tolist()
+
+
+def greedy_split(curve, statistic, grid, budget, step):
+    """Assign slot chunks one at a time to the layer each chunk helps most."""
+    split = {layer: grid[0] for layer in curve}
+    spent = grid[0] * len(curve)
+    while spent + step <= budget:
+        best = None
+        best_gain = 0.0
+        for layer, values in curve.items():
+            here, next_size = split[layer], split[layer] + step
+            if next_size not in values:
+                continue
+            gain = statistic(values[here]) - statistic(values[next_size])
+            if gain > best_gain:
+                best, best_gain = layer, gain
+        if best is None:
+            break
+        split[best] += step
+        spent += step
+    return split
+
+
+def totals_split(curve, grid, budget, step):
+    """Fit against the whole check step, not a layer: a step is gated by its
+    total reads across layers, so each candidate chunk is scored by the p95
+    (worst steps) of the summed step series, not by one layer's own tail."""
+    split = {layer: grid[0] for layer in curve}
+    spent = grid[0] * len(curve)
+    base = {
+        layer: {c: np.asarray(v, dtype=np.int64) for c, v in values.items()}
+        for layer, values in curve.items()
+    }
+    current = summed([base[layer][split[layer]] for layer in curve])
+    while spent + step <= budget:
+        best = None
+        best_tail = p95(current)
+        for layer, values in base.items():
+            here, next_size = split[layer], split[layer] + step
+            if next_size not in values:
+                continue
+            candidate = current - values[here] + values[next_size]
+            tail = p95(candidate)
+            if best is None or tail < best_tail:
+                best, best_tail = (layer, candidate), tail
+        if best is None:
+            break
+        split[best[0]] += step
+        current = best[1]
+        spent += step
+    return split
 
 
 def main():
@@ -137,34 +217,38 @@ def main():
     grid = list(
         range(args.slots - 8 * args.step, args.slots + 12 * args.step + 1, args.step)
     )
-    print(f"{steps} check steps, {len(layers)} layers; budget {budget} slots\n")
+    print(
+        f"{steps} check steps, {len(layers)} layers; budget {budget} slots; "
+        f"mean and p95 SSD reads a step\n"
+    )
     for rule in args.rules.split(","):
+        # A layer's step list for every candidate size: the same trace, so
+        # the three plans are compared on identical text and routing.
         curve = {
             layer: {c: replay(events[layer], c, rule) for c in grid} for layer in layers
         }
-        uniform = sum(curve[layer][args.slots] for layer in layers)
-        # Greedy split: start everyone at the grid's floor, then give each next
-        # chunk of slots to the layer whose reads drop most.
-        split = {layer: grid[0] for layer in layers}
-        spent = grid[0] * len(layers)
-        while spent + args.step <= budget:
-            best = max(
-                (layer for layer in layers if split[layer] + args.step in curve[layer]),
-                key=lambda layer: (
-                    curve[layer][split[layer]] - curve[layer][split[layer] + args.step]
-                ),
-                default=None,
+        plans = {"uniform": {layer: args.slots for layer in layers}}
+        plans["mean"] = greedy_split(curve, np.mean, grid, budget, args.step)
+        plans["p95 (per layer)"] = greedy_split(curve, p95, grid, budget, args.step)
+        plans["p95 (a step)"] = totals_split(curve, grid, budget, args.step)
+        for name, split in plans.items():
+            per_layer = [curve[layer][split[layer]] for layer in layers]
+            total = summed(per_layer)
+            mean, tail, worst = summary(total)
+            spread = max(split.values()) - min(split.values())
+            print(
+                f"{rule:8s} {name:7s} mean {mean:5.1f}  p95 {tail:5.1f}  "
+                f"max {worst:5.1f}  slots {min(split.values())}..{max(split.values())}"
+                f" (spread {spread})"
             )
-            if best is None:
-                break
-            split[best] += args.step
-            spent += args.step
-        uneven = sum(curve[layer][split[layer]] for layer in layers)
         print(
-            f"{rule:8s} same slots everywhere: {uniform / steps:5.1f} reads a step   "
-            f"uneven split: {uneven / steps:5.1f} ({100 * (uneven - uniform) / uniform:+.1f}%)"
+            "         p95 split: "
+            + ",".join(str(plans["p95 (a step)"][layer]) for layer in layers)
         )
-        print("         split: " + ",".join(str(split[layer]) for layer in layers))
+        print(
+            "         mean split: "
+            + ",".join(str(plans["mean"][layer]) for layer in layers)
+        )
 
 
 if __name__ == "__main__":

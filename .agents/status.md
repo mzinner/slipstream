@@ -1,7 +1,27 @@
 # Status — Slipstream (handoff)
 
-**Updated:** 2026-10-19 17:05 PDT by antigravity.
-**Branch:** `main`. Optional vision merged, KV cache image token isolation fixed, and comprehensive diverse benchmark (8 text domains + 6 vision categories) committed to `main`. Server stopped.
+**Updated:** 2026-10-20 evening by Buffy (Freebuff).
+**Branch:** `feature/deepinfer-borrows` (off `main`, see DeepInfer review below). Server on 8090 stopped.
+
+## DeepInfer borrow work (2026-10-20)
+
+Three borrows implemented and measured on this branch; full write-up in
+`docs/research/deepinfer-review.md` (results table at the top):
+
+- **R1 — speculative drafting for batched decode, `SPLASH_MTP_BATCH=1` (default off).** Per-lane
+  liveRows + per-lane draft chains on the existing lanes\*8 rows. Solo streams token-identical;
+  steady-state HTTP: B2 30.3 → 42.0 agg tok/s, B4 47.3 → 50.7, B1 unchanged. All 15 engine test
+  suites pass.
+- **R2 — measured-cost draft depth.** Neutral-to-negative on the 10-prompt suite; reverted, cost
+  curve kept in `cache_plan.py`.
+- **R3 — tail-aware expert-cache slot objective.** Refuted on a freshly recorded route log:
+  whole-step p95 fit (105.2 mean / 308 p95 reads a step) loses to the mean fit (79.8 / 265.0) and
+  to uniform (84.4 / 280.0). Mean objective stays; the tool now reports both.
+
+Older status (vision merge) below.
+
+**Previously updated:** 2026-10-19 17:05 PDT by antigravity.
+**Branch (before this branch):** `main`. Optional vision merged, KV cache image token isolation fixed, and comprehensive diverse benchmark (8 text domains + 6 vision categories) committed to `main`. Server stopped.
 
 ## In one line
 
