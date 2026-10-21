@@ -299,6 +299,10 @@ struct QwenTargetVerifyBuffers final {
   // draft is a placeholder: the other rows are computed only as far as the
   // cheap layers go, and their expert work is skipped.
   uint32_t liveRowsPerLane = ExecutionLimits::targetVerifyRows;
+  // Kept-able rows per batch lane (anchor + proposals). Single-lane steps
+  // keep only `liveRowsPerLane`; batched steps fill this array, one entry
+  // per lane, and anywhere past it is a row the verifier will discard.
+  std::array<uint32_t, ExecutionLimits::maximumBatchWidth> liveRows{};
   // MTP drafting. `mtpShadow` runs the head and measures its guesses without
   // proposing them.
   bool mtpEnabled = false;
@@ -310,8 +314,11 @@ struct QwenTargetVerifyBuffers final {
   bool inThinkingPhase = false;
   metal::MetalBuffer proposedTokens;
   // Out: proposals the MTP head actually made for lane 0 (it stops when
-  // unsure), so the runtime can cap the rows the verifier keeps.
+  // unsure), so the runtime can cap the rows the verifier keeps. When
+  // drafting for several lanes at once, `mtpProposedPerLane` carries one
+  // count per lane instead.
   uint32_t *mtpProposedOut = nullptr;
+  uint32_t *mtpProposedPerLane = nullptr;
   // A constrained request needs the proposals before the step, to build its
   // grammar masks. `mtpDraftOnly` runs just the head and returns; the step
   // then runs with `mtpDrafted`, reusing those proposals (and

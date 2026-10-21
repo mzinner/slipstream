@@ -1864,13 +1864,45 @@ void Qwen4ExpTarget::addVerify(
   uint32_t hcRows = 0, hcStep = 1;
   HyperConnectionParams hcParams{};
   auto setLiveRows = [&] {
-    const uint32_t live = buffers.liveRowsPerLane;
+    // Per-lane depths (R1): a lane keeps only the chain its head proposed;
+    // the hyper-connection pass covers every lane when any of them drafts.
+    bool anyMulti = false;
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      anyMulti = anyMulti || buffers.liveRows[lane] > 1;
+    const uint32_t live =
+        lanes == 1
+            ? buffers.liveRowsPerLane
+            : (anyMulti ? ExecutionLimits::targetVerifyRows : 1u);
     hcRows = lanes == 1 ? live : (live == 1 ? lanes : rows);
     hcStep = lanes != 1 && live == 1 ? ExecutionLimits::targetVerifyRows : 1;
     hcParams = {hcRows, geometry.hiddenSize, geometry.hyperConnectionCount,
                 geometry.hyperConnectionLowRank, 1e-6f, 1, hcStep, 0};
   };
   setLiveRows();
+  // Per-lane keep-able depths (R1). `isLive` classifies a physical verify row:
+  // each lane keeps `liveRows[lane]` rows, and inside the draft head's host
+  // pass (draftRowLimit) only the drafting lane's anchor row is live, since
+  // the draft runs on its own 8 rows no matter which lane drafted it.
+  auto anyMultiRow = [&] {
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      if (buffers.liveRows[lane] > 1)
+        return true;
+    return false;
+  };
+  auto maxLiveRows = [&] {
+    uint32_t result = 0;
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      result = std::max(result, buffers.liveRows[lane]);
+    return lanes == 1 ? buffers.liveRowsPerLane : result;
+  };
+  uint32_t draftRowLimit = 0;
+  auto isLive = [&](uint32_t row) {
+    if (draftRowLimit)
+      return row < draftRowLimit &&
+             row % ExecutionLimits::targetVerifyRows == 0;
+    return row % ExecutionLimits::targetVerifyRows <
+           buffers.liveRows[row / ExecutionLimits::targetVerifyRows];
+  };
 
   uint32_t gdnIndex = 0;
   uint32_t attentionIndex = 0;
@@ -1887,7 +1919,7 @@ void Qwen4ExpTarget::addVerify(
       addPleGather(weights, backend, g, buffers.ple, geometry,
                    auxiliaryView(backend, geometry,
                                  buffers.currentGdnStates[lane]),
-                   lane * laneRows, laneRows, onCpu, buffers.liveRowsPerLane,
+                   lane * laneRows, laneRows, onCpu, buffers.liveRows[lane],
                    pipelineDeferred);
     operators.linear().addDecodeBatch(
         g, buffers.ple.embedding, weights.perLayerEmbedding.keyProjection,
@@ -1901,7 +1933,7 @@ void Qwen4ExpTarget::addVerify(
     // history is written by the state commit, not here.
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       const metal::MetalBuffer *hcNormPtr =
-          (lanes == 1 || buffers.liveRowsPerLane > 1)
+          (lanes == 1 || anyMultiRow())
               ? &weights.layers[layerIndex].attentionHyperConnection.norm
               : nullptr;
       const metal::MetalBuffer hcNormSlice = backend.view(
@@ -1926,7 +1958,7 @@ void Qwen4ExpTarget::addVerify(
                                bool preNormalized = false) {
     if (geometry.hasPerLayerEmbedding() && layerIndex == geometry.pleLayer) {
       encodePerLayerEmbedding(g, layerIndex, priorWorkComplete);
-      preNormalized = (lanes == 1 || buffers.liveRowsPerLane > 1);
+      preNormalized = (lanes == 1 || anyMultiRow());
     }
     const auto &layer = weights.layers[layerIndex];
     metal::MetalBuffer input = buffers.hidden[layerIndex & 1];
@@ -2162,7 +2194,8 @@ void Qwen4ExpTarget::addVerify(
     const uint32_t totalExperts = weights.layout.experts;
     constexpr uint32_t kMaxExperts = 512;
     logRoutes('D', layerIndex, selPtr, rows, routesPerRow, expertsPerToken,
-              buffers.liveRowsPerLane, ExecutionLimits::targetVerifyRows);
+              draftRowLimit ? 1u : maxLiveRows(),
+              ExecutionLimits::targetVerifyRows);
     int16_t stepExpertSeen[kMaxExperts];
     std::fill_n(stepExpertSeen, kMaxExperts, -1);
     std::vector<uint32_t> uniqueExperts;
@@ -2171,7 +2204,7 @@ void Qwen4ExpTarget::addVerify(
     for (uint32_t r = 0; r < rows; ++r) {
       // Rows that cannot be kept select no expert at all, so they neither
       // cost expert work nor evict experts the kept rows will need.
-      if (r % ExecutionLimits::targetVerifyRows >= buffers.liveRowsPerLane) {
+      if (!isLive(r)) {
         for (uint32_t k = 0; k < expertsPerToken; ++k)
           selPtr[r * routesPerRow + k] = kMoeSkippedRoute;
         continue;
@@ -2306,7 +2339,7 @@ void Qwen4ExpTarget::addVerify(
     std::array<uint8_t, kMaxPredicted> votes{};
     std::vector<uint32_t> order;
     for (uint32_t r = 0; r < rows; ++r) {
-      if (r % ExecutionLimits::targetVerifyRows >= buffers.liveRowsPerLane)
+      if (!isLive(r))
         continue;
       // The predicted top 6 of each row's 10. The prediction is right for
       // ~2/3 of its top 10, and every wrong guess is a wasted SSD read that
@@ -2410,9 +2443,6 @@ void Qwen4ExpTarget::addVerify(
         layerRef(layerIndex).ffn, moePlan);
   };
   const uint32_t hostRoutesPerRow = moePlan.shape().routesPerToken();
-  auto isLive = [&](uint32_t row) {
-    return row % ExecutionLimits::targetVerifyRows < buffers.liveRowsPerLane;
-  };
   auto hostSelect = [&](uint32_t layerIndex) {
     const auto *scores = static_cast<const uint16_t *>(buffers.groupedInput.contents());
     const auto *input = static_cast<const uint16_t *>(buffers.hyperMixed.contents());
@@ -2608,12 +2638,13 @@ void Qwen4ExpTarget::addVerify(
       return configuredMax;
     }
   };
-  static AdaptiveDraftController adaptiveController;
+  static std::array<AdaptiveDraftController, ExecutionLimits::maximumBatchWidth>
+      adaptiveControllers;
   if (lanes == 1 && buffers.mtp[0].rows > 0) {
-    adaptiveController.update(buffers.mtp[0].rows);
+    adaptiveControllers[0].update(buffers.mtp[0].rows);
   }
   const uint32_t baseMaxDrafts = mtpDraftLimit();
-  const uint32_t maxDrafts = adaptiveController.calculateMaxDrafts(baseMaxDrafts);
+  const uint32_t maxDrafts = adaptiveControllers[0].calculateMaxDrafts(baseMaxDrafts);
   std::array<std::array<uint32_t, 16>, 7> draftCandidates{};
   std::array<std::array<float, 16>, 7> draftProbabilities{};
   // SPLASH_TRACE=path appends one JSON line per verify step: the head's
@@ -2632,10 +2663,17 @@ void Qwen4ExpTarget::addVerify(
     std::array<float, 7> confidence{};
     std::array<uint32_t, 7> chosen{};
   } draftTrace;
-  auto runMtpDraft = [&]() -> std::array<uint32_t, 7> {
+  // Drafts one lane's chain: the head runs on its own 8 rows with the
+  // drafting lane's tokens, positions and pages, no matter which batch lane
+  // that is, so the batched path passes a lane index and a per-lane depth
+  // limit while everything else behaves as today's single-lane draft.
+  auto runMtpDraft = [&](uint32_t draftLane,
+                         uint32_t draftLimit) -> std::array<uint32_t, 7> {
     std::array<uint32_t, 7> drafts{};
     draftTrace = DraftTrace{};
-    const QwenMtpLane &mtp = buffers.mtp[0];
+    const QwenMtpLane &mtp = buffers.mtp[draftLane];
+    // The head lives in lane-local scratch: from here on, one lane at a time.
+    const uint32_t lanes = 1;
     const auto &head = *weights.mtpLayer;
     const auto &combiner = *weights.mtpCombiner;
     const uint32_t mtpIndex = geometry.layers;
@@ -2795,13 +2833,12 @@ void Qwen4ExpTarget::addVerify(
       (void)backend.submitCommand(a.dispatches());
       const auto clockStage = std::chrono::steady_clock::now();
 
-      const uint32_t saved = buffers.liveRowsPerLane;
-      buffers.liveRowsPerLane = 1;
+      draftRowLimit = ExecutionLimits::targetVerifyRows;
       hostSelect(mtpIndex);
       if (!stageActiveExperts(mtpIndex))
         throw std::logic_error("MTP head needs more experts than its cache holds");
       hostGroup();
-      buffers.liveRowsPerLane = saved;
+      draftRowLimit = 0;
       const auto clockB = std::chrono::steady_clock::now();
 
       metal::CommandGraph b;
@@ -2958,7 +2995,9 @@ void Qwen4ExpTarget::addVerify(
     // guess the token after the anchor.
     for (uint32_t r = 0; r < mtp.rows; ++r)
       std::memcpy(hIn + uint64_t{r} * width,
-                  hidden0 + uint64_t{mtp.firstRow + r} * width, width * 2);
+                  hidden0 + (uint64_t{draftLane} * kRows + mtp.firstRow + r) *
+                                width,
+                  width * 2);
     // Guessing stops once the head is unsure (as llama.cpp's
     // --spec-draft-p-min): an unlikely guess is usually rejected, and every
     // guessed row costs the verifier its own experts.
@@ -3080,7 +3119,7 @@ void Qwen4ExpTarget::addVerify(
     // Steps 2 and 3 chain on the head's own residual. Each re-runs the rows
     // before it (same inputs, same keys) so its attention sees them.
     const uint64_t anchorPosition = mtp.firstPosition + mtp.rows;
-    std::vector<uint16_t> chain(maxDrafts * uint64_t{width});
+    std::vector<uint16_t> chain(draftLimit * uint64_t{width});
     const auto *y = static_cast<const uint16_t *>(Y.contents());
     std::memcpy(chain.data(), y, width * 2);
     // Each guess runs one new row: the attention step stores every row's
@@ -3089,7 +3128,7 @@ void Qwen4ExpTarget::addVerify(
     // row's experts again.) The next step's first guess overwrites these
     // positions with the accepted tokens' real rows.
     static const bool rerun = std::getenv("SPLASH_MTP_RERUN") != nullptr;
-    for (uint32_t k = 1; k < maxDrafts; ++k) {
+    for (uint32_t k = 1; k < draftLimit; ++k) {
       // One new row writes an 8-row window from its own position; when that
       // runs past the pages the request holds (a decode step reserves its
       // verify window only), re-run from the anchor, which stays inside it.
@@ -3135,8 +3174,11 @@ void Qwen4ExpTarget::addVerify(
   double mtpMs = 0.0;
   if (buffers.mtpDrafted) {
     buffers.liveRowsPerLane = 1 + *buffers.mtpProposedOut;
+    buffers.liveRows[0] = buffers.liveRowsPerLane;
     setLiveRows();
-  } else if (buffers.mtpEnabled && weights.mtpLayer && lanes == 1 && buffers.mtp[0].rows) {
+  } else if (buffers.mtpEnabled && weights.mtpLayer &&
+             (lanes == 1 || (lanes > 1 && !buffers.mtpShadow)) &&
+             buffers.mtp[0].rows) {
     static const bool pldEnabled = [] {
       const char *v = std::getenv("SPLASH_PROMPT_LOOKUP");
       return v != nullptr && std::atoi(v) != 0;
@@ -3161,7 +3203,9 @@ void Qwen4ExpTarget::addVerify(
     std::array<uint32_t, 7> drafts{};
     const uint32_t anchor = buffers.mtp[0].tokens[buffers.mtp[0].rows - 1];
 
-    if (pldEnabled && !skipPld && buffers.promptLookup) {
+    // Prompt-lookup drafting reads this lane's prompt history; the runtime
+    // wires only lane 0's table, so it stays a single-lane feature.
+    if (lanes == 1 && pldEnabled && !skipPld && buffers.promptLookup) {
       std::array<uint32_t, 1> queryTokens{anchor};
       std::array<uint32_t, ExecutionLimits::draftProposalTokens> pldDrafts{};
       const uint32_t needed = std::min(maxDrafts, pldMaxDrafts);
@@ -3181,14 +3225,58 @@ void Qwen4ExpTarget::addVerify(
     }
 
     if (drafted == 0) {
-      const auto mtpStart = std::chrono::steady_clock::now();
-      drafts = runMtpDraft();
-      mtpMs = std::chrono::duration<double, std::milli>(
-                  std::chrono::steady_clock::now() - mtpStart).count();
+      if (lanes == 1) {
+        const auto mtpStart = std::chrono::steady_clock::now();
+        drafts = runMtpDraft(0, maxDrafts);
+        mtpMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - mtpStart).count();
+      } else {
+        // Batched drafting (R1): every lane runs its own chain from its own
+        // confidence, so one uncertain request cannot stop the others. The
+        // head is shared scratch, so the chains run per lane; only the
+        // token streams differ. The producers below write each lane's
+        // proposals into its own arena slice.
+        uint32_t maxLive = 1;
+        for (uint32_t laneIdx = 0; laneIdx < lanes; ++laneIdx) {
+          drafted = 0;
+          if (buffers.mtp[laneIdx].rows > 0)
+            adaptiveControllers[laneIdx].update(buffers.mtp[laneIdx].rows);
+          const uint32_t laneMaxDrafts =
+              adaptiveControllers[laneIdx].calculateMaxDrafts(baseMaxDrafts);
+          drafts = runMtpDraft(laneIdx, laneMaxDrafts);
+          if (!buffers.mtpProposedPerLane)
+            throw std::logic_error("batched drafting proposal counts missing");
+          buffers.mtpProposedPerLane[laneIdx] = drafted;
+          adaptiveControllers[laneIdx].lastProposed = drafted;
+          buffers.liveRows[laneIdx] = 1 + drafted;
+          maxLive = std::max(maxLive, 1 + drafted);
+          auto *proposed =
+              static_cast<uint32_t *>(buffers.proposedTokens.contents());
+          auto *candidates = static_cast<uint32_t *>(
+              buffers.proposalCandidates.contents());
+          auto *probabilities =
+              static_cast<float *>(buffers.proposalProbabilities.contents());
+          const uint32_t laneBase =
+              laneIdx * ExecutionLimits::draftProposalTokens;
+          for (uint32_t k = 0; k < ExecutionLimits::draftProposalTokens; ++k) {
+            const uint32_t source = std::min<uint32_t>(k, laneMaxDrafts - 1);
+            proposed[laneBase + k] = drafts[source];
+            for (uint32_t c = 0; c < 16; ++c) {
+              candidates[laneBase * 16 + k * 16 + c] =
+                  draftCandidates[source][c];
+              probabilities[laneBase * 16 + k * 16 + c] =
+                  draftProbabilities[source][c];
+            }
+          }
+        }
+        buffers.liveRowsPerLane = maxLive;
+        setLiveRows();
+      }
     }
-    if (!buffers.mtpShadow) {
-      adaptiveController.lastProposed = drafted;
+    if (lanes == 1 && !buffers.mtpShadow) {
+      adaptiveControllers[0].lastProposed = drafted;
       buffers.liveRowsPerLane = 1 + drafted;
+      buffers.liveRows[0] = buffers.liveRowsPerLane;
       setLiveRows();
       if (buffers.mtpProposedOut)
         *buffers.mtpProposedOut = drafted;
@@ -3209,6 +3297,9 @@ void Qwen4ExpTarget::addVerify(
     }
     // Score each guess when the token it guessed is decided. The anchor of
     // this step is the target's token at position firstPosition + rows.
+    // Lane 0 only: the map and counters are global, and batched drafts run
+    // each lane's chain separately.
+    if (lanes == 1) {
     static std::map<uint64_t, std::array<uint32_t, 3>> guesses;
     static std::array<uint64_t, 3> hits{}, total{};
     const QwenMtpLane &mtp = buffers.mtp[0];
@@ -3231,6 +3322,7 @@ void Qwen4ExpTarget::addVerify(
       std::cerr << "[MTP shadow] guess 1: " << hits[0] << "/" << total[0]
                 << "  guess 2: " << hits[1] << "/" << total[1]
                 << "  guess 3: " << hits[2] << "/" << total[2] << "\n";
+    }
   }
 
   if (buffers.mtpDraftOnly)

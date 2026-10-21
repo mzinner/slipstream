@@ -775,9 +775,33 @@ struct Runtime::Impl {
   bool mtpProposing(const Request &) const noexcept {
     return mtpDrafting() && !std::getenv("SPLASH_MTP_SHADOW");
   }
+  // A batched decode step can draft per lane as well (R1): every lane runs
+  // its own chain from its own confidence, so one slow or uncertain request
+  // cannot stop the others from speculating. Off unless the gate is set, so
+  // today's behaviour is bit-for-bit unchanged by default.
+  bool mtpBatchEnabled() const noexcept {
+    static const bool enabled = [] {
+      const char *v = std::getenv("SPLASH_MTP_BATCH");
+      return v != nullptr && std::atoi(v) != 0;
+    }();
+    return enabled;
+  }
+  bool batchMtpProposing(std::span<Request *const> entries) const noexcept {
+    if (!mtpBatchEnabled() || entries.size() < 2)
+      return false;
+    for (const Request *entry : entries)
+      if (!entry || !mtpProposing(*entry) ||
+          entry->constraint != ConstraintMode::None)
+        return false;
+    return true;
+  }
 
   // Proposals the MTP head made this step (it stops when unsure).
   uint32_t mtpProposed = mtpProposals();
+  // Per-lane proposals when a batched decode step drafts (see
+  // QwenTargetVerifyBuffers::mtpProposedPerLane); only valid within the step
+  // that drafted, since every forward re-runs the head.
+  std::array<uint32_t, kLaneCount> mtpProposedByLane{};
 
   uint32_t retainedRowLimit(uint32_t remaining,
                             const Request *entry = nullptr) const noexcept {
@@ -1145,12 +1169,18 @@ struct Runtime::Impl {
     if (mtpPhase != MtpPhase::AlreadyDrafted)
       mtpProposed = mtpProposals();
     buffers.mtpProposedOut = &mtpProposed;
+    buffers.mtpProposedPerLane = mtpProposedByLane.data();
+    std::fill(mtpProposedByLane.begin(), mtpProposedByLane.end(), 0u);
     buffers.mtpDraftOnly = mtpPhase == MtpPhase::DraftOnly;
     buffers.mtpDrafted = mtpPhase == MtpPhase::AlreadyDrafted;
     buffers.mtpEnabled = mtpDrafting();
-    buffers.mtpShadow = !(lanes == 1 && mtpProposing(laneEntry(entries, 0)));
+    buffers.mtpShadow =
+        !(lanes == 1 && mtpProposing(laneEntry(entries, 0))) &&
+        !(lanes > 1 && batchMtpProposing(entries));
     if (!buffers.mtpShadow)
       buffers.liveRowsPerLane = 1 + mtpProposals();
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      buffers.liveRows[lane] = buffers.liveRowsPerLane;
     buffers.kvPageCount = kvPages.pageCount();
     buffers.proposedTokens = d(DecodeTensor::ProposedTokens);
     buffers.proposalCandidates = d(DecodeTensor::Candidates);
@@ -2100,8 +2130,15 @@ Runtime::decodeAsync(const BatchPlan &plan,
     impl_->encodeTargetVerifyBatchForward(
         commandGraph, {requests.data(), lanes.size()}, items, batchStats);
     // The head may have stopped early; keep no row it did not propose.
+    // Per lane when the batch drafts (R1), lane 0 only otherwise.
     if (mtpProposes)
       maximumRetained[0] = std::min(maximumRetained[0], 1 + impl_->mtpProposed);
+    if (lanes.size() > 1 &&
+        impl_->batchMtpProposing({requests.data(), lanes.size()})) {
+      for (uint32_t lane = 0; lane < lanes.size(); ++lane)
+        maximumRetained[lane] = std::min(
+            maximumRetained[lane], 1 + impl_->mtpProposedByLane[lane]);
+    }
     impl_->encodeTargetVerifyBatchPolicy(commandGraph,
                                          {requests.data(), lanes.size()});
     impl_->encodeBatchAcceptance(commandGraph, {requests.data(), lanes.size()},
