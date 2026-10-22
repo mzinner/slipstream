@@ -12,7 +12,6 @@
 
 #include <algorithm>
 #include <bitset>
-#include <random>
 #include <cmath>
 #include <map>
 #include <deque>
@@ -2715,6 +2714,20 @@ void Qwen4ExpTarget::addVerify(
 
     std::array<uint32_t, 16> lastCandidates{};
     std::array<float, 16> lastProbabilities{};
+    // A sampled proposal is drawn from a counter-based stream keyed by the
+    // request's seed and the position being predicted, so a lane's drafts
+    // depend only on its own content: not on which requests share the batch and
+    // not on how the lanes' chains interleave. A process-wide generator here
+    // made identical seeded requests diverge.
+    uint64_t drawSerial = 0;
+    auto drawDraftToken = [&](uint64_t position) {
+      uint64_t value = mtp.seed ^ (position * 0x9e3779b97f4a7c15ULL) ^
+                       (++drawSerial * 0xd1b54a32d192ed03ULL);
+      value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+      value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+      value ^= value >> 31;
+      return float(value >> 40) * 0x1p-24F;
+    };
     auto step = [&](uint64_t position, uint32_t live,
                     const uint32_t *tokens) -> uint32_t {
       auto *tokenOut = static_cast<uint32_t *>(weights.mtpTokens.contents());
@@ -2794,11 +2807,17 @@ void Qwen4ExpTarget::addVerify(
           weights.mtpSin, buffers.fullQueries, buffers.chunkKeys[kvIndex],
           buffers.chunkValues[kvIndex], kRows, kv::kPageTokens, kv::kPageTokens,
           geometry.attentionQueryHeads, geometry.kvLayout, lanes);
+      // This draft graph is deliberately single-lane: its params and row
+      // tensors use batch 0, while `draftLane` may be any request in the outer
+      // batch. Reorder the bound page-table views so the kernel's batch-0
+      // lookup resolves to this draft's request rather than outer lane 0.
+      auto draftPageTables = buffers.pageTables;
+      draftPageTables[0] = buffers.pageTables[draftLane];
       ops::PagedAttention::addVerify(
           a, kvLayers[kvIndex],
           {buffers.chunkKeys[kvIndex], buffers.chunkValues[kvIndex],
            buffers.fullQueries, buffers.attentionPartials,
-           buffers.attentionStatistics, buffers.fullAttention, buffers.pageTables},
+           buffers.attentionStatistics, buffers.fullAttention, draftPageTables},
           q8m, vm, plan);
       // Only the anchor row (`live - 1`) produces the next draft token; rows
       // 0..live-2 only needed their KV entries stored above. Narrow the
@@ -2978,12 +2997,11 @@ void Qwen4ExpTarget::addVerify(
       }
       float keptSum = 0.0f;
       for (uint32_t i = 0; i < kept; ++i) keptSum += q[i];
-      static std::mt19937 random(20260922);
       for (uint32_t i = 0; i < kept; ++i) {
         lastCandidates[i] = ids[i];
         lastProbabilities[i] = q[i] / keptSum;
       }
-      float draw = std::uniform_real_distribution<float>(0.0f, 1.0f)(random);
+      float draw = drawDraftToken(position + live - 1);
       for (uint32_t i = 0; i + 1 < kept; ++i) {
         if (draw < lastProbabilities[i]) return ids[i];
         draw -= lastProbabilities[i];

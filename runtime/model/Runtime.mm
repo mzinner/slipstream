@@ -1193,6 +1193,11 @@ struct Runtime::Impl {
         buffers.mtp[lane].temperature = requestEntry.sampling.temperature;
         buffers.mtp[lane].topP = requestEntry.sampling.topP;
         buffers.mtp[lane].topK = requestEntry.sampling.topK;
+        // Draft draws are keyed by the request's seed, not by a shared RNG, so
+        // a lane's proposals do not depend on which requests share the batch.
+        // This does not make seeded output reproducible: the target's own
+        // draws still follow KV page reuse and batch shape.
+        buffers.mtp[lane].seed = requestEntry.sampling.seed;
       }
     }
     buffers.promptLookup = &laneEntry(entries, 0).promptLookup;

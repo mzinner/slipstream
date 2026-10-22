@@ -292,6 +292,9 @@ struct QwenMtpLane final {
   float temperature = 0.0f;
   float topP = 1.0f;
   uint32_t topK = 0;
+  // The request's seed. Sampled draft proposals are drawn from a stream keyed
+  // by it, so a lane's drafts never depend on how steps or lanes interleave.
+  uint64_t seed = 0;
 };
 
 struct QwenTargetVerifyBuffers final {
