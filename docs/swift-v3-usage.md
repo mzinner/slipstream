@@ -111,6 +111,11 @@ Three equivalent ways to point at a model (`install/launcher.py` `serve()`):
 Model id the server advertises is `local/<dir-name>` — `local/swift-qwen38-flash-next-v3`
 for the Swift dir. The server speaks OpenAI **and** Anthropic APIs on that port.
 
+Note `<dir-name>` is the directory you pass, not the model: `--model …/swift-qwen38-flash-next-v3`
+serves `local/swift-qwen38-flash-next-v3`, while `--model …/swift-qwen38-flash-next-v3/prepared`
+serves `local/prepared`. Clients that pin a model id (Zed, pi, omp) get a
+`404 model … not found` if these disagree — check `curl -s localhost:8090/v1/models`.
+
 `--max-memory`, `--max-context`, `--api-key`, `--no-webui`, `--allowed-host`,
 `--max-image-pixels` are the other real `serve` flags. Env knobs that matter
 (`SPLASH_` prefix, all optional, output-identical):
@@ -118,6 +123,7 @@ for the Swift dir. The server speaks OpenAI **and** Anthropic APIs on that port.
 | Setting | Default | Effect |
 |---|---|---|
 | `SPLASH_NO_MTP=1` | off | Disable the MTP draft head: one token per step, much slower. Use this to measure what Swift's sparsity alone buys |
+| `SPLASH_MTP_BATCH=0` | on in `slipstream serve` | Per-lane drafting inside a batched decode step. On by default when served through the launcher (+31.7% throughput and lower p99 per-token latency at width 2; same greedy text as drafting-off for a fixed batch shape). Set `0` to fall back to single-chain drafting, e.g. to A/B it |
 | `SPLASH_EXPERT_CACHE_GIB` | 32 | Experts kept in RAM; the rest stream from SSD. Set `30` if you skip the sudo step |
 | `SPLASH_MTP_CHAIN_MIN` | `0.35` | Stop drafting when proposal confidence drops below this |
 | `SPLASH_LOOKAHEAD_EXPERTS` | `6` | Experts per row read ahead from a prediction (5–8 tie) |

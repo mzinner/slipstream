@@ -230,6 +230,11 @@ def serve(args):
         environment = dict(
             os.environ, PYTHONUNBUFFERED="1", TRANSFORMERS_VERBOSITY="error"
         )
+        # Served batches draft per lane (SPLASH_MTP_BATCH): measured +31.7%
+        # throughput with lower p99 per-token latency at width 2, and identical
+        # greedy text to drafting-off for a fixed batch shape. An explicit
+        # setting still wins, including "0" to turn it off.
+        environment.setdefault("SPLASH_MTP_BATCH", "1")
         if args.api_key is not None:
             environment["SLIPSTREAM_V2_API_KEY"] = args.api_key
             environment["SLIPSTREAM_API_KEY"] = args.api_key
