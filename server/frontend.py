@@ -6,6 +6,7 @@ import json
 import secrets
 import threading
 import time
+from bisect import bisect_left
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -66,12 +67,13 @@ MIN_FLOAT32_SUBNORMAL = float.fromhex("0x1p-149")
 
 
 RESPONSE_STORE_BUDGET_BYTES = 64 * 1024 * 1024
+# Each chat message begins with this special token in the model's template.
+MESSAGE_START = "<|im_start|>"
 
 
 def _thinking_from_prefix(rendered):
-    marker = "<|im_start|>"
-    start = rendered.rfind(marker)
-    prefix = rendered[start + len(marker) :] if start >= 0 else ""
+    start = rendered.rfind(MESSAGE_START)
+    prefix = rendered[start + len(MESSAGE_START) :] if start >= 0 else ""
     if not prefix.startswith("assistant\n") or "<|im_end|>" in prefix:
         raise APIError(
             400, "chat template must end with an assistant generation prefix"
@@ -160,6 +162,24 @@ class ResponseStore:
             }
 
 
+def _special_token_id(tokenizer, token):
+    """The id of a special token, or None when the tokenizer has none."""
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if convert is None:
+        return None
+    token_id = convert(token)
+    if token_id is None or token_id == getattr(tokenizer, "unk_token_id", None):
+        return None
+    return token_id
+
+
+def _last_request_message(body):
+    """The last message as the client sent it: the frontend joins content
+    parts into one string before rendering, and the hints need the parts."""
+    messages = body.get("messages") if isinstance(body, dict) else None
+    return messages[-1] if isinstance(messages, list) and messages else None
+
+
 @dataclass
 class Prompt:
     messages: list
@@ -194,6 +214,7 @@ class Frontend:
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
             raise ValueError("frontend preparation capacity must be positive")
         self.tokenizer = tokenizer
+        self.message_start_token = _special_token_id(tokenizer, MESSAGE_START)
         self.backend = backend
         self.model = model
         self.max_context = max_context
@@ -241,6 +262,75 @@ class Frontend:
             deadline = self.request_deadline(body)
         with self._preparation(deadline):
             return self._prepare(body, tool_namespaces, deadline, clamp_output_budget)
+
+    # Content parts of the last message to hint, counted from its end.
+    HINTED_LAST_PARTS = 2
+
+    def state_hints(self, tokens, text=None, last_message=None):
+        """Where the engine should keep the state, so a later prompt that
+        shares everything before a point and differs after it resumes there.
+        The first hint ends the system prompt and tools, which a new
+        conversation or a side agent on the same setup shares; the engine
+        keeps it ahead of other states. The others mark where the last
+        message and its final content parts begin: a new question in the same
+        conversation, often after reminders the client puts first. The end of
+        each prompt is kept anyway."""
+        if self.message_start_token is None:
+            return ()
+        starts = [
+            i for i, token in enumerate(tokens) if token == self.message_start_token
+        ]
+        if len(starts) < 2:
+            return ()
+        hints = {starts[1]}
+        # The final start opens the reply being generated.
+        if len(starts) >= 3:
+            hints.add(starts[-2])
+            hints.update(self._part_hints(starts[-2], text, last_message))
+        return tuple(sorted(hints))
+
+    def _part_hints(self, message_token, text, message):
+        """Token positions where the last message's final content parts begin.
+        Only that message is tokenized again: it opens with a special token,
+        so its tokens line up with the whole prompt's."""
+        parts = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(parts, list) or len(parts) < 2 or not isinstance(text, str):
+            return ()
+        # The last message opens at the second-to-last start; the last opens
+        # the reply.
+        opening = text.rfind(MESSAGE_START, 0, text.rfind(MESSAGE_START))
+        if opening < 0:
+            return ()
+        segment = text[opening:]
+        chars, at = [], 0
+        # The first part begins with the message, which is hinted already.
+        for index, part in enumerate(parts):
+            needle = part.get("text") if isinstance(part, dict) else None
+            if not isinstance(needle, str) or not needle.strip():
+                continue
+            found = segment.find(needle[:200].strip(), at)
+            if found < 0:
+                continue
+            if index:
+                chars.append(found)
+            at = found + 1
+        chars = chars[-self.HINTED_LAST_PARTS :]
+        if not chars:
+            return ()
+        try:
+            offsets = self.tokenizer(
+                segment, add_special_tokens=False, return_offsets_mapping=True
+            )["offset_mapping"]
+        except (TypeError, KeyError, ValueError, NotImplementedError):
+            # Python (slow) tokenizers raise NotImplementedError for offsets.
+            return ()
+        begins = [begin for begin, _ in offsets]
+        hints = []
+        for char in chars:
+            index = bisect_left(begins, char)
+            if 0 < index < len(begins):
+                hints.append(message_token + index)
+        return hints
 
     def count_tokens(self, body, *, deadline=None):
         if deadline is None:
@@ -583,6 +673,9 @@ class Frontend:
         job = Job(
             request_id=request_id,
             prompt_tokens=prompt_tokens,
+            state_hints=self.state_hints(
+                prompt_tokens, rendered.text, _last_request_message(body)
+            ),
             max_new_tokens=max_new,
             seed=seed,
             temperature=temperature,

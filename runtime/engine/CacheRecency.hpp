@@ -21,6 +21,8 @@ private:
 struct CacheEvictionCandidate final {
   uint64_t id = 0;
   uint64_t lastUsed = 0;
+  // A state many prompts resume from: evict plain KV before it.
+  bool protectedState = false;
 };
 
 } // namespace splash::engine

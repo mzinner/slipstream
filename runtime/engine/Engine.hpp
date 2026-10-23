@@ -55,6 +55,8 @@ struct EngineSnapshot final {
   uint64_t replayStatePublicationFailures = 0;
   uint64_t junctionMaterializations = 0;
   uint64_t junctionMaterializationFailures = 0;
+  uint64_t hintPublications = 0;
+  uint64_t hintPublicationFailures = 0;
   uint64_t checkpointPublications = 0;
   uint64_t checkpointPublicationFailures = 0;
   uint64_t resourceSuspensions = 0;
@@ -114,7 +116,13 @@ private:
 
   struct Request final {
     struct StateBoundary final {
-      enum class Purpose : uint8_t { Checkpoint, Replay, Junction };
+      // Higher purposes win when two land on the same block. A hint is an
+      // ordinary state where the server says a message part begins; a
+      // boundary (the first hint, where the shared setup ends) is also kept
+      // ahead of other states.
+      enum class Purpose : uint8_t { Checkpoint, Replay, Junction, Hint, Boundary };
+      // Hints closer than this to another planned state are skipped.
+      static constexpr uint32_t kHintSpacingTokens = 4 * KvCache::pageTokens;
       uint32_t tokens = 0;
       Purpose purpose = Purpose::Replay;
     };

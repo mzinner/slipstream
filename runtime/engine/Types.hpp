@@ -35,6 +35,10 @@ struct EngineRequest final {
   ConstraintMode constraint = ConstraintMode::None;
   double deadlineMilliseconds = 0.0;
   bool returnProgress = false;
+  // Ascending prompt positions where its messages begin, from the server.
+  // The state there is kept so later prompts that share the messages before
+  // it, and differ after, resume instead of prefilling from the start.
+  std::vector<uint32_t> stateHints;
 
   [[nodiscard]] ModelRequest modelView() const noexcept {
     return {id, cohort, prompt, maxNewTokens, sampling, constraint};

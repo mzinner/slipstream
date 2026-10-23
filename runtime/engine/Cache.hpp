@@ -67,7 +67,11 @@ enum class CacheReclaimMode { ReuseBacking, ReleaseBacking };
 // composite states. Physical recurrent-state cells remain model-owned.
 class Cache final {
 public:
-  Cache(KvPool &pool, CacheNamespace cacheNamespace);
+  // Boundary states kept ahead of all others (StateCache); enough for the
+  // system prompts of a session and its side agents.
+  static constexpr uint32_t kDefaultBoundaryStates = 4;
+  Cache(KvPool &pool, CacheNamespace cacheNamespace,
+        uint32_t boundaryStates = kDefaultBoundaryStates);
   Cache(const Cache &) = delete;
   Cache &operator=(const Cache &) = delete;
 
@@ -91,10 +95,11 @@ public:
       uint64_t requestId, std::span<const uint32_t> exactTokens,
       uint32_t committedTokens);
   [[nodiscard]] uint64_t blockAt(uint64_t requestId, uint32_t boundary) const;
-  [[nodiscard]] bool reuseCompositeState(uint64_t kvBlock, bool checkpoint = false);
+  [[nodiscard]] bool reuseCompositeState(uint64_t kvBlock,
+                                         StateRole role = StateRole::Ordinary);
   void publishCompositeState(uint64_t kvBlock,
                              std::shared_ptr<const CompositeState> state,
-                             bool checkpoint = false);
+                             StateRole role = StateRole::Ordinary);
   [[nodiscard]] StateCheckpoint checkpointState(uint64_t kvBlock) const noexcept;
   // False only while this exact disposable publication is pinned.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
@@ -113,8 +118,10 @@ public:
   [[nodiscard]] CacheReclaimResult reclaimOne(
       CacheReclaimMode mode = CacheReclaimMode::ReleaseBacking);
   // Recycles an unpinned state, preferring checkpoints, for a required state
-  // publication. KV bytes only return once an extent unmaps.
-  [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false);
+  // publication. KV bytes only return once an extent unmaps. With
+  // spareProtected, a boundary state is never recycled.
+  [[nodiscard]] bool reclaimOneState(bool checkpointsOnly = false,
+                                     bool spareProtected = false);
   // Empty resident backing exists but the previous release is still in
   // flight; more reclaim work becomes possible without evicting anything.
   [[nodiscard]] bool releaseDeferred() const noexcept;

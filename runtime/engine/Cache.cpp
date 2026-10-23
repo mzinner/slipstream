@@ -6,8 +6,9 @@
 
 namespace splash::engine {
 
-Cache::Cache(KvPool &pool, CacheNamespace cacheNamespace)
-    : pool_(pool), kv_(pool, cacheNamespace, recency_), states_(kv_, recency_) {
+Cache::Cache(KvPool &pool, CacheNamespace cacheNamespace, uint32_t boundaryStates)
+    : pool_(pool), kv_(pool, cacheNamespace, recency_),
+      states_(kv_, recency_, boundaryStates) {
 }
 
 void Cache::beginRequest(uint64_t requestId) {
@@ -198,14 +199,14 @@ uint64_t Cache::blockAt(uint64_t requestId, uint32_t boundary) const {
   return active.cachedBlocks[index];
 }
 
-bool Cache::reuseCompositeState(uint64_t kvBlock, bool checkpoint) {
-  return states_.touchIfResident(kvBlock, checkpoint);
+bool Cache::reuseCompositeState(uint64_t kvBlock, StateRole role) {
+  return states_.touchIfResident(kvBlock, role);
 }
 
 void Cache::publishCompositeState(uint64_t kvBlock,
                                   std::shared_ptr<const CompositeState> state,
-                                  bool checkpoint) {
-  states_.publish(kvBlock, std::move(state), checkpoint);
+                                  StateRole role) {
+  states_.publish(kvBlock, std::move(state), role);
 }
 
 StateCheckpoint Cache::checkpointState(uint64_t kvBlock) const noexcept {
@@ -248,7 +249,7 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode) {
       checkpoint ? std::nullopt : oldestStateFreeKvBlock();
   if (!state && !kv)
     return {};
-  if (state && (!kv || state->lastUsed <= kv->lastUsed)) {
+  if (state && (!kv || (!state->protectedState && state->lastUsed <= kv->lastUsed))) {
     const StateEviction eviction = states_.evict(state->id);
     if (!eviction.evicted)
       throw std::logic_error("state eviction candidate became pinned");
@@ -260,10 +261,11 @@ CacheReclaimResult Cache::reclaimOne(CacheReclaimMode mode) {
                     : 0};
 }
 
-bool Cache::reclaimOneState(bool checkpointsOnly) {
+bool Cache::reclaimOneState(bool checkpointsOnly, bool spareProtected) {
   const std::optional<CacheEvictionCandidate> state =
       states_.evictionCandidate();
   return state && (!checkpointsOnly || states_.checkpoint(state->id)) &&
+         (!spareProtected || !state->protectedState) &&
          states_.evict(state->id).evicted;
 }
 

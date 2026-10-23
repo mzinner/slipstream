@@ -21,7 +21,7 @@ std::string_view failureClassName(FailureClass failureClass);
 
 constexpr std::array<uint8_t, 4> kMagic{'S', 'P', 'L', 'H'};
 
-constexpr uint64_t kRequestFixedBytes = 56;
+constexpr uint64_t kRequestFixedBytes = 60;
 constexpr uint64_t kCancelFixedBytes = 8;
 constexpr uint64_t kMaskResponseFixedBytes = 20;
 constexpr uint64_t kStatusRequestFixedBytes = 8;
@@ -374,6 +374,18 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
     return invalid(IssueCode::LimitExceeded,
                    "prompt token count exceeds its limit");
   }
+  if (request.stateHints.size() > limits.maxStateHints) {
+    return invalid(IssueCode::LimitExceeded,
+                   "state hint count exceeds its limit");
+  }
+  for (size_t i = 0; i < request.stateHints.size(); ++i) {
+    if (!request.stateHints[i] ||
+        request.stateHints[i] >= request.promptTokens.size() ||
+        (i && request.stateHints[i] <= request.stateHints[i - 1])) {
+      return invalid(IssueCode::InvalidPayloadLength,
+                     "state hints must ascend within the prompt");
+    }
+  }
   const SamplingParameters &sampling = request.sampling;
   if (!std::isfinite(sampling.temperature) || sampling.temperature < 0.0f ||
       !std::isfinite(sampling.topP) || sampling.topP <= 0.0f ||
@@ -570,8 +582,8 @@ ProtocolResult<Frame> encodeRequest(const RequestFrame &request,
   }
   uint64_t payloadBytes = 0;
   uint64_t tokenBytes = 0;
-  if (!checkedMultiply(request.promptTokens.size(), sizeof(uint32_t),
-                       tokenBytes) ||
+  if (!checkedMultiply(request.promptTokens.size() + request.stateHints.size(),
+                       sizeof(uint32_t), tokenBytes) ||
       !checkedAdd(kRequestFixedBytes, tokenBytes, payloadBytes) ||
       payloadBytes > std::numeric_limits<size_t>::max()) {
     return failure<Frame>(
@@ -592,8 +604,11 @@ ProtocolResult<Frame> encodeRequest(const RequestFrame &request,
   writer.u32(request.sampling.topK);
   writer.u64(request.seed);
   writer.u8(request.returnProgress);
+  writer.u32(static_cast<uint32_t>(request.stateHints.size()));
   for (uint32_t token : request.promptTokens)
     writer.u32(token);
+  for (uint32_t hint : request.stateHints)
+    writer.u32(hint);
   return success(Frame{FrameType::Request, writer.take()});
 }
 
@@ -774,6 +789,7 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
   uint8_t constraint = 0;
   uint8_t returnProgress = 0;
   uint32_t promptCount = 0;
+  uint32_t hintCount = 0;
   if (!reader.u64(request.requestId) || !reader.u8(priority) ||
       !reader.u8(cohort) || !reader.u8(constraint) ||
       !reader.u64(request.absoluteDeadlineUnixMicros) ||
@@ -782,7 +798,7 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
       !reader.f32(request.sampling.temperature) ||
       !reader.f32(request.sampling.topP) ||
       !reader.u32(request.sampling.topK) || !reader.u64(request.seed) ||
-      !reader.u8(returnProgress)) {
+      !reader.u8(returnProgress) || !reader.u32(hintCount)) {
     return failure<Message>(makeIssue(FailureClass::ProtocolFatal,
                                       IssueCode::InvalidPayloadLength, 0,
                                       "request fixed payload is truncated"));
@@ -806,6 +822,17 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
         makeIssue(FailureClass::RequestError, IssueCode::InvalidPayloadLength,
                   request.requestId,
                   "prompt count does not match the binary token payload"));
+  }
+  if (hintCount > limits.maxStateHints) {
+    return failure<Message>(
+        makeIssue(FailureClass::RequestError, IssueCode::LimitExceeded,
+                  request.requestId, "state hint count exceeds its limit"));
+  }
+  if (!reader.words(hintCount, request.stateHints)) {
+    return failure<Message>(
+        makeIssue(FailureClass::RequestError, IssueCode::InvalidPayloadLength,
+                  request.requestId,
+                  "state hint count does not match the payload"));
   }
   if (reader.remaining()) {
     return failure<Message>(

@@ -1,6 +1,7 @@
 #include "TestKvPool.hpp"
 #include "engine/Cache.hpp"
 
+#include <cstdlib>
 #include <array>
 #include <cstdint>
 #include <iostream>
@@ -105,11 +106,13 @@ CacheNamespace cacheNamespace() {
 struct CacheFixture {
   test::TestKvBacking backing{4, 100};
   KvPool pool{backing};
-  engine::Cache cache{pool, cacheNamespace()};
+  engine::Cache cache;
   std::vector<uint32_t> prompt;
   std::vector<uint64_t> blocks;
 
-  CacheFixture() {
+  explicit CacheFixture(
+      uint32_t boundaryStates = engine::Cache::kDefaultBoundaryStates)
+      : cache(pool, cacheNamespace(), boundaryStates) {
     for (uint32_t block = 0; block < 4; ++block) {
       for (uint32_t row = 0; row < KvCache::pageTokens; ++row)
         prompt.push_back(1000 + block * 100 + row);
@@ -124,9 +127,13 @@ struct CacheFixture {
     cache.endRequest(1);
   }
 
-  void publish(uint32_t block, uint64_t bytes = 100) {
+  void publish(uint32_t block, uint64_t bytes = 100,
+               engine::StateRole role = engine::StateRole::Ordinary) {
     cache.publishCompositeState(blocks.at(block),
-                                std::make_shared<TestState>(bytes));
+                                std::make_shared<TestState>(bytes), role);
+  }
+  void publishBoundary(uint32_t block) {
+    publish(block, 100, engine::StateRole::Boundary);
   }
 
   engine::CacheLookup lookup(uint32_t tokens) {
@@ -342,7 +349,7 @@ void testCheckpointLookupProbeDoesNotPromote() {
   CacheFixture fixture;
   const uint64_t block = fixture.blocks[0];
   fixture.cache.publishCompositeState(block, std::make_shared<TestState>(100),
-                                      true);
+                                      engine::StateRole::Checkpoint);
   const StateCheckpoint checkpoint = fixture.cache.checkpointState(block);
   {
     auto probe = fixture.lookup(33);
@@ -360,11 +367,11 @@ void testCheckpointRetirementRespectsUseAndPublicationIdentity() {
   const uint64_t block = fixture.blocks[1];
   const auto publish = [&] {
     fixture.cache.publishCompositeState(block, std::make_shared<TestState>(100),
-                                        true);
+                                        engine::StateRole::Checkpoint);
     return fixture.cache.checkpointState(block);
   };
   const StateCheckpoint first = publish();
-  require(fixture.cache.reuseCompositeState(block, true),
+  require(fixture.cache.reuseCompositeState(block, engine::StateRole::Checkpoint),
           "concurrent progress publication did not deduplicate");
   require(fixture.cache.retireCheckpointState(first) &&
               fixture.cache.snapshot().stateCache.entries == 0,
@@ -408,9 +415,9 @@ void testRestoredCheckpointsKeepTheirEvictionPriority() {
   fixture.publish(0, 150);
   fixture.publish(3, 400);
   fixture.cache.publishCompositeState(fixture.blocks[1],
-                                      std::make_shared<TestState>(200), true);
+                                      std::make_shared<TestState>(200), engine::StateRole::Checkpoint);
   fixture.cache.publishCompositeState(fixture.blocks[2],
-                                      std::make_shared<TestState>(300), true);
+                                      std::make_shared<TestState>(300), engine::StateRole::Checkpoint);
   {
     auto lookup = fixture.lookup(65);
     fixture.cache.beginRequest(2);
@@ -434,11 +441,81 @@ void testRestoredCheckpointsKeepTheirEvictionPriority() {
           "pressure eviction was counted as rolling retirement");
 }
 
+// States where a prompt's messages begin outlive ordinary states, however
+// old, up to a capped number; past the cap the least recently used boundary
+// becomes ordinary again.
+void testBoundaryStatesOutliveOrdinaryStates() {
+  {
+    CacheFixture fixture(2);
+    fixture.publishBoundary(0);
+    fixture.publish(1);
+    fixture.publish(2);
+    require(fixture.cache.reclaimOneState() && fixture.cache.reclaimOneState() &&
+                fixture.lookup(33).resumeBoundary() == 32 &&
+                fixture.lookup(65).resumeBoundary() == 32,
+            "ordinary states did not go before an older boundary state");
+    require(fixture.cache.reclaimOneState() &&
+                fixture.lookup(33).resumeBoundary() == 0,
+            "the boundary state was not evicted last");
+  }
+  {
+    CacheFixture fixture(2);
+    for (uint32_t block = 0; block < 3; ++block)
+      fixture.publishBoundary(block);
+    auto snapshot = fixture.cache.snapshot().stateCache;
+    require(snapshot.boundaryEntries == 2 && snapshot.boundaryCapacity == 2 &&
+                snapshot.boundaryDemotions == 1,
+            "publishing past the cap did not demote the oldest boundary");
+    require(fixture.cache.reclaimOneState() &&
+                fixture.lookup(33).resumeBoundary() == 0 &&
+                fixture.lookup(65).resumeBoundary() == 64,
+            "the demoted boundary was not evicted first");
+    fixture.publish(3);
+    require(fixture.cache.reuseCompositeState(fixture.blocks[3],
+                                              engine::StateRole::Boundary),
+            "reuse did not find the published state");
+    snapshot = fixture.cache.snapshot().stateCache;
+    require(snapshot.boundaryEntries == 2 && snapshot.boundaryDemotions == 2,
+            "reuse as a boundary did not upgrade the state within the cap");
+  }
+}
+
+// A hint state starts as the oldest ordinary state, so it goes before older
+// end-of-turn states unless a later prompt resumes from it.
+void testHintStatesStartColdUntilReused() {
+  {
+    CacheFixture fixture;
+    fixture.publish(0);
+    fixture.publish(1);
+    fixture.publish(2, 100, engine::StateRole::Hint);
+    require(fixture.cache.reclaimOneState() &&
+                fixture.lookup(97).resumeBoundary() == 64,
+            "a new hint state was not evicted before older ordinary states");
+  }
+  {
+    CacheFixture fixture;
+    fixture.publish(0);
+    fixture.publish(2, 100, engine::StateRole::Hint);
+    fixture.publish(1);
+    {
+      auto lookup = fixture.lookup(97);
+      require(lookup.resumeBoundary() == 96, "the hint state was not found");
+      fixture.cache.beginRequest(2);
+      fixture.cache.restoreRequest(2, lookup);
+      fixture.cache.endRequest(2);
+    }
+    require(fixture.cache.reclaimOneState() &&
+                fixture.lookup(97).resumeBoundary() == 96 &&
+                fixture.lookup(33).resumeBoundary() == 0,
+            "a reused hint state did not become ordinary");
+  }
+}
+
 void testCheckpointReclaimPrecedesOlderKv() {
   CacheFixture fixture;
   fixture.publish(0, 150);
   fixture.cache.publishCompositeState(fixture.blocks[2],
-                                      std::make_shared<TestState>(200), true);
+                                      std::make_shared<TestState>(200), engine::StateRole::Checkpoint);
   const auto reclaimed = fixture.cache.reclaimOne();
   require(reclaimed.madeProgress && reclaimed.reclaimedBytes == 200 &&
               fixture.cache.snapshot().kvCache.blocks == 4 &&
@@ -453,7 +530,7 @@ void testOptionalReclaimLeavesOrdinaryStateIntact() {
   CacheFixture fixture;
   fixture.publish(0, 150);
   fixture.cache.publishCompositeState(fixture.blocks[2],
-                                      std::make_shared<TestState>(200), true);
+                                      std::make_shared<TestState>(200), engine::StateRole::Checkpoint);
   require(fixture.cache.reclaimOneState(true) &&
               fixture.cache.snapshot().stateCache.checkpointEntries == 0 &&
               fixture.lookup(33).resumeBoundary() == 32,
@@ -468,9 +545,9 @@ void testCheckpointPinsAndBoundaryUpgrade() {
   fixture.publish(0, 100);
   fixture.publish(3, 400);
   fixture.cache.publishCompositeState(fixture.blocks[1],
-                                      std::make_shared<TestState>(200), true);
+                                      std::make_shared<TestState>(200), engine::StateRole::Checkpoint);
   fixture.cache.publishCompositeState(fixture.blocks[2],
-                                      std::make_shared<TestState>(300), true);
+                                      std::make_shared<TestState>(300), engine::StateRole::Checkpoint);
   const auto checkpoint = fixture.cache.checkpointState(fixture.blocks[1]);
   auto first = fixture.lookup(65);
   auto second = fixture.lookup(97);
@@ -493,7 +570,8 @@ void testCheckpointPinsAndBoundaryUpgrade() {
               fixture.cache.lookup(fixture.prompt).resumeBoundary() == 64,
           "upgraded checkpoint did not join ordinary LRU");
 
-  require(fixture.cache.reuseCompositeState(fixture.blocks[1], true) &&
+  require(fixture.cache.reuseCompositeState(fixture.blocks[1],
+                                              engine::StateRole::Checkpoint) &&
               !fixture.cache.checkpointState(fixture.blocks[1]),
           "optional publication downgraded an ordinary boundary");
 }
@@ -522,7 +600,7 @@ void testCheckpointPressurePreservesHotPrefix() {
   require(cache.ensureTokens(3, 32).granted(), "cold KV admission failed");
   const uint64_t coldBlock = cache.publishCommittedBlocks(3, cold, 32);
   cache.publishCompositeState(coldBlock, std::make_shared<BudgetState>(budget),
-                              true);
+                              engine::StateRole::Checkpoint);
   require(budget.used == SharedBudget::capacity,
           "checkpoint did not fill the shared allocation budget");
   const TokenAdmission denied = cache.ensureTokens(3, 64);
@@ -540,7 +618,7 @@ void testCheckpointPressurePreservesHotPrefix() {
 void testLogicalKvPressureStillReclaimsPages() {
   CacheFixture fixture;
   fixture.cache.publishCompositeState(fixture.blocks[0],
-                                      std::make_shared<TestState>(200), true);
+                                      std::make_shared<TestState>(200), engine::StateRole::Checkpoint);
   fixture.cache.beginRequest(2);
   require(fixture.cache.ensureTokens(2, 32).granted() &&
               fixture.cache.snapshot().kvCache.blocks == 3 &&
@@ -570,6 +648,8 @@ int main() {
     testDuplicateProbePromotesStateWithoutLookupAccounting();
     testUnifiedRecencyAndPhysicalReclaimAccounting();
     testFinishedRequestLeavesTailKvBeforeItsState();
+    testBoundaryStatesOutliveOrdinaryStates();
+    testHintStatesStartColdUntilReused();
     std::cout << "KV-first cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {

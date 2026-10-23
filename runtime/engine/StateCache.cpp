@@ -75,24 +75,72 @@ std::optional<CompositeStateLease> StateCache::acquireBlock(uint64_t kvBlock) {
   return CompositeStateLease(*this, kvBlock, boundary, entry.state);
 }
 
-bool StateCache::touchIfResident(uint64_t kvBlock, bool checkpoint) {
+StateCache::EvictionQueue &StateCache::queueOf(const Entry &entry) noexcept {
+  switch (entry.role) {
+  case StateRole::Checkpoint:
+    return checkpointEviction_;
+  case StateRole::Boundary:
+    return boundaryEviction_;
+  case StateRole::Ordinary:
+  case StateRole::Hint:
+    break;
+  }
+  return ordinaryEviction_;
+}
+
+void StateCache::setRole(uint64_t kvBlock, StateRole role) noexcept {
+  Entry &entry = entries_.at(kvBlock);
+  if (entry.role == role)
+    return;
+  const bool evictable = entry.evictable;
+  if (evictable)
+    removeEvictable(kvBlock);
+  const uint64_t bytes = entry.state->bytes();
+  if (entry.role == StateRole::Checkpoint) {
+    --checkpointEntries_;
+    checkpointBytes_ -= bytes;
+  } else if (entry.role == StateRole::Boundary) {
+    --boundaryEntries_;
+  }
+  entry.role = role;
+  if (role == StateRole::Checkpoint) {
+    ++checkpointEntries_;
+    checkpointBytes_ += bytes;
+  } else if (role == StateRole::Boundary) {
+    ++boundaryEntries_;
+  }
+  if (evictable)
+    insertEvictable(kvBlock);
+}
+
+bool StateCache::reserveBoundary() noexcept {
+  if (!boundaryCapacity_)
+    return false;
+  if (boundaryEntries_ < boundaryCapacity_)
+    return true;
+  const uint64_t oldest = boundaryEviction_.oldest;
+  if (!oldest)
+    return false;
+  setRole(oldest, StateRole::Ordinary);
+  ++boundaryDemotions_;
+  return true;
+}
+
+bool StateCache::touchIfResident(uint64_t kvBlock, StateRole role) {
   auto found = entries_.find(kvBlock);
   if (found == entries_.end())
     return false;
   if (!kv_.contains(kvBlock)) {
     throw std::logic_error("composite state outlived its target KV block");
   }
-  Entry &entry = found->second;
-  const bool evictable = entry.evictable;
-  if (evictable)
-    removeEvictable(kvBlock);
-  if (!checkpoint && entry.checkpoint) {
-    --checkpointEntries_;
-    checkpointBytes_ -= entry.state->bytes();
-    entry.checkpoint = false;
-  }
-  if (evictable)
-    insertEvictable(kvBlock);
+  const StateRole current = found->second.role;
+  if (role == StateRole::Boundary && current != StateRole::Boundary &&
+      reserveBoundary())
+    setRole(kvBlock, StateRole::Boundary);
+  else if (current == StateRole::Checkpoint && role != StateRole::Checkpoint)
+    setRole(kvBlock, StateRole::Ordinary);
+  else
+    touch(kvBlock);
   ++deduplicatedPublications_;
   return true;
 }
@@ -107,7 +155,7 @@ void StateCache::touch(uint64_t kvBlock) noexcept {
 
 void StateCache::publish(uint64_t kvBlock,
                          std::shared_ptr<const CompositeState> state,
-                         bool checkpoint) {
+                         StateRole role) {
   if (!state || !state->bytes()) {
     throw std::invalid_argument("composite state payload is empty");
   }
@@ -124,29 +172,33 @@ void StateCache::publish(uint64_t kvBlock,
   Entry entry;
   entry.publication = publications_ + 1;
   entry.state = std::move(state);
-  entry.checkpoint = checkpoint;
-  auto [_, inserted] = entries_.emplace(kvBlock, std::move(entry));
-  if (!inserted)
+  if (entries_.contains(kvBlock))
     throw std::logic_error("duplicate composite state key");
+  if (role == StateRole::Boundary && !reserveBoundary())
+    role = StateRole::Ordinary;
+  entry.role = role;
+  entries_.emplace(kvBlock, std::move(entry));
   bytes_ += stateBytes;
-  if (checkpoint) {
+  if (role == StateRole::Checkpoint) {
     ++checkpointEntries_;
     checkpointBytes_ += stateBytes;
+  } else if (role == StateRole::Boundary) {
+    ++boundaryEntries_;
   }
-  insertEvictable(kvBlock);
+  insertEvictable(kvBlock, role == StateRole::Hint);
   ++publications_;
 }
 
 StateCheckpoint StateCache::checkpoint(uint64_t kvBlock) const noexcept {
   const auto found = entries_.find(kvBlock);
-  if (found == entries_.end() || !found->second.checkpoint)
+  if (found == entries_.end() || found->second.role != StateRole::Checkpoint)
     return {};
   return {kvBlock, found->second.publication};
 }
 
 bool StateCache::retireCheckpoint(StateCheckpoint checkpoint) noexcept {
   const auto found = entries_.find(checkpoint.kvBlock);
-  if (found == entries_.end() || !found->second.checkpoint ||
+  if (found == entries_.end() || found->second.role != StateRole::Checkpoint ||
       found->second.publication != checkpoint.publication)
     return true;
   return erase(checkpoint.kvBlock, true).evicted;
@@ -158,12 +210,14 @@ bool StateCache::contains(uint64_t kvBlock) const noexcept {
 
 std::optional<CacheEvictionCandidate>
 StateCache::evictionCandidate() const noexcept {
-  const uint64_t oldest = checkpointEviction_.oldest
-                              ? checkpointEviction_.oldest
-                              : ordinaryEviction_.oldest;
+  const uint64_t oldest = checkpointEviction_.oldest ? checkpointEviction_.oldest
+                          : ordinaryEviction_.oldest ? ordinaryEviction_.oldest
+                                                     : boundaryEviction_.oldest;
   if (!oldest)
     return std::nullopt;
-  return CacheEvictionCandidate{oldest, entries_.at(oldest).lastUsed};
+  const Entry &entry = entries_.at(oldest);
+  return CacheEvictionCandidate{oldest, entry.lastUsed,
+                                entry.role == StateRole::Boundary};
 }
 
 StateEviction StateCache::evict(uint64_t kvBlock) noexcept {
@@ -176,11 +230,13 @@ StateEviction StateCache::erase(uint64_t kvBlock, bool retirement) noexcept {
     return {};
   const uint64_t reclaimed = found->second.state->bytes();
   removeEvictable(kvBlock);
-  if (found->second.checkpoint) {
+  if (found->second.role == StateRole::Checkpoint) {
     --checkpointEntries_;
     checkpointBytes_ -= reclaimed;
     if (!retirement)
       ++checkpointEvictions_;
+  } else if (found->second.role == StateRole::Boundary) {
+    --boundaryEntries_;
   }
   bytes_ -= reclaimed;
   entries_.erase(found);
@@ -207,6 +263,9 @@ StateCacheSnapshot StateCache::snapshot() const noexcept {
   result.checkpointBytes = checkpointBytes_;
   result.checkpointRetirements = checkpointRetirements_;
   result.checkpointEvictions = checkpointEvictions_;
+  result.boundaryEntries = boundaryEntries_;
+  result.boundaryCapacity = boundaryCapacity_;
+  result.boundaryDemotions = boundaryDemotions_;
   return result;
 }
 
@@ -224,16 +283,24 @@ void StateCache::release(uint64_t kvBlock) noexcept {
   kv_.releaseActive(kvBlock);
 }
 
-void StateCache::insertEvictable(uint64_t kvBlock) noexcept {
+void StateCache::insertEvictable(uint64_t kvBlock, bool coldest) noexcept {
   Entry &entry = entries_.at(kvBlock);
   if (entry.evictable || entry.pins)
     std::terminate();
-  EvictionQueue &queue =
-      entry.checkpoint ? checkpointEviction_ : ordinaryEviction_;
+  EvictionQueue &queue = queueOf(entry);
+  entry.evictable = true;
+  if (coldest && queue.oldest) {
+    Entry &oldest = entries_.at(queue.oldest);
+    entry.lastUsed = oldest.lastUsed;
+    entry.previousEvictable = 0;
+    entry.nextEvictable = queue.oldest;
+    oldest.previousEvictable = kvBlock;
+    queue.oldest = kvBlock;
+    return;
+  }
   entry.previousEvictable = queue.newest;
   entry.nextEvictable = 0;
   entry.lastUsed = recency_.next();
-  entry.evictable = true;
   if (queue.newest)
     entries_.at(queue.newest).nextEvictable = kvBlock;
   else
@@ -245,8 +312,7 @@ void StateCache::removeEvictable(uint64_t kvBlock) noexcept {
   Entry &entry = entries_.at(kvBlock);
   if (!entry.evictable)
     std::terminate();
-  EvictionQueue &queue =
-      entry.checkpoint ? checkpointEviction_ : ordinaryEviction_;
+  EvictionQueue &queue = queueOf(entry);
   if (entry.previousEvictable)
     entries_.at(entry.previousEvictable).nextEvictable = entry.nextEvictable;
   else

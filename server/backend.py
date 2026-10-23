@@ -109,6 +109,8 @@ class Job:
     response_previous_id: str | None = None
     response_history_items: list | None = None
     return_progress: bool = False
+    # Prompt positions where the engine keeps the state (Frontend.state_hints).
+    state_hints: tuple = ()
 
 
 class CallbackStreamer:
@@ -446,6 +448,7 @@ class NativeBackend:
             constraint = wire.ConstraintMode.NONE
         return engine_runtime.GenerationRequest(
             prompt_tokens=tuple(job.prompt_tokens),
+            state_hints=tuple(job.state_hints),
             logical_max_output_tokens=job.max_new_tokens,
             deadline=self._deadline(job),
             priority=priority,

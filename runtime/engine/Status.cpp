@@ -185,7 +185,10 @@ std::string runtimeStatusJson(
       << ",\"checkpoint_entries\":" << state.checkpointEntries
       << ",\"checkpoint_bytes\":" << state.checkpointBytes
       << ",\"checkpoint_evictions\":" << state.checkpointEvictions
-      << ",\"checkpoint_retirements\":" << state.checkpointRetirements << "}"
+      << ",\"checkpoint_retirements\":" << state.checkpointRetirements
+      << ",\"boundary_entries\":" << state.boundaryEntries
+      << ",\"boundary_capacity\":" << state.boundaryCapacity
+      << ",\"boundary_demotions\":" << state.boundaryDemotions << "}"
       << ",\"cache\":{\"lookups\":" << lookup.lookups
       << ",\"hits\":" << core.cacheHits
       << ",\"cold_misses\":" << core.coldMisses << ",\"hit_rate\":" << hitRate
@@ -206,6 +209,8 @@ std::string runtimeStatusJson(
       << ",\"checkpoint_publications\":" << core.checkpointPublications
       << ",\"checkpoint_publication_failures\":"
       << core.checkpointPublicationFailures
+      << ",\"hint_publications\":" << core.hintPublications
+      << ",\"hint_publication_failures\":" << core.hintPublicationFailures
       << ",\"resource_suspensions\":" << core.resourceSuspensions
       << ",\"resource_resumptions\":" << core.resourceResumptions
       << ",\"resource_replay_tokens\":" << core.resourceReplayTokens << "}"

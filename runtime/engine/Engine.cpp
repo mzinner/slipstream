@@ -477,6 +477,38 @@ void Engine::configureStateBoundaries(Request &active, uint32_t stateBoundary,
   }
   addCandidate(junctionBoundary, Request::StateBoundary::Purpose::Junction);
   addCandidate(latestReplayBoundary, Request::StateBoundary::Purpose::Replay);
+  // The server's hints, at the KV block they fall in. The first ends the
+  // setup other conversations share, so it is kept as a boundary. The others
+  // are skipped near another planned state, the end of the prompt included:
+  // a near-duplicate costs a snapshot, a cache entry and a short prefill
+  // command, and saves almost nothing.
+  const std::vector<uint32_t> &hints = active.request.stateHints;
+  // The restored state counts as planned; rolling checkpoints do not, since
+  // they are retired once the next one is published.
+  const auto nearPlanned = [&](uint32_t block) {
+    constexpr uint32_t spacing = Request::StateBoundary::kHintSpacingTokens;
+    if (latestReplayBoundary - block < spacing ||
+        (block > stateBoundary && block - stateBoundary < spacing))
+      return true;
+    return std::any_of(active.stateBoundaries.begin(),
+                       active.stateBoundaries.end(),
+                       [&](const Request::StateBoundary &planned) {
+                         return planned.purpose !=
+                                    Request::StateBoundary::Purpose::Checkpoint &&
+                                std::max(planned.tokens, block) -
+                                        std::min(planned.tokens, block) <
+                                    spacing;
+                       });
+  };
+  for (size_t i = 0; i < hints.size(); ++i) {
+    const uint32_t block = hints[i] / KvCache::pageTokens * KvCache::pageTokens;
+    if (block >= latestReplayBoundary)
+      continue;
+    if (!i)
+      addCandidate(block, Request::StateBoundary::Purpose::Boundary);
+    else if (!nearPlanned(block))
+      addCandidate(block, Request::StateBoundary::Purpose::Hint);
+  }
   std::sort(active.stateBoundaries.begin(), active.stateBoundaries.end(),
             [](const Request::StateBoundary &left,
                const Request::StateBoundary &right) {
@@ -531,16 +563,32 @@ void Engine::publishReachedStateBoundaries(Request &active,
              promptProcessed) {
     const Request::StateBoundary objective =
         active.stateBoundaries[active.stateBoundaryCursor++];
-    const bool checkpoint =
-        objective.purpose == Request::StateBoundary::Purpose::Checkpoint;
-    const bool junction =
-        objective.purpose == Request::StateBoundary::Purpose::Junction;
-    uint64_t &failures = checkpoint ? counters_.checkpointPublicationFailures
-                         : junction ? counters_.junctionMaterializationFailures
-                                    : counters_.replayStatePublicationFailures;
-    uint64_t &publications = checkpoint ? counters_.checkpointPublications
-                             : junction ? counters_.junctionMaterializations
-                                        : counters_.replayStatePublications;
+    using Purpose = Request::StateBoundary::Purpose;
+    const bool checkpoint = objective.purpose == Purpose::Checkpoint;
+    const StateRole role = checkpoint ? StateRole::Checkpoint
+                           : objective.purpose == Purpose::Boundary ? StateRole::Boundary
+                           : objective.purpose == Purpose::Hint     ? StateRole::Hint
+                                                                    : StateRole::Ordinary;
+    const auto [publicationCounter, failureCounter] =
+        [&]() -> std::pair<uint64_t *, uint64_t *> {
+      switch (objective.purpose) {
+      case Purpose::Checkpoint:
+        return {&counters_.checkpointPublications,
+                &counters_.checkpointPublicationFailures};
+      case Purpose::Junction:
+        return {&counters_.junctionMaterializations,
+                &counters_.junctionMaterializationFailures};
+      case Purpose::Hint:
+      case Purpose::Boundary:
+        return {&counters_.hintPublications, &counters_.hintPublicationFailures};
+      case Purpose::Replay:
+        break;
+      }
+      return {&counters_.replayStatePublications,
+              &counters_.replayStatePublicationFailures};
+    }();
+    uint64_t &publications = *publicationCounter;
+    uint64_t &failures = *failureCounter;
     // The scheduler ends a command exactly at an armed boundary; a boundary
     // passed inside a command has no materialized state to copy.
     if (objective.tokens != promptProcessed) {
@@ -549,7 +597,7 @@ void Engine::publishReachedStateBoundaries(Request &active,
     }
     try {
       const uint64_t block = cache_.blockAt(active.request.id, objective.tokens);
-      if (cache_.reuseCompositeState(block, checkpoint)) {
+      if (cache_.reuseCompositeState(block, role)) {
         ++counters_.deduplicatedStatePublications;
       } else {
         // Recycle the previous recovery point before allocating its replacement.
@@ -560,7 +608,9 @@ void Engine::publishReachedStateBoundaries(Request &active,
         }
         std::shared_ptr<const CompositeState> state =
             model_.snapshot(active.request.id);
-        if (!state && cache_.reclaimOneState(checkpoint)) {
+        // A speculative hint never recycles a boundary state.
+        if (!state &&
+            cache_.reclaimOneState(checkpoint, role == StateRole::Hint)) {
           state = model_.snapshot(active.request.id);
           if (state)
             ++counters_.recycledStatePublications;
@@ -569,7 +619,7 @@ void Engine::publishReachedStateBoundaries(Request &active,
           ++failures;
           continue;
         }
-        cache_.publishCompositeState(block, std::move(state), checkpoint);
+        cache_.publishCompositeState(block, std::move(state), role);
         ++publications;
       }
       if (active.latestCheckpoint.kvBlock != block)

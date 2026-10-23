@@ -123,6 +123,7 @@ RequestFrame exampleRequest() {
   request.seed = 0xfedcba9876543210ULL;
   request.cohort = Cohort::Constrained;
   request.constraint = ConstraintMode::TokenMask;
+  request.stateHints = {1, 3};
   return request;
 }
 
@@ -135,23 +136,36 @@ void testRequestWireAndRoundTrip() {
     return;
   const auto &wire = *serialized.value;
 
-  CHECK(test, wire.size() ==
-                  kFrameHeaderBytes + 56 + request.promptTokens.size() * 4);
+  const size_t words = request.promptTokens.size() + request.stateHints.size();
+  CHECK(test, wire.size() == kFrameHeaderBytes + 60 + words * 4);
   CHECK(test, std::string(wire.begin(), wire.begin() + 4) == "SPLH");
   CHECK(test, loadU16(wire, 4) == kProtocolVersion);
   CHECK(test, loadU16(wire, 6) == kFrameHeaderBytes);
   CHECK(test, loadU16(wire, 8) == static_cast<uint16_t>(FrameType::Request));
   CHECK(test, loadU16(wire, 10) == 0);
-  CHECK(test, loadU64(wire, 12) == 56 + request.promptTokens.size() * 4);
+  CHECK(test, loadU64(wire, 12) == 60 + words * 4);
   CHECK(test, loadU32(wire, 20) == 0);
   CHECK(test, loadU64(wire, kFrameHeaderBytes) == request.requestId);
   CHECK(test,
         loadU32(wire, kFrameHeaderBytes + 31) == request.promptTokens.size());
-  CHECK(test, loadU32(wire, kFrameHeaderBytes + 56) == 0);
-  CHECK(test, loadU32(wire, kFrameHeaderBytes + 56 + 16) == 0xffffffffU);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 56) == request.stateHints.size());
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 60) == 0);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 60 + 16) == 0xffffffffU);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 60 + 20) == 1);
+  CHECK(test, loadU32(wire, kFrameHeaderBytes + 60 + 24) == 3);
 
   RequestFrame decoded = roundTrip(request);
   CHECK(test, decoded == request);
+
+  // Hints must ascend strictly, start after the first token and stay inside
+  // the prompt.
+  for (const std::vector<uint32_t> &hints :
+       {std::vector<uint32_t>{3, 1}, std::vector<uint32_t>{2, 2},
+        std::vector<uint32_t>{0}, std::vector<uint32_t>{5}}) {
+    RequestFrame invalid = exampleRequest();
+    invalid.stateHints = hints;
+    CHECK(test, !serializeMessage(Message{invalid}));
+  }
 
 }
 
