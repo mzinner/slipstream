@@ -13,7 +13,7 @@
 
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 6;
+inline constexpr uint16_t kProtocolVersion = 7;
 inline constexpr size_t kFrameHeaderBytes = 24;
 inline constexpr uint32_t kStatusSchemaVersion = 5;
 // The largest prompt (1 Mi tokens of 4 bytes) fits with room to spare.
@@ -102,6 +102,7 @@ struct ProtocolLimits {
   uint64_t maxStatusJsonBytes = 32ULL * 1024 * 1024;
   uint64_t maxErrorStringBytes = 1ULL * 1024 * 1024;
   uint32_t maxPromptTokens = 1U << 20;
+  uint32_t maxStateHints = 16;
   uint32_t maxLogicalOutputTokens = 1U << 20;
   uint32_t maxTokenBatch = 4096;
   uint32_t maxSimulationTokens = 32;
@@ -150,6 +151,8 @@ struct RequestFrame {
   Cohort cohort = Cohort::Greedy;
   ConstraintMode constraint = ConstraintMode::None;
   bool returnProgress = false;
+  // Ascending prompt positions where messages begin (EngineRequest::stateHints).
+  std::vector<uint32_t> stateHints;
 
   bool operator==(const RequestFrame &) const = default;
 };

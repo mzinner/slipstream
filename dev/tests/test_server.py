@@ -7010,5 +7010,92 @@ class MessageNormalizationTest(unittest.TestCase):
             )
 
 
+class StateHintTests(unittest.TestCase):
+    """Where the server asks the engine to keep the state: after the system
+    prompt and tools, and where the last message begins."""
+
+    class VocabTokenizer(FakeTokenizer):
+        def convert_tokens_to_ids(self, token):
+            return (
+                7 if token == "<|im_start|>" else super().convert_tokens_to_ids(token)
+            )
+
+    def hints(self, tokens, tokenizer=None):
+        app = request_frontend.Frontend(
+            tokenizer or self.VocabTokenizer(), None, "test-model", 4096, 16, 5, 1
+        )
+        return app.state_hints(tokens)
+
+    def test_system_end_and_last_message_start(self):
+        # system, user, assistant, user, then the reply being generated
+        tokens = [7, 1, 1, 7, 2, 2, 7, 3, 3, 7, 4, 4, 7, 5]
+        self.assertEqual(self.hints(tokens), (3, 9))
+
+    def test_one_message_after_the_system_prompt_gives_one_hint(self):
+        self.assertEqual(self.hints([7, 1, 7, 2, 2, 7, 3]), (2,))
+
+    class CharTokenizer(VocabTokenizer):
+        """One token per character, with <|im_start|> as one special token."""
+
+        START = "<|im_start|>"
+
+        def encode(self, text):
+            ids, offsets, at = [], [], 0
+            while at < len(text):
+                if text.startswith(self.START, at):
+                    ids.append(7)
+                    offsets.append((at, at + len(self.START)))
+                    at += len(self.START)
+                else:
+                    ids.append(1000 + ord(text[at]))
+                    offsets.append((at, at + 1))
+                    at += 1
+            return ids, offsets
+
+        def __call__(self, text, **kwargs):
+            ids, offsets = self.encode(text)
+            result = {"input_ids": ids}
+            if kwargs.get("return_offsets_mapping"):
+                result["offset_mapping"] = offsets
+            return result
+
+    def test_last_message_content_parts_are_hinted(self):
+        tokenizer = self.CharTokenizer()
+        text = (
+            "<|im_start|>system\nrules<|im_start|>user\n"
+            "<reminder>first</reminder>\nWhat is new?\n<reminder>last</reminder>"
+            "<|im_start|>assistant\n"
+        )
+        tokens, _ = tokenizer.encode(text)
+        message = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "<reminder>first</reminder>"},
+                {"type": "text", "text": "What is new?"},
+                {"type": "text", "text": "<reminder>last</reminder>"},
+            ],
+        }
+        app = request_frontend.Frontend(tokenizer, None, "test-model", 4096, 16, 5, 1)
+        starts = [i for i, token in enumerate(tokens) if token == 7]
+        question = starts[1] + len(
+            tokenizer.encode(text[text.index("<|im_start|>user") : text.index("What")])[
+                0
+            ]
+        )
+        reminder = starts[1] + len(
+            tokenizer.encode(
+                text[text.index("<|im_start|>user") : text.index("<reminder>last")]
+            )[0]
+        )
+        self.assertEqual(
+            app.state_hints(tokens, text, message), (starts[1], question, reminder)
+        )
+
+    def test_no_hints_without_message_starts(self):
+        self.assertEqual(self.hints([1, 2, 3]), ())
+        self.assertEqual(self.hints([7, 1, 2]), ())
+        self.assertEqual(self.hints([7, 1, 7, 2], FakeTokenizer()), ())
+
+
 if __name__ == "__main__":
     unittest.main()

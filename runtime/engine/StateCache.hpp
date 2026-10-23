@@ -64,7 +64,17 @@ struct StateCacheSnapshot {
   uint64_t checkpointRetirements = 0;
   // Pressure and logical eviction; rolling retirements are counted separately.
   uint64_t checkpointEvictions = 0;
+  // States at prompt message boundaries, kept ahead of all others.
+  uint32_t boundaryEntries = 0;
+  uint32_t boundaryCapacity = 0;
+  uint64_t boundaryDemotions = 0;
 };
+
+// What a published state is for, which decides when it is evicted:
+// checkpoints first, then ordinary and hint states by recency (a hint, a
+// state the server guessed later prompts may resume from, starts as the
+// oldest until one does), then boundary states.
+enum class StateRole : uint8_t { Ordinary, Checkpoint, Hint, Boundary };
 
 struct StateEviction final {
   bool evicted = false;
@@ -75,7 +85,10 @@ struct StateEviction final {
 // target-KV block. The pair is restored atomically.
 class StateCache final {
 public:
-  StateCache(KvCache &kv, CacheRecency &recency) : kv_(kv), recency_(recency) {}
+  // At most boundaryCapacity boundary states are kept as such; publishing one
+  // more demotes the least recently used to an ordinary state.
+  StateCache(KvCache &kv, CacheRecency &recency, uint32_t boundaryCapacity)
+      : kv_(kv), recency_(recency), boundaryCapacity_(boundaryCapacity) {}
   StateCache(const StateCache &) = delete;
   StateCache &operator=(const StateCache &) = delete;
 
@@ -85,12 +98,13 @@ public:
   void recordLookup(bool hit) noexcept { hit ? ++hits_ : ++misses_; }
 
   // Reuses a published state without a restore pin or lookup accounting.
-  // A normal boundary upgrades a checkpoint; a checkpoint cannot downgrade
-  // an ordinary state. Restoration alone never changes the boundary's role.
-  [[nodiscard]] bool touchIfResident(uint64_t kvBlock, bool checkpoint = false);
+  // Any other role upgrades a checkpoint, and a boundary role upgrades any
+  // state; nothing downgrades. Restoration alone never changes a role.
+  [[nodiscard]] bool touchIfResident(uint64_t kvBlock,
+                                     StateRole role = StateRole::Ordinary);
 
   void publish(uint64_t kvBlock, std::shared_ptr<const CompositeState> state,
-               bool checkpoint = false);
+               StateRole role = StateRole::Ordinary);
   // Publication identity protects replacement states from stale handles.
   [[nodiscard]] StateCheckpoint checkpoint(uint64_t kvBlock) const noexcept;
   // Ensures this publication is no longer a disposable checkpoint. Returns
@@ -101,7 +115,9 @@ public:
   void touch(uint64_t kvBlock) noexcept;
 
   [[nodiscard]] bool contains(uint64_t kvBlock) const noexcept;
-  // Unpinned checkpoints precede ordinary states regardless of recency.
+  // Unpinned checkpoints precede ordinary and hint states, which precede
+  // boundary states, regardless of recency. A boundary candidate is marked
+  // protectedState.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   evictionCandidate() const noexcept;
   [[nodiscard]] StateEviction evict(uint64_t kvBlock) noexcept;
@@ -117,7 +133,7 @@ private:
     uint64_t previousEvictable = 0;
     uint64_t nextEvictable = 0;
     bool evictable = false;
-    bool checkpoint = false;
+    StateRole role = StateRole::Ordinary;
     uint64_t publication = 0;
   };
 
@@ -130,8 +146,14 @@ private:
   void release(uint64_t kvBlock) noexcept;
   [[nodiscard]] std::optional<CompositeStateLease>
   acquireBlock(uint64_t kvBlock);
-  void insertEvictable(uint64_t kvBlock) noexcept;
+  // Coldest inserts at the oldest end of the queue, as old as its oldest.
+  void insertEvictable(uint64_t kvBlock, bool coldest = false) noexcept;
   void removeEvictable(uint64_t kvBlock) noexcept;
+  [[nodiscard]] EvictionQueue &queueOf(const Entry &entry) noexcept;
+  // Changes an entry's role, keeping the role counts and queues in step.
+  void setRole(uint64_t kvBlock, StateRole role) noexcept;
+  // Makes room for one more boundary state; false when none can be demoted.
+  [[nodiscard]] bool reserveBoundary() noexcept;
 
   KvCache &kv_;
   CacheRecency &recency_;
@@ -139,6 +161,7 @@ private:
   uint64_t bytes_ = 0;
   EvictionQueue ordinaryEviction_;
   EvictionQueue checkpointEviction_;
+  EvictionQueue boundaryEviction_;
   uint32_t pinnedEntries_ = 0;
   uint64_t hits_ = 0;
   uint64_t misses_ = 0;
@@ -149,6 +172,9 @@ private:
   uint64_t checkpointBytes_ = 0;
   uint64_t checkpointRetirements_ = 0;
   uint64_t checkpointEvictions_ = 0;
+  uint32_t boundaryEntries_ = 0;
+  uint32_t boundaryCapacity_ = 0;
+  uint64_t boundaryDemotions_ = 0;
 };
 
 } // namespace splash::engine

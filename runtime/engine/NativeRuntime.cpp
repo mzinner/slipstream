@@ -265,6 +265,7 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
                               request.seed};
     engineRequest.constraint = mapConstraint(request.constraint);
     engineRequest.returnProgress = request.returnProgress;
+    engineRequest.stateHints = request.stateHints;
     engineRequest.deadlineMilliseconds =
         nowMonotonic + double(remaining) / 1000.0;
     core_.submit(std::move(engineRequest));

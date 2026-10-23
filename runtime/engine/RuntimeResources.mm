@@ -2,6 +2,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 
 #import <Foundation/Foundation.h>
+#include <cstdlib>
 #include <CommonCrypto/CommonDigest.h>
 
 #include <array>
@@ -497,8 +498,21 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
       throw std::runtime_error("model factory returned no state storage");
     }
     auto kvPool = std::make_unique<KvPool>(*kvPages);
-    auto cache =
-        std::make_unique<engine::Cache>(*kvPool, cacheIdentity.cacheNamespace);
+    // SPLASH_BOUNDARY_STATES sets how many boundary states the cache keeps
+    // ahead of others; 0 keeps them as ordinary states. A value that is not a
+    // small non-negative integer keeps the default.
+    const uint32_t boundaryStates = [] {
+      const char *value = std::getenv("SPLASH_BOUNDARY_STATES");
+      if (!value || *value < '0' || *value > '9')
+        return engine::Cache::kDefaultBoundaryStates;
+      char *end = nullptr;
+      const unsigned long parsed = std::strtoul(value, &end, 10);
+      if (*end || parsed > 1024)
+        return engine::Cache::kDefaultBoundaryStates;
+      return static_cast<uint32_t>(parsed);
+    }();
+    auto cache = std::make_unique<engine::Cache>(
+        *kvPool, cacheIdentity.cacheNamespace, boundaryStates);
 
     if (kvPages->declaredBytes() != budget.kvVirtualBytes ||
         kvPages->actualAllocatedBytes() > budget.kvVirtualBytes) {

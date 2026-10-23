@@ -165,6 +165,7 @@ class GenerationRequest:
     constraint: wire.ConstraintMode = wire.ConstraintMode.NONE
     mask_provider: MaskProvider | None = None
     return_progress: bool = False
+    state_hints: tuple[int, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -585,6 +586,7 @@ class MultiplexedRuntime:
                 cohort=request.cohort,
                 constraint=request.constraint,
                 return_progress=request.return_progress,
+                state_hints=request.state_hints,
             )
             try:
                 encoded = wire.serialize_message(protocol_request)

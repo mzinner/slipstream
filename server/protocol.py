@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
 FRAME_HEADER_BYTES = 24
 STATUS_SCHEMA_VERSION = 5
 # Largest top-k the native sampler keeps as candidates.
@@ -24,7 +24,7 @@ _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHHHQI")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIffIQB")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIffIQBI")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _STATUS_REQUEST = struct.Struct("<Q")
@@ -40,7 +40,7 @@ _STATUS_JSON = struct.Struct("<QI")
 
 assert array.array("I").itemsize == 4 and sys.byteorder == "little"
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 56
+assert _REQUEST.size == 60
 assert _START.size == 21
 assert _DONE.size == 41
 assert _ERROR.size == 18
@@ -142,6 +142,7 @@ class ProtocolLimits:
     max_token_batch: int = 4096
     max_simulation_tokens: int = 32
     max_mask_words: int = 1 << 20
+    max_state_hints: int = 16
 
 
 class RequestPriority(IntEnum):
@@ -181,6 +182,9 @@ class RequestFrame:
     cohort: Cohort
     constraint: ConstraintMode
     return_progress: bool = False
+    # Ascending prompt positions where messages begin; the engine keeps the
+    # state there for later prompts that share the messages before it.
+    state_hints: tuple[int, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -588,11 +592,24 @@ def _request_issue(
             raise ValueError("logical max output token count exceeds its limit")
         if not prompt or len(prompt) > limits.max_prompt_tokens:
             raise ValueError("prompt token count exceeds its limit")
+        hints = _words(request.state_hints, "state hints")
+        if len(hints) > limits.max_state_hints:
+            raise ValueError("state hint count exceeds its limit")
     except ValueError as error:
         return _issue(
             FailureClass.REQUEST_ERROR,
             IssueCode.LIMIT_EXCEEDED,
             str(error),
+            request_id,
+        )
+    if any(
+        not hint or hint >= len(prompt) or (i and hint <= hints[i - 1])
+        for i, hint in enumerate(hints)
+    ):
+        return _issue(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.INVALID_PAYLOAD_LENGTH,
+            "state hints must ascend within the prompt",
             request_id,
         )
     try:
@@ -952,23 +969,29 @@ def _encode_message(
     if isinstance(message, RequestFrame):
         _raise_issue(_request_issue(message, limits))
         prompt = _words(message.prompt_tokens, "prompt tokens")
+        hints = _words(message.state_hints, "state hints")
         temperature = _float32(message.sampling.temperature, "temperature")
         top_p = _float32(message.sampling.top_p, "top_p")
-        payload = _REQUEST.pack(
-            message.request_id,
-            int(message.priority),
-            int(message.cohort),
-            int(message.constraint),
-            message.absolute_deadline_unix_micros,
-            message.remaining_deadline_micros,
-            message.logical_max_output_tokens,
-            len(prompt),
-            temperature,
-            top_p,
-            message.sampling.top_k,
-            message.seed,
-            message.return_progress,
-        ) + _pack_words(prompt)
+        payload = (
+            _REQUEST.pack(
+                message.request_id,
+                int(message.priority),
+                int(message.cohort),
+                int(message.constraint),
+                message.absolute_deadline_unix_micros,
+                message.remaining_deadline_micros,
+                message.logical_max_output_tokens,
+                len(prompt),
+                temperature,
+                top_p,
+                message.sampling.top_k,
+                message.seed,
+                message.return_progress,
+                len(hints),
+            )
+            + _pack_words(prompt)
+            + _pack_words(hints)
+        )
         frame_type = FrameType.REQUEST
     elif isinstance(message, CancelFrame):
         _raise_issue(_cancel_issue(message))
@@ -1229,6 +1252,7 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         top_k,
         seed,
         return_progress,
+        hint_count,
     ) = _REQUEST.unpack_from(payload)
     if return_progress > 1:
         _fail(
@@ -1244,9 +1268,18 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
             "prompt token count exceeds its limit",
             request_id,
         )
+    if hint_count > limits.max_state_hints:
+        _fail(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.LIMIT_EXCEEDED,
+            "state hint count exceeds its limit",
+            request_id,
+        )
     try:
         prompt = _unpack_prefix_words(payload, _REQUEST.size, prompt_count)
-        if len(payload) != _REQUEST.size + 4 * prompt_count:
+        hints_at = _REQUEST.size + 4 * prompt_count
+        hints = _unpack_prefix_words(payload, hints_at, hint_count)
+        if len(payload) != hints_at + 4 * hint_count:
             raise ValueError("trailing request bytes")
     except (ValueError, struct.error):
         _fail(
@@ -1285,6 +1318,7 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
             request_id,
         ),
         bool(return_progress),
+        hints,
     )
     _raise_issue(_request_issue(request, limits))
     return request
