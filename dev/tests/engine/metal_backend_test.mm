@@ -764,8 +764,31 @@ void pipelineStagesReleasedEarly(MetalBackend &backend) {
     backend.releasePipelineStages();  // nothing left: a no-op
 }
 
+// macOS 27 decides residency per set, so keepResident spreads its buffers over
+// size-capped sets, at most the 32 a queue takes, and commands still run with
+// all of them attached.
+void residencySetsSpread(const std::string &metallibPath) {
+    // The smallest cap, 64 MiB: each 40 MiB buffer then needs a set of its own.
+    setenv("SPLASH_RESIDENCY_SET_MAX_PCT", "0.0001", 1);
+    MetalBackend backend(metallibPath);
+    std::vector<MetalBuffer> buffers;
+    for (int b = 0; b < 36; ++b)
+        buffers.push_back(backend.allocateBuffer(40ull << 20, BufferStorage::Shared, "resident"));
+    backend.keepResident(std::span(buffers).first(3));
+    require(backend.residencySetCount() == 3, "kept-resident buffers did not get a set each");
+    backend.keepResident(std::span(buffers).subspan(3));
+    require(backend.residencySetCount() == 32, "kept-resident sets went past a queue's 32");
+    unsetenv("SPLASH_RESIDENCY_SET_MAX_PCT");
+    CountingPipeline pipeline(backend);
+    for (const ComputeDispatch &dispatch : pipeline.dispatches) (void)backend.submit(dispatch);
+    require(pipeline.value() == CountingPipeline::kStages,
+            "commands did not run with the residency sets attached");
+    std::cout << "PASS residency sets spread sets=" << backend.residencySetCount() << '\n';
+}
+
 void run(const std::string &metallibPath) {
     placementProbeFailures(metallibPath);
+    residencySetsSpread(metallibPath);
     backendDeferredSubmission(metallibPath);
     NSData *libraryData = [NSData dataWithContentsOfFile:
         [NSString stringWithUTF8String:metallibPath.c_str()]];

@@ -351,10 +351,12 @@ public:
   // when it needs stage k - 1's output, then signalPipelineEvent(base + 2k).
   // reservePipelineEvents(stages) returns a fresh base.
   // Keeps these buffers resident on the GPU for every command from now on
-  // (a residency set on the queue), instead of the driver making them
-  // resident when a command first uses them - and again after something
-  // large evicted them.
+  // (size-capped residency sets on the queue, requested again every 500 ms),
+  // instead of the driver making them resident when a command first uses
+  // them - and again after something large evicted them.
   void keepResident(std::span<const MetalBuffer> buffers);
+  // How many residency sets keepResident spread its buffers over.
+  [[nodiscard]] size_t residencySetCount() const;
 
   [[nodiscard]] uint64_t reservePipelineEvents(uint32_t stages);
   // Stage k waits for the host's signalPipelineEvent(base + 2k); its end is
