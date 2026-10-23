@@ -409,7 +409,21 @@ struct MetalBackend::Impl {
     __strong id<MTLCommandQueue> queue = nil;
     __strong id<MTL4CommandQueue> sparseQueue = nil;
     __strong id<MTLSharedEvent> sparseEvent = nil;
-    __strong id<MTLResidencySet> residencySet = nil;
+    // keepResident's buffers, spread over size-capped sets. macOS 27 decides residency per set: with the whole
+    // 32 GiB expert cache in one set, any lapse made the driver wire all of it
+    // again before the next command, and decode fell to ~1 tok/s (MLX #4211).
+    struct ResidencySets {
+        std::mutex mutex;
+        std::vector<__strong id<MTLResidencySet>> sets;
+    };
+    // Shared with the heartbeat, which may fire once more during teardown.
+    std::shared_ptr<ResidencySets> residencySets = std::make_shared<ResidencySets>();
+    // Sets only grow while keepResident is the sole writer, under commandMutex,
+    // so it and residencySetCount() read the vector's size without the lock.
+    uint64_t lastResidencySetBytes = 0;
+    // Requests residency of every set again every so often: one request holds
+    // only about two seconds (llama.cpp #17766, MLX #4633).
+    __strong dispatch_source_t residencyHeartbeat = nil;
     // Signalled by the GPU alone, as each pipeline stage ends (base + 2k + 1).
     // The host releases stage k (base + 2k) through pipelineGate, not this
     // event: written by both, a stage's end signal landing after the host had
@@ -452,6 +466,7 @@ struct MetalBackend::Impl {
     std::atomic<double> pendingUnmapIssuedSeconds{0.0};
 
     ~Impl() {
+        if (residencyHeartbeat) dispatch_source_cancel(residencyHeartbeat);
         // Teardown must not wait for a stalled mapping queue. Keep its backing
         // alive until the driver acknowledges the pending unmap instead.
         if (pendingUnmap && sparseEvent.signaledValue < pendingUnmap->eventValue) {
@@ -1283,22 +1298,73 @@ std::vector<DispatchTiming> MetalBackend::takeDispatchProfile() {
 
 void MetalBackend::keepResident(std::span<const MetalBuffer> buffers) {
     std::lock_guard commandLock(impl_->commandMutex);
-    if (!impl_->residencySet) {
+    // SPLASH_RESIDENCY_SET_MAX_PCT caps a set as a share of the working set
+    // (default 5, as MLX); 0 or 100 and above keep a single set.
+    const char *capPct = getenv("SPLASH_RESIDENCY_SET_MAX_PCT");
+    const double pct = capPct ? std::atof(capPct) : 5.0;
+    const uint64_t capBytes = pct <= 0 || pct >= 100
+        ? std::numeric_limits<uint64_t>::max()
+        : std::max<uint64_t>(64ull << 20, uint64_t(
+              double(impl_->capabilities.recommendedMaxWorkingSetBytes) * pct / 100.0));
+    // A command queue takes at most 32 residency sets.
+    constexpr size_t kMaxSets = 32;
+    auto newSet = [&] {
         MTLResidencySetDescriptor *descriptor = [MTLResidencySetDescriptor new];
-        descriptor.label = @"splash-resident";
+        descriptor.label = [NSString stringWithFormat:@"splash-resident-%zu",
+                                                      impl_->residencySets->sets.size()];
         NSError *error = nil;
-        impl_->residencySet =
+        id<MTLResidencySet> set =
             [impl_->device newResidencySetWithDescriptor:descriptor error:&error];
-        if (!impl_->residencySet)
-            throw MetalBackendError("cannot create a residency set");
-        [impl_->queue addResidencySet:impl_->residencySet];
-    }
+        if (!set) throw MetalBackendError("cannot create a residency set");
+        [impl_->queue addResidencySet:set];
+        impl_->residencySets->sets.push_back(set);
+        impl_->lastResidencySetBytes = 0;
+    };
+    // The heartbeat requests residency of these sets from its own queue.
+    std::lock_guard setsLock(impl_->residencySets->mutex);
+    std::vector<__strong id<MTLResidencySet>> &sets = impl_->residencySets->sets;
+    // Only the last existing set and those created now change; commit just those.
+    const size_t firstChanged = sets.empty() ? 0 : sets.size() - 1;
     for (const MetalBuffer &buffer : buffers) {
-        if (buffer.impl_ && buffer.impl_->allocation)
-            [impl_->residencySet addAllocation:buffer.impl_->allocation->buffer];
+        if (!buffer.impl_ || !buffer.impl_->allocation) continue;
+        id<MTLBuffer> allocation = buffer.impl_->allocation->buffer;
+        const uint64_t bytes = allocation.allocatedSize;
+        if (sets.empty() ||
+            (impl_->lastResidencySetBytes + bytes > capBytes && sets.size() < kMaxSets))
+            newSet();
+        [sets.back() addAllocation:allocation];
+        impl_->lastResidencySetBytes += bytes;
     }
-    [impl_->residencySet commit];
-    [impl_->residencySet requestResidency];
+    for (size_t i = firstChanged; i < sets.size(); ++i) [sets[i] commit];
+    for (id<MTLResidencySet> set : sets) [set requestResidency];
+    // SPLASH_RESIDENCY_REFRESH_MS sets the heartbeat (default 500); 0 turns it off.
+    const char *refresh = getenv("SPLASH_RESIDENCY_REFRESH_MS");
+    const long refreshMs = refresh ? std::atol(refresh) : 500;
+    if (!impl_->residencyHeartbeat && refreshMs > 0) {
+        std::shared_ptr<Impl::ResidencySets> shared = impl_->residencySets;
+        dispatch_queue_t queue = dispatch_queue_create(
+            "splash.metal.residency",
+            dispatch_queue_attr_make_with_autorelease_frequency(
+                DISPATCH_QUEUE_SERIAL, DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM));
+        impl_->residencyHeartbeat = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+        const uint64_t interval = uint64_t(refreshMs) * NSEC_PER_MSEC;
+        dispatch_source_set_timer(impl_->residencyHeartbeat,
+                                  dispatch_time(DISPATCH_TIME_NOW, int64_t(interval)),
+                                  interval, interval / 10);
+        dispatch_source_set_event_handler(impl_->residencyHeartbeat, ^{
+            std::lock_guard heartbeatLock(shared->mutex);
+            for (id<MTLResidencySet> set : shared->sets) [set requestResidency];
+        });
+        dispatch_activate(impl_->residencyHeartbeat);
+    }
+    std::cerr << "[Metal] keepResident: " << sets.size()
+              << " residency sets, cap " << (capBytes >> 20) << " MiB, heartbeat "
+              << (refreshMs > 0 ? std::to_string(refreshMs) + " ms" : std::string("off")) << "\n";
+}
+
+size_t MetalBackend::residencySetCount() const {
+    std::lock_guard commandLock(impl_->commandMutex);
+    return impl_->residencySets->sets.size();
 }
 
 uint64_t MetalBackend::reservePipelineEvents(uint32_t stages) {
