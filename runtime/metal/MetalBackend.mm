@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <deque>
 #include <iostream>
 #include <limits>
 #include <mutex>
@@ -359,6 +360,42 @@ struct CommandTicket::State {
     }
 };
 
+// The stages of a pipelined submission after the first, held back until the
+// host signals them. macOS fails a command buffer that waits on an event for
+// about five seconds (kIOGPUCommandBufferCallbackErrorTimeout), even one that
+// has used no GPU time, and a stage's host work (expert reads from SSD) can
+// take that long. Committed only once signalled, no stage waits on the GPU;
+// the queue still runs them in order, and the hand-off costs the same.
+struct PipelineGate {
+    std::mutex mutex;
+    // Uncommitted stages in order, with the host signal each waits for.
+    std::deque<std::pair<uint64_t, id<MTLCommandBuffer>>> stages;
+    uint64_t signaled = 0;
+    // The first stage is committed, after any sparse mapping it waits for.
+    bool started = false;
+    uint64_t sequence = 0;
+    std::shared_ptr<BackendAsyncState> observer;
+    // Fails the submission's ticket when the backend stops before a stage;
+    // takes the number of stages that will now never run.
+    std::function<void(size_t)> stopped;
+
+    void commitSignalledLocked() {
+        if (!started) return;
+        while (!stages.empty() && stages.front().first <= signaled) {
+            if (!observer->commitSubmission(sequence, stages.front().second)) {
+                const size_t dropped = stages.size();
+                cancel();
+                stopped(dropped);
+                return;
+            }
+            stages.pop_front();
+        }
+    }
+
+    // The submission failed before its first stage: the rest never run.
+    void cancel() { stages.clear(); }
+};
+
 struct MetalBackend::Impl {
     std::function<bool()> cancelled;
     void checkCancellation() const {
@@ -373,17 +410,19 @@ struct MetalBackend::Impl {
     __strong id<MTL4CommandQueue> sparseQueue = nil;
     __strong id<MTLSharedEvent> sparseEvent = nil;
     __strong id<MTLResidencySet> residencySet = nil;
-    // Gates the stages of submitPipelineAsync; values only grow.
-    __strong id<MTLSharedEvent> pipelineEvent = nil;
-    // Signalled by the GPU alone, as each pipeline stage ends. A wait on the
-    // shared event above returns early once the host has signalled a later
-    // stage's start; this one only moves when a stage is really done.
+    // Signalled by the GPU alone, as each pipeline stage ends (base + 2k + 1).
+    // The host releases stage k (base + 2k) through pipelineGate, not this
+    // event: written by both, a stage's end signal landing after the host had
+    // released the next stage left the event below it, and the last stage,
+    // with no later release to lift it, waited until macOS killed it with
+    // kIOGPUCommandBufferCallbackErrorTimeout.
     __strong id<MTLSharedEvent> pipelineDoneEvent = nil;
     uint64_t pipelineValue = 0;
     // Set only for the duration of a pipelined submission.
     const std::vector<size_t> *pipelineStarts = nullptr;
-    const std::vector<bool> *pipelineQuiet = nullptr;
     uint64_t pipelineBase = 0;
+    // The stages of the latest pipelined submission the host has yet to signal.
+    std::shared_ptr<PipelineGate> pipelineGate;
     __strong id<MTLLibrary> library = nil;
     __strong NSMutableDictionary<NSString *, id<MTLComputePipelineState>>
         *pipelines = nil;
@@ -1264,8 +1303,6 @@ void MetalBackend::keepResident(std::span<const MetalBuffer> buffers) {
 
 uint64_t MetalBackend::reservePipelineEvents(uint32_t stages) {
     std::lock_guard commandLock(impl_->commandMutex);
-    if (!impl_->pipelineEvent)
-        impl_->pipelineEvent = [impl_->device newSharedEvent];
     if (!impl_->pipelineDoneEvent)
         impl_->pipelineDoneEvent = [impl_->device newSharedEvent];
     const uint64_t base = impl_->pipelineValue;
@@ -1273,19 +1310,11 @@ uint64_t MetalBackend::reservePipelineEvents(uint32_t stages) {
     return base;
 }
 
-bool MetalBackend::waitPipelineEvent(uint64_t value, uint64_t timeoutMs) {
+bool MetalBackend::waitPipelineStageDone(uint64_t base, uint32_t stage,
+                                         uint64_t timeoutMs) {
     // Poll first: a pipeline hands off once per layer, and a blocking wait's
     // wake-up latency, paid 47 times a token, cost ~9 ms. Spinning costs one
     // core for the few hundred microseconds a stage takes.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (impl_->pipelineEvent.signaledValue >= value) return true;
-    }
-    return [impl_->pipelineEvent waitUntilSignaledValue:value timeoutMS:timeoutMs];
-}
-
-bool MetalBackend::waitPipelineStageDone(uint64_t base, uint32_t stage,
-                                         uint64_t timeoutMs) {
     const uint64_t value = base + 2ull * stage + 1;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
     while (std::chrono::steady_clock::now() < deadline) {
@@ -1295,32 +1324,40 @@ bool MetalBackend::waitPipelineStageDone(uint64_t base, uint32_t stage,
 }
 
 void MetalBackend::signalPipelineEvent(uint64_t value) {
-    impl_->pipelineEvent.signaledValue = value;
+    if (const std::shared_ptr<PipelineGate> gate = impl_->pipelineGate) {
+        std::lock_guard lock(gate->mutex);
+        gate->signaled = std::max(gate->signaled, value);
+        gate->commitSignalledLocked();
+    }
+}
+
+void MetalBackend::releasePipelineStages() {
+    const std::shared_ptr<PipelineGate> gate = std::move(impl_->pipelineGate);
+    if (!gate) return;
+    std::lock_guard lock(gate->mutex);
+    if (gate->stages.empty()) return;
+    // Run what the host never signalled, so the submission completes and its
+    // ticket can be released; the caller discards the results.
+    gate->signaled = std::numeric_limits<uint64_t>::max();
+    gate->commitSignalledLocked();
 }
 
 CommandTicket MetalBackend::submitPipelineAsync(
     std::span<const ComputeDispatch> dispatches,
-    std::span<const size_t> stageStarts, uint64_t base,
-    std::span<const bool> quietStages) {
+    std::span<const size_t> stageStarts, uint64_t base) {
     if (stageStarts.empty() || stageStarts.front() != 0 ||
         !std::is_sorted(stageStarts.begin(), stageStarts.end()) ||
-        stageStarts.back() >= dispatches.size() || !impl_->pipelineEvent)
+        stageStarts.back() >= dispatches.size() || !impl_->pipelineDoneEvent)
         throw MetalBackendError("invalid pipeline stages");
     const std::vector<size_t> starts(stageStarts.begin(), stageStarts.end());
-    if (!quietStages.empty() && quietStages.size() != starts.size())
-        throw MetalBackendError("quiet stage flags do not match the stages");
-    const std::vector<bool> quiet(quietStages.begin(), quietStages.end());
     impl_->pipelineStarts = &starts;
-    impl_->pipelineQuiet = quiet.empty() ? nullptr : &quiet;
     impl_->pipelineBase = base;
     try {
         CommandTicket ticket = submitCommandAsync(dispatches);
         impl_->pipelineStarts = nullptr;
-        impl_->pipelineQuiet = nullptr;
         return ticket;
     } catch (...) {
         impl_->pipelineStarts = nullptr;
-        impl_->pipelineQuiet = nullptr;
         throw;
     }
 }
@@ -1525,10 +1562,6 @@ CommandTicket MetalBackend::submitCommandAsync(
             // Keep the queue dependency explicit; the CPU resolves it before commit.
             [command encodeWaitForEvent:impl_->sparseEvent value:sparseEventValue];
         }
-        const bool pipelined = impl_->pipelineStarts != nullptr;
-        if (pipelined && c > 0)
-            [command encodeWaitForEvent:impl_->pipelineEvent
-                                  value:impl_->pipelineBase + 2 * c];
         @autoreleasepool {
             id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
             if (!encoder) {
@@ -1596,10 +1629,7 @@ CommandTicket MetalBackend::submitCommandAsync(
                 throw;
             }
         }
-        if (pipelined) {
-            if (!impl_->pipelineQuiet || !(*impl_->pipelineQuiet)[c])
-                [command encodeSignalEvent:impl_->pipelineEvent
-                                     value:impl_->pipelineBase + 2 * c + 1];
+        if (impl_->pipelineStarts) {
             [command encodeSignalEvent:impl_->pipelineDoneEvent
                                  value:impl_->pipelineBase + 2 * c + 1];
         }
@@ -1612,8 +1642,28 @@ CommandTicket MetalBackend::submitCommandAsync(
         CommandTiming timing;
         std::string error;
         std::shared_ptr<CommandTicket::State> ticketState;
+        std::chrono::steady_clock::time_point wallStart;
+
+        // Counts `count` commands that will never run as done, so the ticket
+        // finishes with `message` only once the committed ones have: their
+        // buffers stay alive while the GPU may still use them.
+        void abandon(size_t count, std::string message) {
+            CommandTiming finalTiming;
+            std::string finalError;
+            {
+                std::lock_guard lock(mutex);
+                if (error.empty()) error = std::move(message);
+                if (remaining.fetch_sub(count, std::memory_order_acq_rel) != count) return;
+                timing.wallSeconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - wallStart).count();
+                finalTiming = timing;
+                finalError = std::move(error);
+            }
+            ticketState->finish(finalTiming, std::move(finalError));
+        }
     };
     auto tracker = std::make_shared<MultiCommandTracker>();
+    tracker->wallStart = wallStart;
     tracker->remaining.store(commands.size(), std::memory_order_relaxed);
     tracker->ticketState = ticketState;
 
@@ -1666,6 +1716,24 @@ CommandTicket MetalBackend::submitCommandAsync(
           }
         }];
     }
+    // A pipelined submission commits its first stage now; the others wait in
+    // the gate until the host signals them. Enqueueing every stage first keeps
+    // their place in the queue, so work submitted meanwhile still runs after
+    // them, as it did when all stages were committed at once.
+    std::shared_ptr<PipelineGate> gate;
+    if (impl_->pipelineStarts && commands.size() > 1) {
+        for (id<MTLCommandBuffer> command : commands) [command enqueue];
+        gate = std::make_shared<PipelineGate>();
+        gate->sequence = ticketState->sequence;
+        gate->observer = observer;
+        gate->stopped = [tracker](size_t dropped) {
+            tracker->abandon(dropped, "Metal backend stopped before command submission");
+        };
+        for (size_t c = 1; c < commands.size(); ++c)
+            gate->stages.emplace_back(impl_->pipelineBase + 2 * c, commands[c]);
+        impl_->pipelineGate = gate;
+    }
+
     impl_->sampleDeviceMemory();
     id<MTLSharedEvent> event = impl_->sparseEvent;
     const bool pendingMap =
@@ -1676,16 +1744,25 @@ CommandTicket MetalBackend::submitCommandAsync(
         observer->mapWaitEvent.store(sparseEventValue, std::memory_order_release);
     }
     afterMetalEvent(event, sparseEventValue, kSparseMapTimeoutMilliseconds,
-        [commands, event, observer, ticketState, sparseEventValue,
-         pendingMap, mapWaitStart, wallStart](bool signaled) {
+        [commands, gate, tracker, event, observer, ticketState, sparseEventValue,
+         pendingMap, mapWaitStart](bool signaled) {
             if (pendingMap) {
                 const double waited = steadySeconds() - mapWaitStart;
                 observer->lastMapWaitSeconds.store(waited, std::memory_order_relaxed);
                 raisePeak(observer->maxMapWaitSeconds, waited);
                 observer->mapWaitEvent.store(0, std::memory_order_release);
             }
+            // Fails the ticket once the first `committed` commands are done;
+            // the rest, gated stages included, never run.
+            auto fail = [&](size_t committed, std::string message) {
+                if (gate) {
+                    std::lock_guard lock(gate->mutex);
+                    gate->cancel();
+                }
+                tracker->abandon(commands.size() - committed, std::move(message));
+            };
             if (observer->stopping.stop_requested()) {
-                ticketState->finish({}, "Metal backend stopped before command submission");
+                fail(0, "Metal backend stopped before command submission");
                 return;
             }
             if (!signaled || !observer->healthy.load(std::memory_order_acquire)) {
@@ -1696,17 +1773,21 @@ CommandTicket MetalBackend::submitCommandAsync(
                 if (!signaled)
                     message << ", wait exceeded "
                             << kSparseMapTimeoutMilliseconds << " ms";
-                CommandTiming timing;
-                timing.wallSeconds = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - wallStart).count();
-                ticketState->finish(timing, message.str());
+                fail(0, message.str());
                 return;
             }
-            for (id<MTLCommandBuffer> command : commands) {
-                if (!observer->commitSubmission(ticketState->sequence, command)) {
-                    ticketState->finish({}, "Metal backend stopped before command submission");
+            // Only the first stage of a gated submission is committed here.
+            const size_t immediate = gate ? 1 : commands.size();
+            for (size_t c = 0; c < immediate; ++c) {
+                if (!observer->commitSubmission(ticketState->sequence, commands[c])) {
+                    fail(c, "Metal backend stopped before command submission");
                     return;
                 }
+            }
+            if (gate) {
+                std::lock_guard lock(gate->mutex);
+                gate->started = true;
+                gate->commitSignalledLocked();
             }
             observer->sampleDeviceMemory();
         }, observer->stopping.get_token());
